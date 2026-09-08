@@ -39,7 +39,7 @@ def _install_core_path():
 
 REPOSITORY_ROOT = _install_core_path()
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 import substance_painter.event
 import substance_painter.logging
@@ -177,6 +177,32 @@ def publish_textures(preset_name):
     return texture_publish.publish(CONNECTION.arena, CONNECTION.publisher, preset_name)
 
 
+def _panel_icon():
+    """A tab-strip icon, which is also the only way back to a closed dock.
+
+    Painter turns a dock widget's windowIcon into the button that reopens it
+    once someone closes it, and gives a dock without one no way back at all. It
+    is drawn here rather than shipped as a file so the plugin stays a folder of
+    source with nothing to lose.
+    """
+    size = 64
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    painter.setBrush(QtGui.QColor(70, 130, 200))
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.drawRoundedRect(2, 2, size - 4, size - 4, 12, 12)
+    font = painter.font()
+    font.setPixelSize(34)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.setPen(QtGui.QColor(255, 255, 255))
+    painter.drawText(pixmap.rect(), QtCore.Qt.AlignCenter, "RB")
+    painter.end()
+    return QtGui.QIcon(pixmap)
+
+
 class RuriBridgePanel(QtWidgets.QWidget):
     """The dock: attach, watch the slots, push textures back by hand."""
 
@@ -184,6 +210,7 @@ class RuriBridgePanel(QtWidgets.QWidget):
         super().__init__()
         self.setObjectName("RuriBridgePanel")
         self.setWindowTitle("RuriBridge")
+        self.setWindowIcon(_panel_icon())
 
         layout = QtWidgets.QVBoxLayout(self)
         session_row = QtWidgets.QHBoxLayout()
@@ -340,6 +367,7 @@ _panel = None
 _dock = None
 _timer = None
 _log_handler = None
+_menu_action = None
 _mesh_deadline = None
 _shader_gate = sync_module.ChangeGate("painter.shader", SHADER_QUIET_SECONDS)
 _texture_gate = sync_module.ChangeGate("painter.textures", TEXTURE_QUIET_SECONDS)
@@ -367,7 +395,7 @@ def _resolve_dirty_textures():
     by_texture_set = {}
     for stack_id, channel_type in _dirty_textures:
         try:
-            name = substance_painter.textureset.Stack(stack_id).material().name()
+            name = substance_painter.textureset.Stack(stack_id).material().name
         except Exception as error:
             LOG.warning("stack %s no longer resolves: %s", stack_id, error)
             continue
@@ -398,7 +426,7 @@ def _values_by_texture_set(values_by_label):
     one instance.
     """
     identity_by_display = {
-        texture_set.name(): texture_set.original_name
+        texture_set.name: texture_set.original_name
         for texture_set in substance_painter.textureset.all_texture_sets()}
     by_texture_set = {}
     for display, body in shader_state.assignment().get("texturesets", {}).items():
@@ -562,7 +590,12 @@ def _on_timer():
 
 
 def _on_project_ready(_event):
-    """A project just became editable. Adopt its shader values without sending them.
+    """A project just became editable. Show the panel and adopt its values.
+
+    The dock belongs to Painter's project modes, so on the home screen it exists
+    but is not shown -- which looks exactly like a plugin that failed. Opening a
+    project is the moment it can be seen, so that is the moment to make sure it
+    is, rather than leaving it to whatever the saved layout happened to hold.
 
     Priming rather than publishing is what stops a freshly created project's
     defaults from overwriting values the other side authored: on connect neither
@@ -570,6 +603,11 @@ def _on_project_ready(_event):
     """
     global _mesh_deadline
     _mesh_deadline = None
+    if _dock is not None and not _dock.isVisible():
+        _dock.setVisible(True)
+        _dock.raise_()
+    if _dock is not None:
+        LOG.info("panel visible: %s", _dock.isVisible())
     try:
         _shader_gate.prime(shader_state.parameter_values())
     except shader_state.ShaderStateError as error:
@@ -589,11 +627,36 @@ def _on_project_closed(_event):
     publish_project_state()
 
 
+def show_panel():
+    """Bring the dock back, from a menu item that is always there.
+
+    A dock lives in the saved layout and in the mode it was registered for, and
+    an icon only offers a way back once Painter decides to show the strip. A menu
+    entry depends on neither, so there is always one place to look when the panel
+    is not where somebody expects it.
+    """
+    if _dock is None:
+        LOG.warning("the panel has not been created yet")
+        return
+    _dock.setVisible(True)
+    _dock.raise_()
+    LOG.info("panel visible: %s, floating: %s", _dock.isVisible(), _dock.isFloating())
+
+
 def start_plugin():
-    global _panel, _dock, _timer, _log_handler
+    global _panel, _dock, _timer, _log_handler, _menu_action
     _log_handler = log_module.install_callable_sink(_emit_to_painter)
     _panel = RuriBridgePanel()
-    _dock = substance_painter.ui.add_dock_widget(_panel)
+    _dock = substance_painter.ui.add_dock_widget(
+        _panel, substance_painter.ui.UIMode.Edition
+        | substance_painter.ui.UIMode.Visualisation
+        | substance_painter.ui.UIMode.Baking)
+    _dock.setVisible(True)
+    _dock.raise_()
+    _menu_action = QtGui.QAction("RuriBridge")
+    _menu_action.triggered.connect(show_panel)
+    substance_painter.ui.add_action(
+        substance_painter.ui.ApplicationMenu.Window, _menu_action)
     substance_painter.event.DISPATCHER.connect_strong(
         substance_painter.event.ProjectEditionEntered, _on_project_ready)
     substance_painter.event.DISPATCHER.connect_strong(
@@ -612,11 +675,15 @@ def start_plugin():
     except Exception as error:
         LOG.error("could not attach on start: %s", error)
         _panel.set_status("attach failed: {0}".format(error))
+    LOG.info("panel added (visible: %s); Window > RuriBridge reopens it, and the "
+             "'RB' button in the right-hand strip does too. It belongs to the "
+             "project modes, so it shows once a project is open.",
+             _dock.isVisible())
     LOG.info("plugin started from %s", REPOSITORY_ROOT)
 
 
 def close_plugin():
-    global _panel, _dock, _timer, _log_handler
+    global _panel, _dock, _timer, _log_handler, _menu_action
     if _timer is not None:
         _timer.stop()
         _timer = None
@@ -627,6 +694,9 @@ def close_plugin():
     substance_painter.event.DISPATCHER.disconnect(
         substance_painter.event.TextureStateEvent, _on_texture_state)
     CONNECTION.close()
+    if _menu_action is not None:
+        substance_painter.ui.delete_ui_element(_menu_action)
+        _menu_action = None
     if _dock is not None:
         substance_painter.ui.delete_ui_element(_dock)
         _dock = None

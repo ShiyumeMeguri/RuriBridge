@@ -224,12 +224,12 @@ def build_configuration(export_directory, preset_name, selected_texture_sets=Non
     export_list = []
     plan_by_stack = {}
     for texture_set in substance_painter.textureset.all_texture_sets():
-        if selected_texture_sets and texture_set.name() not in selected_texture_sets:
+        if selected_texture_sets and texture_set.name not in selected_texture_sets:
             continue
         for stack in texture_set.all_stacks():
             planned = plan_stack(preset_name, texture_set, stack)
             if dirty_channels_by_texture_set is not None:
-                dirty = dirty_channels_by_texture_set.get(texture_set.name(), set())
+                dirty = dirty_channels_by_texture_set.get(texture_set.name, set())
                 planned = [entry for entry in planned if _touched_by(entry, dirty)]
             if not planned:
                 continue
@@ -237,7 +237,7 @@ def build_configuration(export_directory, preset_name, selected_texture_sets=Non
             presets.append({"name": generated_name,
                             "maps": [entry.definition for entry in planned]})
             export_list.append({"rootPath": str(stack), "exportPreset": generated_name})
-            plan_by_stack[(texture_set.name(), stack.name())] = (texture_set, stack, planned)
+            plan_by_stack[(texture_set.name, stack.name())] = (texture_set, stack, planned)
     if not export_list:
         raise TexturePublishError("the open project has no stack with any channel to export")
     configuration = {
@@ -317,7 +317,7 @@ def publish(arena, publisher, preset_name=DEFAULT_PRESET_NAME, selected_texture_
                 })
             texture_sets.append({
                 "identity": texture_set.original_name,
-                "name": texture_set.name(),
+                "name": texture_set.name,
                 "stack": stack.name(),
                 "resolution": [resolution.width, resolution.height],
                 "maps": maps,
@@ -343,7 +343,7 @@ def apply_display_names(names_by_identity):
     renamed = {}
     for texture_set in substance_painter.textureset.all_texture_sets():
         wanted = names_by_identity.get(texture_set.original_name)
-        if not wanted or texture_set.name() == wanted:
+        if not wanted or texture_set.name == wanted:
             continue
         try:
             texture_set.name = wanted
@@ -372,7 +372,7 @@ def current_project_state():
             })
         texture_sets.append({
             "identity": texture_set.original_name,
-            "name": texture_set.name(),
+            "name": texture_set.name,
             "resolution": [resolution.width, resolution.height],
             "stacks": stacks,
         })

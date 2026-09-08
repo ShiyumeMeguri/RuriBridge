@@ -114,7 +114,7 @@ def instance_by_texture_set():
     import substance_painter.textureset
 
     identifier_by_label = {entry["label"]: entry["id"] for entry in instances()}
-    identity_by_display = {texture_set.name(): texture_set.original_name
+    identity_by_display = {texture_set.name: texture_set.original_name
                            for texture_set in substance_painter.textureset.all_texture_sets()}
     mapping = {}
     for display, body in assignment().get("texturesets", {}).items():

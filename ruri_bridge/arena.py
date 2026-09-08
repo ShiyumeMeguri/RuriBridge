@@ -177,9 +177,42 @@ class Arena:
         directory.mkdir(parents=True, exist_ok=True)
         _mark_temporary(directory)
         control_path = directory / CONTROL_FILE_NAME
+        if control_path.exists() and not cls._speaks_this_format(control_path):
+            cls._discard_stale(directory, control_path)
         if not control_path.exists():
             cls._materialise_control(control_path, channels)
         return cls._attach(root, session, channels, control_path)
+
+    @classmethod
+    def _speaks_this_format(cls, control_path):
+        try:
+            with open(control_path, "rb") as handle:
+                magic, version, _count, _epoch = _HEADER.unpack_from(
+                    handle.read(HEADER_SIZE), 0)
+        except (OSError, struct.error):
+            return False
+        return magic == CONTROL_MAGIC and version == FORMAT_VERSION
+
+    @classmethod
+    def _discard_stale(cls, directory, control_path):
+        """Throw away a session written by a different build and start over.
+
+        A session is transport, not anybody's work: when the format moves, the
+        old one carries nothing worth migrating, and refusing to attach would
+        leave both applications staring at a session neither can open. It is
+        rebuilt rather than read.
+        """
+        try:
+            shutil.rmtree(directory)
+        except OSError as error:
+            raise ArenaError(
+                "session at {0} was written by a different build and cannot be "
+                "rebuilt while something still holds it open ({1}); close the other "
+                "Blender or Painter and try again".format(directory, error))
+        directory.mkdir(parents=True, exist_ok=True)
+        _mark_temporary(directory)
+        LOG.warning("discarded the session at %s: it was written by an older build",
+                    directory)
 
     @classmethod
     def attach_existing(cls, session=DEFAULT_SESSION, root=None):
