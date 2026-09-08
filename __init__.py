@@ -569,17 +569,24 @@ class RURIBRIDGE_OT_publish_mesh(bpy.types.Operator):
             bpy.ops.ruri_bridge.reconnect()
         starting = False
         stored = preferences()
-        if not painter_is_attached() and stored is not None and stored.auto_launch:
-            if painter_host.is_running():
-                self.report({"WARNING"},
-                            "Painter is running but its RuriBridge plugin is off")
-            else:
-                try:
-                    remember_painter_executable(
-                        painter_host.launch(painter_executable(), settings.session))
-                    starting = True
-                except Exception as error:
-                    self.report({"WARNING"}, str(error))
+        if painter_is_attached():
+            LOG.info("Painter is attached, so there is nothing to start")
+        elif stored is None:
+            self.report({"WARNING"},
+                        "the add-on has no preferences entry, so Painter cannot be started")
+        elif not stored.auto_launch:
+            LOG.info("Painter is not attached and Start Painter When Sending is off; "
+                     "the mesh waits in the arena until Painter opens")
+        elif painter_host.is_running():
+            self.report({"WARNING"},
+                        "Painter is running but its RuriBridge plugin is off")
+        else:
+            try:
+                remember_painter_executable(
+                    painter_host.launch(painter_executable(), settings.session))
+                starting = True
+            except Exception as error:
+                self.report({"WARNING"}, str(error))
         try:
             generation = publish_mesh(context, settings.scope, settings.intent,
                                       settings.include_colors)
