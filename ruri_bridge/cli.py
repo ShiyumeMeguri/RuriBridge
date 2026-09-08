@@ -30,6 +30,7 @@ from . import arena as arena_module
 from . import channel as channel_module
 from . import glb as glb_module
 from . import log as log_module
+from . import painter_host
 from . import record as record_module
 
 LOG = log_module.logger("cli")
@@ -46,6 +47,20 @@ def _repository_root():
 def _open(arguments):
     return arena_module.Arena.open_session(
         record_module.CHANNELS, session=arguments.session, root=arguments.root)
+
+
+def command_launch(arguments):
+    """Start Painter, so a script can set the whole link up on its own."""
+    executable = arguments.painter or painter_host.discover_executable()
+    if executable is None:
+        print("Windows has no record of a Painter install; pass --painter")
+        return 1
+    if painter_host.is_running():
+        print("Painter is already running: {0}".format(executable))
+        return 0
+    painter_host.launch(executable, arguments.session)
+    print("started {0} on session {1}".format(executable, arguments.session))
+    return 0
 
 
 def command_sessions(arguments):
@@ -482,6 +497,11 @@ def build_parser():
 
     subparsers.add_parser("remove").set_defaults(handler=command_remove)
     subparsers.add_parser("values").set_defaults(handler=command_values)
+
+    launch = subparsers.add_parser("launch")
+    launch.add_argument("--painter", default=None,
+                        help="Painter executable; found in the registry when omitted")
+    launch.set_defaults(handler=command_launch)
     subparsers.add_parser("verify-mesh").set_defaults(handler=command_verify_mesh)
 
     textures = subparsers.add_parser("textures")

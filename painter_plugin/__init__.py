@@ -15,6 +15,7 @@ module at all -- viewport shader instances through ``substance_painter.js``,
 which is a Python entry point that already hands back parsed JSON.
 """
 
+import ctypes
 import os
 import sys
 import time
@@ -97,7 +98,7 @@ class _Connection:
         self.arena = arena_module.Arena.open_session(record_module.CHANNELS, session=session)
         self.publisher = channel_module.Publisher(self.arena, record_module.CHANNEL_TO_BLENDER)
         self.subscriber = channel_module.Subscriber(self.arena, record_module.CHANNEL_TO_PAINTER)
-        self.subscriber.skip_to_latest()
+        self._adopt_pending_work()
         self.state_writer = channel_module.StateWriter(
             self.arena, record_module.CHANNEL_STATE_TO_BLENDER)
         self.state_reader = channel_module.StateReader(
@@ -105,6 +106,24 @@ class _Connection:
         self.state_reader.skip_to_latest()
         LOG.info("attached to session %s at %s", session, self.arena.directory)
         return self.arena
+
+    def _adopt_pending_work(self):
+        """Decide what a fresh attachment owes the other side.
+
+        With a project already open, history is not ours to replay: the user is
+        working, and loading a mesh from an hour ago would throw that away. With
+        no project open there is nothing to protect and something to do -- the
+        mesh someone published while starting this application is waiting, and
+        taking it is the entire reason they published it before opening Painter.
+        """
+        try:
+            busy = substance_painter.project.is_open()
+        except Exception:
+            busy = False
+        if busy:
+            self.subscriber.skip_to_latest()
+        else:
+            self.subscriber.catch_up(record_module.KIND_MESH)
 
     def close(self):
         if self.arena is not None:
@@ -119,6 +138,17 @@ class _Connection:
 CONNECTION = _Connection()
 
 
+def executable_path():
+    """This process's own image path, so Blender can start Painter later.
+
+    Asked of Windows rather than of ``sys.executable``, which in an embedded
+    interpreter is whatever the host chose to report.
+    """
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetModuleFileNameW(None, buffer, len(buffer))
+    return buffer.value if length else ""
+
+
 def default_session():
     return os.environ.get(SESSION_ENVIRONMENT_VARIABLE, arena_module.DEFAULT_SESSION)
 
@@ -126,7 +156,9 @@ def default_session():
 def publish_project_state():
     if not CONNECTION.is_open:
         return None
-    return CONNECTION.publisher.publish_record(texture_publish.current_project_state())
+    state = texture_publish.current_project_state()
+    state["host_executable"] = executable_path()
+    return CONNECTION.publisher.publish_record(state)
 
 
 def publish_shader_state():
@@ -183,6 +215,9 @@ class RuriBridgePanel(QtWidgets.QWidget):
         self.send_button = QtWidgets.QPushButton("Send Textures To Blender")
         layout.addWidget(self.send_button)
 
+        self.link_label = QtWidgets.QLabel("")
+        layout.addWidget(self.link_label)
+
         self.status_label = QtWidgets.QLabel("detached")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -208,6 +243,9 @@ class RuriBridgePanel(QtWidgets.QWidget):
         if not CONNECTION.is_open:
             self.slot_label.setText("")
             return
+        blender = CONNECTION.arena.read_slot(record_module.CHANNEL_TO_PAINTER)
+        self.link_label.setText(
+            "Blender is attached" if blender.writer_is_live else "Blender is not attached")
         self.slot_label.setText("\n".join(
             "{0}: gen {1} ack {2} drop {3}".format(
                 state.channel, state.generation, state.acknowledged_generation,
@@ -425,6 +463,7 @@ def pump():
         LOG.warning("mesh load never signalled ProjectEditionEntered within %.0fs; "
                     "resuming the channel", MESH_LOAD_DEADLINE_SECONDS)
         _mesh_deadline = None
+    CONNECTION.arena.touch(record_module.CHANNEL_TO_BLENDER)
     if substance_painter.project.is_busy():
         return
     take_shader_values()
@@ -496,6 +535,7 @@ def start_plugin():
         CONNECTION.open(default_session())
         _panel.attach_button.setText("Detach")
         _panel.set_status("attached: {0}".format(CONNECTION.arena.directory))
+        publish_project_state()
         _panel.refresh_slots()
     except Exception as error:
         LOG.error("could not attach on start: %s", error)

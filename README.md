@@ -21,6 +21,28 @@ Painter 会映射的**同一批物理页**,通道贴图从 Painter 原样回到 
     shader_state.py  经 substance_painter.js 读写视口着色器实例
 ```
 
+## 怎么用
+
+**装好之后你只需要按一个按钮。** 3D 视图 N 面板 → `RuriBridge` 页:
+
+1. 面板顶上写着 Painter 有没有接上。**没接上也不用先开 Painter** —— 直接按 **Send To Painter**:
+   网格写进竞技场,桥顺手把 Painter 启动起来,Painter 一开就把等着的那份网格接走并建好工程。
+   Painter 的路径不用你填,从 Windows 注册表的 `App Paths` 读(那是安装器自己登记的),
+   而且两边第一次连上之后 Painter 会把自己的路径告诉 Blender,存进插件偏好设置。
+2. 从这一刻起**什么都不用再点**:你在 Painter 里画 → Blender 的贴图跟着变;
+   你在两边改 shader 参数 → 另一边跟着变;你改几何、离开编辑模式 → Painter 重载网格。
+3. 不想要自动的,把 **Live Sync** 关掉,下面那排手动按钮照常用。
+
+Painter 那侧的停靠面板同理:写着 Blender 有没有接上,一个 **Live sync to Blender** 开关,
+一个手动 **Send Textures To Blender**。
+
+**唯一需要理解的概念是「会话」**:两侧用同一个会话名(默认 `default`)就在同一块共享内存上。
+面板里 `Channels` 那个折叠区能看到会话名、目录、和每条通道的实时代次 —— 平时不用管它。
+
+一个人先开谁都行:先开 Blender 发网格再开 Painter、先开 Painter 再开 Blender、两边都开着,
+三种顺序都成立。
+
+
 ## 为什么是这个机制
 
 Windows 上**映射文件就是 section 对象**。两个进程映射同一个文件,寻址的是同一批物理页 ——

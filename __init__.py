@@ -54,6 +54,7 @@ import bpy
 from ruri_bridge import arena as arena_module
 from ruri_bridge import channel as channel_module
 from ruri_bridge import log as log_module
+from ruri_bridge import painter_host
 from ruri_bridge import record as record_module
 from ruri_bridge import sync as sync_module
 
@@ -302,6 +303,7 @@ def pump(bind=True):
                                 len(generation.record.get("instances", []))))
             elif generation.kind == record_module.KIND_PROJECT_STATE:
                 CONNECTION.last_state[generation.kind] = generation.record
+                remember_painter_executable(generation.record.get("host_executable"))
                 handled.append((generation.number, generation.kind, generation.record))
             else:
                 LOG.warning("ignoring generation %d of unknown kind %r",
@@ -381,6 +383,7 @@ def _timer():
         LOG.error("pump failed: %s", error)
         settings.status = "pump failed: {0}".format(error)
         return settings.poll_seconds
+    CONNECTION.arena.touch(record_module.CHANNEL_TO_PAINTER)
     if handled:
         summary = ", ".join("{0}#{1}".format(kind, number) for number, kind, _ in handled)
         settings.status = "received " + summary
@@ -419,10 +422,112 @@ def _stop_timer():
         bpy.app.timers.unregister(_timer)
 
 
-class RURIBRIDGE_OT_connect(bpy.types.Operator):
-    bl_idname = "ruri_bridge.connect"
-    bl_label = "Attach"
-    bl_description = "Attach to the arena session, building it if nobody has yet"
+class RuriBridgePreferences(bpy.types.AddonPreferences):
+    """The one genuinely machine-specific fact: where Painter is installed.
+
+    It lives in the add-on preferences rather than in the scene, because it is a
+    property of this computer and not of the file being worked on. It is filled
+    in without anyone typing it -- from the registry on request, and from Painter
+    itself the first time the two ever connect.
+    """
+
+    bl_idname = __name__
+
+    painter_executable: bpy.props.StringProperty(
+        name="Painter",
+        description="Adobe Substance 3D Painter executable, used to start it on demand",
+        subtype="FILE_PATH", default="")
+    auto_launch: bpy.props.BoolProperty(
+        name="Start Painter When Sending",
+        description="If Painter is not attached when a mesh is sent, start it; the mesh "
+                    "waits in the arena and Painter takes it as it opens",
+        default=True)
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row(align=True)
+        row.prop(self, "painter_executable")
+        row.operator(RURIBRIDGE_OT_locate_painter.bl_idname, text="", icon="VIEWZOOM")
+        layout.prop(self, "auto_launch")
+
+
+def preferences():
+    entry = bpy.context.preferences.addons.get(__name__)
+    return entry.preferences if entry else None
+
+
+def painter_executable():
+    """The configured path, or whatever Windows recorded about the install."""
+    stored = preferences()
+    if stored is not None and stored.painter_executable:
+        return bpy.path.abspath(stored.painter_executable)
+    return painter_host.discover_executable()
+
+
+def remember_painter_executable(path):
+    stored = preferences()
+    if stored is not None and path and not stored.painter_executable:
+        stored.painter_executable = path
+        LOG.info("learned where Painter lives: %s", path)
+
+
+def painter_is_attached():
+    """Whether Painter's half of the bridge is alive, not whether it is running.
+
+    The heartbeat answers the question that matters. A Painter with its plugin
+    switched off is running and will never respond, and starting a second copy
+    because a process check said "no" would be worse than saying so.
+    """
+    if not CONNECTION.is_open:
+        return False
+    return CONNECTION.arena.read_slot(record_module.CHANNEL_TO_BLENDER).writer_is_live
+
+
+class RURIBRIDGE_OT_locate_painter(bpy.types.Operator):
+    bl_idname = "ruri_bridge.locate_painter"
+    bl_label = "Find Painter"
+    bl_description = "Read Painter's install path out of the Windows registry"
+
+    def execute(self, context):
+        found = painter_host.discover_executable()
+        if found is None:
+            self.report({"ERROR"},
+                        "Windows has no record of a Painter install; set the path by hand")
+            return {"CANCELLED"}
+        preferences().painter_executable = found
+        self.report({"INFO"}, found)
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_launch_painter(bpy.types.Operator):
+    bl_idname = "ruri_bridge.launch_painter"
+    bl_label = "Start Painter"
+    bl_description = "Start Substance 3D Painter and let it attach to this session"
+
+    def execute(self, context):
+        settings = context.scene.ruri_bridge
+        if painter_is_attached():
+            self.report({"INFO"}, "Painter is already attached")
+            return {"FINISHED"}
+        if painter_host.is_running():
+            settings.status = ("Painter is running but its RuriBridge plugin is off; "
+                               "switch it on in Painter's Python menu")
+            self.report({"WARNING"}, settings.status)
+            return {"CANCELLED"}
+        try:
+            executable = painter_host.launch(painter_executable(), settings.session)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        remember_painter_executable(executable)
+        settings.status = "starting Painter; it attaches on its own"
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_reconnect(bpy.types.Operator):
+    bl_idname = "ruri_bridge.reconnect"
+    bl_label = "Reattach"
+    bl_description = "Attach to the named session again"
 
     def execute(self, context):
         settings = context.scene.ruri_bridge
@@ -436,39 +541,45 @@ class RURIBRIDGE_OT_connect(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class RURIBRIDGE_OT_disconnect(bpy.types.Operator):
-    bl_idname = "ruri_bridge.disconnect"
-    bl_label = "Detach"
-    bl_description = "Release the mapping"
-
-    def execute(self, context):
-        _stop_timer()
-        CONNECTION.close()
-        context.scene.ruri_bridge.status = "detached"
-        return {"FINISHED"}
-
-
 class RURIBRIDGE_OT_publish_mesh(bpy.types.Operator):
     bl_idname = "ruri_bridge.publish_mesh"
-    bl_label = "Send Mesh"
-    bl_description = "Write the scoped objects into the arena for Painter"
+    bl_label = "Send To Painter"
+    bl_description = ("Write the scoped objects into the shared arena, starting Painter if "
+                      "it is not attached. This is also what starts live sync")
 
     def execute(self, context):
         settings = context.scene.ruri_bridge
+        if not CONNECTION.is_open:
+            bpy.ops.ruri_bridge.reconnect()
+        starting = False
+        stored = preferences()
+        if not painter_is_attached() and stored is not None and stored.auto_launch:
+            if painter_host.is_running():
+                self.report({"WARNING"},
+                            "Painter is running but its RuriBridge plugin is off")
+            else:
+                try:
+                    remember_painter_executable(
+                        painter_host.launch(painter_executable(), settings.session))
+                    starting = True
+                except Exception as error:
+                    self.report({"WARNING"}, str(error))
         try:
             generation = publish_mesh(context, settings.scope, settings.intent,
                                       settings.include_colors)
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        settings.status = "sent mesh generation {0}".format(generation.number)
+        settings.status = "sent mesh {0}{1}".format(
+            generation.number,
+            "; Painter is starting and takes it as it opens" if starting else "")
         self.report({"INFO"}, settings.status)
         return {"FINISHED"}
 
 
 class RURIBRIDGE_OT_request_export(bpy.types.Operator):
     bl_idname = "ruri_bridge.request_export"
-    bl_label = "Request Textures"
+    bl_label = "Ask For Textures"
     bl_description = "Ask Painter to render its channels into the arena now"
 
     def execute(self, context):
@@ -478,24 +589,24 @@ class RURIBRIDGE_OT_request_export(bpy.types.Operator):
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        settings.status = "requested export {0}".format(generation.number)
+        settings.status = "asked for textures, generation {0}".format(generation.number)
         return {"FINISHED"}
 
 
 class RURIBRIDGE_OT_push_shader_parameters(bpy.types.Operator):
     bl_idname = "ruri_bridge.push_shader_parameters"
     bl_label = "Send Shader Values"
-    bl_description = ("Offer each scoped material's custom properties to the shader "
-                      "Painter runs on the matching Texture Set")
+    bl_description = ("Offer each scoped material's custom properties to the shader Painter "
+                      "runs on the matching Texture Set")
 
     def execute(self, context):
         settings = context.scene.ruri_bridge
         try:
-            generation = push_shader_parameters(context, settings.scope)
+            push_shader_parameters(context, settings.scope)
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        settings.status = "sent shader values, generation {0}".format(generation.number)
+        settings.status = "sent shader values"
         self.report({"INFO"}, settings.status)
         return {"FINISHED"}
 
@@ -503,8 +614,8 @@ class RURIBRIDGE_OT_push_shader_parameters(bpy.types.Operator):
 class RURIBRIDGE_OT_pull_textures(bpy.types.Operator):
     bl_idname = "ruri_bridge.pull_textures"
     bl_label = "Pull Latest Textures"
-    bl_description = ("Ingest the newest textures Painter published, even if it "
-                      "published them before this session attached")
+    bl_description = ("Ingest the newest textures Painter published, even if it published "
+                      "them before this session attached")
 
     def execute(self, context):
         settings = context.scene.ruri_bridge
@@ -530,51 +641,78 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
     def draw(self, context):
         settings = context.scene.ruri_bridge
         layout = self.layout
-        row = layout.row(align=True)
-        row.prop(settings, "session", text="")
-        if CONNECTION.is_open:
-            row.operator(RURIBRIDGE_OT_disconnect.bl_idname, text="", icon="UNLINKED")
+
+        state = layout.box()
+        if not CONNECTION.is_open:
+            state.label(text="Not attached to a session", icon="UNLINKED")
+            state.operator(RURIBRIDGE_OT_reconnect.bl_idname, icon="LINKED")
+        elif painter_is_attached():
+            state.label(text="Painter is attached", icon="LINKED")
         else:
-            row.operator(RURIBRIDGE_OT_connect.bl_idname, text="", icon="LINKED")
+            state.label(text="Painter is not attached", icon="UNLINKED")
+            row = state.row(align=True)
+            row.operator(RURIBRIDGE_OT_launch_painter.bl_idname, icon="PLAY")
+            row.operator(RURIBRIDGE_OT_locate_painter.bl_idname, text="", icon="VIEWZOOM")
 
         column = layout.column(align=True)
         column.enabled = CONNECTION.is_open
         column.prop(settings, "scope")
         column.prop(settings, "intent")
         column.prop(settings, "include_colors")
+        column.separator()
         column.operator(RURIBRIDGE_OT_publish_mesh.bl_idname, icon="EXPORT")
-        column.operator(RURIBRIDGE_OT_push_shader_parameters.bl_idname, icon="NODE_MATERIAL")
 
-        column = layout.column(align=True)
-        column.enabled = CONNECTION.is_open
-        column.prop(settings, "export_preset", text="Preset")
-        column.prop(settings, "bind_on_receive")
-        column.operator(RURIBRIDGE_OT_request_export.bl_idname, icon="IMPORT")
-        column.operator(RURIBRIDGE_OT_pull_textures.bl_idname, icon="FILE_REFRESH")
-
-        box = layout.box()
-        box.prop(settings, "live_sync")
-        row = box.row(align=True)
+        live = layout.box()
+        live.prop(settings, "live_sync")
+        row = live.row(align=True)
         row.enabled = settings.live_sync
         row.prop(settings, "live_shader_values", toggle=True)
         row.prop(settings, "live_mesh", toggle=True)
         if CONNECTION.is_open and not CONNECTION.published_objects:
-            box.label(text="send the mesh once to start live sync", icon="INFO")
+            live.label(text="Send the mesh once to start live sync", icon="INFO")
 
+        manual = layout.column(align=True)
+        manual.enabled = CONNECTION.is_open
+        manual.prop(settings, "export_preset", text="Preset")
+        manual.prop(settings, "bind_on_receive")
+        manual.operator(RURIBRIDGE_OT_request_export.bl_idname, icon="IMPORT")
+        manual.operator(RURIBRIDGE_OT_pull_textures.bl_idname, icon="FILE_REFRESH")
+        manual.operator(RURIBRIDGE_OT_push_shader_parameters.bl_idname, icon="NODE_MATERIAL")
+
+        if settings.status:
+            layout.box().label(text=settings.status, icon="INFO")
+
+
+class RURIBRIDGE_PT_diagnostics(bpy.types.Panel):
+    bl_label = "Channels"
+    bl_idname = "RURIBRIDGE_PT_diagnostics"
+    bl_parent_id = "RURIBRIDGE_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "RuriBridge"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        settings = context.scene.ruri_bridge
+        layout = self.layout
+        row = layout.row(align=True)
+        row.prop(settings, "session", text="")
+        row.operator(RURIBRIDGE_OT_reconnect.bl_idname, text="", icon="FILE_REFRESH")
         layout.prop(settings, "poll_seconds")
-        box = layout.box()
-        box.label(text=settings.status, icon="INFO")
-        if CONNECTION.is_open:
-            for state in CONNECTION.arena.describe():
-                box.label(text="{0}: gen {1} ack {2} drop {3}".format(
-                    state.channel, state.generation, state.acknowledged_generation,
-                    state.dropped_generations))
+        if not CONNECTION.is_open:
+            return
+        layout.label(text=str(CONNECTION.arena.directory))
+        for state in CONNECTION.arena.describe():
+            layout.label(text="{0}: gen {1} ack {2} drop {3}".format(
+                state.channel, state.generation, state.acknowledged_generation,
+                state.dropped_generations))
 
 
-_CLASSES = (RuriBridgeSettings, RURIBRIDGE_OT_connect, RURIBRIDGE_OT_disconnect,
+_CLASSES = (RuriBridgeSettings, RURIBRIDGE_OT_locate_painter, RuriBridgePreferences,
+            RURIBRIDGE_OT_launch_painter, RURIBRIDGE_OT_reconnect,
             RURIBRIDGE_OT_publish_mesh, RURIBRIDGE_OT_request_export,
             RURIBRIDGE_OT_pull_textures, RURIBRIDGE_OT_push_shader_parameters,
-            RURIBRIDGE_PT_panel)
+            RURIBRIDGE_PT_panel, RURIBRIDGE_PT_diagnostics)
 
 
 def register():
@@ -584,6 +722,11 @@ def register():
     for entry in _CLASSES:
         bpy.utils.register_class(entry)
     bpy.types.Scene.ruri_bridge = bpy.props.PointerProperty(type=RuriBridgeSettings)
+    try:
+        CONNECTION.open(arena_module.DEFAULT_SESSION)
+        _start_timer()
+    except Exception as error:
+        LOG.error("could not attach on start: %s", error)
 
 
 def unregister():

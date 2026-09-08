@@ -41,7 +41,7 @@ from .log import logger
 LOG = logger("arena")
 
 CONTROL_MAGIC = b"RURIBRDG"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 CONTROL_FILE_NAME = "control.bin"
 SESSION_DIRECTORY_NAME = "RuriDccBridge"
 ROOT_ENVIRONMENT_VARIABLE = "RURI_BRIDGE_ROOT"
@@ -59,9 +59,11 @@ SLOT_OFFSET_ACKNOWLEDGED = 56
 SLOT_OFFSET_DROPPED = 64
 SLOT_OFFSET_WRITER_PROCESS = 72
 SLOT_OFFSET_INLINE_BYTES = 80
+SLOT_OFFSET_HEARTBEAT = 88
 
 MAX_OUTSTANDING_GENERATIONS = 8
 SEQLOCK_READ_ATTEMPTS = 64
+PRESENCE_SECONDS = 3.0
 
 FILE_ATTRIBUTE_TEMPORARY = 0x00000100
 
@@ -108,10 +110,12 @@ class SlotState:
     """One consistent read of a channel slot."""
 
     __slots__ = ("channel", "sequence", "generation", "payload_bytes",
-                 "acknowledged_generation", "dropped_generations", "writer_process_id")
+                 "acknowledged_generation", "dropped_generations", "writer_process_id",
+                 "heartbeat")
 
     def __init__(self, channel, sequence, generation, payload_bytes,
-                 acknowledged_generation, dropped_generations, writer_process_id):
+                 acknowledged_generation, dropped_generations, writer_process_id,
+                 heartbeat=0):
         self.channel = channel
         self.sequence = sequence
         self.generation = generation
@@ -119,6 +123,20 @@ class SlotState:
         self.acknowledged_generation = acknowledged_generation
         self.dropped_generations = dropped_generations
         self.writer_process_id = writer_process_id
+        self.heartbeat = heartbeat
+
+    @property
+    def writer_is_live(self):
+        """Whether the side that owns this channel is attached right now.
+
+        A stamp the writer refreshes on every pump, rather than a process
+        lookup: the question is not whether an application is running but
+        whether its half of the bridge is attached, and only the plugin itself
+        can answer that.
+        """
+        if not self.heartbeat:
+            return False
+        return (time.time_ns() - self.heartbeat) < PRESENCE_SECONDS * 1e9
 
     def __repr__(self):
         return ("SlotState(channel={0!r}, sequence={1}, generation={2}, "
@@ -284,9 +302,10 @@ class Arena:
             acknowledged = self._read_unsigned_64(base + SLOT_OFFSET_ACKNOWLEDGED)
             dropped = self._read_unsigned_64(base + SLOT_OFFSET_DROPPED)
             writer = _UNSIGNED_32.unpack_from(self._control, base + SLOT_OFFSET_WRITER_PROCESS)[0]
+            heartbeat = self._read_unsigned_64(base + SLOT_OFFSET_HEARTBEAT)
             if self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE) == first:
                 return SlotState(channel, first, generation, payload_bytes,
-                                 acknowledged, dropped, writer)
+                                 acknowledged, dropped, writer, heartbeat)
         raise ArenaError(
             "slot {0!r} never settled in {1} attempts; a writer is wedged mid-publish".format(
                 channel, SEQLOCK_READ_ATTEMPTS))
@@ -302,6 +321,18 @@ class Arena:
             self._write_unsigned_64(base + SLOT_OFFSET_DROPPED, dropped_generations)
         _UNSIGNED_32.pack_into(self._control, base + SLOT_OFFSET_WRITER_PROCESS, os.getpid())
         self._write_unsigned_64(base + SLOT_OFFSET_SEQUENCE, sequence + 2)
+
+    def touch(self, channel):
+        """Say "my half is still attached". One aligned store, no seqlock.
+
+        Deliberately outside the seqlock: a torn read of a timestamp can only
+        make presence look slightly stale, which the next pump corrects, and
+        making every pump take the lock would put a write on the hot path for
+        a value nobody makes decisions on beyond "recent or not".
+        """
+        base = HEADER_SIZE + self.slot_index(channel) * SLOT_SIZE
+        self._write_unsigned_64(base + SLOT_OFFSET_HEARTBEAT, time.time_ns())
+        _UNSIGNED_32.pack_into(self._control, base + SLOT_OFFSET_WRITER_PROCESS, os.getpid())
 
     def acknowledge(self, channel, generation):
         """Record how far the reader has consumed. One aligned store, no lock."""

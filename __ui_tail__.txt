@@ -1,0 +1,175 @@
+class RURIBRIDGE_OT_connect(bpy.types.Operator):
+    bl_idname = "ruri_bridge.connect"
+    bl_label = "Attach"
+    bl_description = "Attach to the arena session, building it if nobody has yet"
+
+    def execute(self, context):
+        settings = context.scene.ruri_bridge
+        try:
+            attached = CONNECTION.open(settings.session)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        settings.status = "attached: {0}".format(attached.directory)
+        _start_timer()
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_disconnect(bpy.types.Operator):
+    bl_idname = "ruri_bridge.disconnect"
+    bl_label = "Detach"
+    bl_description = "Release the mapping"
+
+    def execute(self, context):
+        _stop_timer()
+        CONNECTION.close()
+        context.scene.ruri_bridge.status = "detached"
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_publish_mesh(bpy.types.Operator):
+    bl_idname = "ruri_bridge.publish_mesh"
+    bl_label = "Send Mesh"
+    bl_description = "Write the scoped objects into the arena for Painter"
+
+    def execute(self, context):
+        settings = context.scene.ruri_bridge
+        try:
+            generation = publish_mesh(context, settings.scope, settings.intent,
+                                      settings.include_colors)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        settings.status = "sent mesh generation {0}".format(generation.number)
+        self.report({"INFO"}, settings.status)
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_request_export(bpy.types.Operator):
+    bl_idname = "ruri_bridge.request_export"
+    bl_label = "Request Textures"
+    bl_description = "Ask Painter to render its channels into the arena now"
+
+    def execute(self, context):
+        settings = context.scene.ruri_bridge
+        try:
+            generation = request_export(settings.export_preset)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        settings.status = "requested export {0}".format(generation.number)
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_push_shader_parameters(bpy.types.Operator):
+    bl_idname = "ruri_bridge.push_shader_parameters"
+    bl_label = "Send Shader Values"
+    bl_description = ("Offer each scoped material's custom properties to the shader "
+                      "Painter runs on the matching Texture Set")
+
+    def execute(self, context):
+        settings = context.scene.ruri_bridge
+        try:
+            generation = push_shader_parameters(context, settings.scope)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        settings.status = "sent shader values, generation {0}".format(generation.number)
+        self.report({"INFO"}, settings.status)
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_pull_textures(bpy.types.Operator):
+    bl_idname = "ruri_bridge.pull_textures"
+    bl_label = "Pull Latest Textures"
+    bl_description = ("Ingest the newest textures Painter published, even if it "
+                      "published them before this session attached")
+
+    def execute(self, context):
+        settings = context.scene.ruri_bridge
+        try:
+            generation, report = ingest_latest_textures(settings.bind_on_receive)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        bound = sum(entry["bound_nodes"] for entry in report)
+        settings.status = "pulled generation {0}: {1} texture set(s), {2} node(s) bound".format(
+            generation.number, len(report), bound)
+        self.report({"INFO"}, settings.status)
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_PT_panel(bpy.types.Panel):
+    bl_label = "RuriBridge"
+    bl_idname = "RURIBRIDGE_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "RuriBridge"
+
+    def draw(self, context):
+        settings = context.scene.ruri_bridge
+        layout = self.layout
+        row = layout.row(align=True)
+        row.prop(settings, "session", text="")
+        if CONNECTION.is_open:
+            row.operator(RURIBRIDGE_OT_disconnect.bl_idname, text="", icon="UNLINKED")
+        else:
+            row.operator(RURIBRIDGE_OT_connect.bl_idname, text="", icon="LINKED")
+
+        column = layout.column(align=True)
+        column.enabled = CONNECTION.is_open
+        column.prop(settings, "scope")
+        column.prop(settings, "intent")
+        column.prop(settings, "include_colors")
+        column.operator(RURIBRIDGE_OT_publish_mesh.bl_idname, icon="EXPORT")
+        column.operator(RURIBRIDGE_OT_push_shader_parameters.bl_idname, icon="NODE_MATERIAL")
+
+        column = layout.column(align=True)
+        column.enabled = CONNECTION.is_open
+        column.prop(settings, "export_preset", text="Preset")
+        column.prop(settings, "bind_on_receive")
+        column.operator(RURIBRIDGE_OT_request_export.bl_idname, icon="IMPORT")
+        column.operator(RURIBRIDGE_OT_pull_textures.bl_idname, icon="FILE_REFRESH")
+
+        box = layout.box()
+        box.prop(settings, "live_sync")
+        row = box.row(align=True)
+        row.enabled = settings.live_sync
+        row.prop(settings, "live_shader_values", toggle=True)
+        row.prop(settings, "live_mesh", toggle=True)
+        if CONNECTION.is_open and not CONNECTION.published_objects:
+            box.label(text="send the mesh once to start live sync", icon="INFO")
+
+        layout.prop(settings, "poll_seconds")
+        box = layout.box()
+        box.label(text=settings.status, icon="INFO")
+        if CONNECTION.is_open:
+            for state in CONNECTION.arena.describe():
+                box.label(text="{0}: gen {1} ack {2} drop {3}".format(
+                    state.channel, state.generation, state.acknowledged_generation,
+                    state.dropped_generations))
+
+
+_CLASSES = (RuriBridgeSettings, RURIBRIDGE_OT_connect, RURIBRIDGE_OT_disconnect,
+            RURIBRIDGE_OT_publish_mesh, RURIBRIDGE_OT_request_export,
+            RURIBRIDGE_OT_pull_textures, RURIBRIDGE_OT_push_shader_parameters,
+            RURIBRIDGE_PT_panel)
+
+
+def register():
+    log_module.install_stream_sink()
+    if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
+    for entry in _CLASSES:
+        bpy.utils.register_class(entry)
+    bpy.types.Scene.ruri_bridge = bpy.props.PointerProperty(type=RuriBridgeSettings)
+
+
+def unregister():
+    _stop_timer()
+    if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
+    CONNECTION.close()
+    del bpy.types.Scene.ruri_bridge
+    for entry in reversed(_CLASSES):
+        bpy.utils.unregister_class(entry)

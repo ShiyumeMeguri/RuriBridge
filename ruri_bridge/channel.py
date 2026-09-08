@@ -200,6 +200,23 @@ class Subscriber:
                 return Generation(self.channel, number, directory, payload)
         return None
 
+    def catch_up(self, kind):
+        """Acknowledge history, but stop short of the newest generation of a kind.
+
+        Used when a host attaches and finds work already waiting. Skipping
+        everything would throw away exactly the thing the other side published a
+        moment ago -- the whole point of publishing before the other application
+        was even started -- while replaying everything would re-apply meshes that
+        have since been superseded. What matters is the newest generation of the
+        kind being waited for, and whatever came after it.
+        """
+        newest = self.latest(kind)
+        if newest is None:
+            return self.skip_to_latest()
+        self._acknowledged = max(self._acknowledged, newest.number - 1)
+        self.arena.acknowledge(self.channel, self._acknowledged)
+        return self._acknowledged
+
     def pending(self):
         """Every unacknowledged generation still on disk, oldest first."""
         state = self.arena.read_slot(self.channel)
