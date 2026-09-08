@@ -34,7 +34,6 @@ from . import record as record_module
 
 LOG = log_module.logger("cli")
 
-BLENDER_ADDON_DIRECTORY_NAME = "blender_addon"
 PAINTER_PLUGIN_DIRECTORY_NAME = "painter_plugin"
 INSTALLED_NAME = "RuriBridge"
 DEFAULT_EXPORT_PRESET = "Document channels + Normal + AO (No Alpha)"
@@ -291,6 +290,38 @@ def command_request_export(arguments):
     return _run_blender(arguments, body)
 
 
+def command_push_shader_values(arguments):
+    body = (
+        "    generation = module.push_shader_parameters(bpy.context, {scope!r})\n"
+        "    print({marker!r}, 'shader values', generation.number)"
+    ).format(scope=arguments.scope, marker=MARKER)
+    return _run_blender(arguments, body)
+
+
+def command_shaders(arguments):
+    """What Painter last said about its shaders, from outside both hosts."""
+    with _open(arguments) as arena:
+        subscriber = channel_module.Subscriber(arena, record_module.CHANNEL_TO_BLENDER)
+        generation = subscriber.latest(record_module.KIND_SHADER_STATE)
+        if generation is None:
+            print("Painter has not published a shader state")
+            return 1
+        payload = generation.record
+        print("generation {0}".format(generation.number))
+        for entry in payload["instances"]:
+            print("instance {0}  {1}  ({2})".format(entry["id"], entry["label"], entry["shader"]))
+            for texture_set, body in sorted(
+                    payload["assignment"].get("texturesets", {}).items()):
+                if body.get("shader") == entry["label"]:
+                    print("  texture set {0}".format(texture_set))
+            for name, item in sorted(payload["parameters"].get(str(entry["id"]), {}).items()):
+                if arguments.name and arguments.name not in name:
+                    continue
+                print("  {0:<32} {1:<8} {2}".format(
+                    name, item["description"]["dataType"], item.get("value")))
+    return 0
+
+
 def command_pull_textures(arguments):
     if arguments.wait:
         body = (
@@ -390,26 +421,22 @@ def enable_painter_plugin(name=INSTALLED_NAME):
 
 
 def command_install(arguments):
+    """Point Painter at this checkout. Blender already has it -- it lives there.
+
+    The checkout *is* the Blender add-on, so there is nothing to install on that
+    side; only Painter needs a junction into the plugin folder inside it.
+    """
     root = _repository_root()
-    targets = []
-    if arguments.blender_addons:
-        targets.append((root / BLENDER_ADDON_DIRECTORY_NAME,
-                        Path(arguments.blender_addons) / INSTALLED_NAME))
-    if arguments.painter_plugins:
-        targets.append((root / PAINTER_PLUGIN_DIRECTORY_NAME,
-                        Path(arguments.painter_plugins) / INSTALLED_NAME))
-    if not targets:
-        print("nothing to do: pass --blender-addons and/or --painter-plugins")
-        return 1
-    for source, target in targets:
-        action = _link_or_copy(source, target, arguments.copy)
-        print("{0} {1} -> {2}".format(action, target, source))
+    print("blender add-on   {0}".format(root))
+    target = Path(arguments.painter_plugins) / INSTALLED_NAME
+    action = _link_or_copy(root / PAINTER_PLUGIN_DIRECTORY_NAME, target, arguments.copy)
+    print("painter plugin   {0} {1}".format(action, target))
     if arguments.enable_painter_plugin:
-        print("painter launch_at_start = {0} (takes effect at Painter's next start)".format(
+        print("painter launch_at_start = {0} (read at Painter's next start)".format(
             enable_painter_plugin()))
     if arguments.copy:
-        print("copies cannot find the shared core above themselves; "
-              "junction instead unless the whole checkout was copied")
+        print("a copied plugin folder cannot find the shared core above it; "
+              "junction unless the whole checkout was copied")
     return 0
 
 
@@ -457,6 +484,15 @@ def build_parser():
     request.add_argument("--preset", default=DEFAULT_EXPORT_PRESET)
     request.set_defaults(handler=command_request_export)
 
+    push_values = subparsers.add_parser("push-shader-values")
+    add_blender_arguments(push_values)
+    push_values.add_argument("--scope", default="VISIBLE", choices=["SELECTED", "VISIBLE"])
+    push_values.set_defaults(handler=command_push_shader_values)
+
+    shaders = subparsers.add_parser("shaders")
+    shaders.add_argument("--name", default=None, help="only parameters containing this text")
+    shaders.set_defaults(handler=command_shaders)
+
     pull = subparsers.add_parser("pull-textures")
     add_blender_arguments(pull)
     pull.add_argument("--wait", action="store_true",
@@ -468,8 +504,8 @@ def build_parser():
     pull.set_defaults(handler=command_pull_textures)
 
     install = subparsers.add_parser("install")
-    install.add_argument("--blender-addons", default=None)
-    install.add_argument("--painter-plugins", default=None)
+    install.add_argument("--painter-plugins", required=True,
+                         help="Painter's user python/plugins folder")
     install.add_argument("--copy", action="store_true",
                          help="copy instead of creating a directory junction")
     install.add_argument("--enable-painter-plugin", action="store_true",

@@ -53,16 +53,14 @@ class AttributeSource:
 class ObjectData:
     """One source object, resolved down to index arrays and its own buffers."""
 
-    __slots__ = ("name", "node_matrix", "vertex_count", "sources", "primitives",
-                 "material_rows")
+    __slots__ = ("name", "node_matrix", "vertex_count", "sources", "primitives")
 
-    def __init__(self, name, node_matrix, vertex_count, sources, primitives, material_rows):
+    def __init__(self, name, node_matrix, vertex_count, sources, primitives):
         self.name = name
         self.node_matrix = node_matrix
         self.vertex_count = vertex_count
         self.sources = sources
         self.primitives = primitives
-        self.material_rows = material_rows
 
 
 def _column_major(matrix):
@@ -92,6 +90,23 @@ def _material_row(material):
         if groups:
             row["node_groups"] = groups
     return row
+
+
+def collect_material_rows(objects):
+    """Every distinct material row across these objects, first use wins.
+
+    One collection point, because a mesh publish and a shader push must offer the
+    other side the same idea of what a material is.
+    """
+    rows = []
+    seen = set()
+    for object_reference in objects:
+        for slot in object_reference.material_slots:
+            if slot.material is None or slot.material.name in seen:
+                continue
+            seen.add(slot.material.name)
+            rows.append(_material_row(slot.material))
+    return rows
 
 
 def _slot_material_names(object_reference):
@@ -207,11 +222,9 @@ def gather_object(object_reference, depsgraph, include_colors=True):
                     else material_names[-1])
             primitives.append((name, inverse[rows]))
 
-        rows = [_material_row(slot.material) for slot in object_reference.material_slots
-                if slot.material is not None]
         return ObjectData(object_reference.name,
                           _column_major(object_reference.matrix_world),
-                          int(order.shape[0]), sources, primitives, rows)
+                          int(order.shape[0]), sources, primitives)
     finally:
         evaluated.to_mesh_clear()
 
@@ -289,18 +302,10 @@ def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
     with publisher.staging() as staging:
         scene_description = write_glb(
             arena, staging.path(record_module.SCENE_FILE_NAME), gathered)
-        material_rows = []
-        seen = set()
-        for entry in gathered:
-            for row in entry.material_rows:
-                if row["name"] in seen:
-                    continue
-                seen.add(row["name"])
-                material_rows.append(row)
         return staging.publish(record_module.mesh(
             source="blender",
             intent=intent,
             scene=scene_description,
-            materials=material_rows,
+            materials=collect_material_rows(objects_to_send),
             unit_scale=unit_scale,
             up_axis="Z"))

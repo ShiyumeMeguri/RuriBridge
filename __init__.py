@@ -7,9 +7,10 @@ is a file that already lives in those pages by the time this side is told about
 it. The polling pump is a Blender timer reading a few integers out of the mapped
 control block, which is what a shared-memory bridge costs when idle.
 
-The shared core is imported from the repository this package sits in rather than
-from a copy: the path is resolved through ``realpath`` so a directory junction
-into Blender's add-on folder lands on the real checkout.
+The checkout lives here, in Blender's add-on folder, and Painter reaches the same
+files through a directory junction. So the shared core is found by looking in
+this package first and then above it -- the add-on sits on top of the core, the
+Painter plugin sits one level below it, and one search covers both.
 """
 
 import os
@@ -18,7 +19,7 @@ import sys
 
 def _install_core_path():
     here = os.path.dirname(os.path.realpath(__file__))
-    candidate = os.path.dirname(here)
+    candidate = here
     while True:
         if os.path.isfile(os.path.join(candidate, "ruri_bridge", "__init__.py")):
             if candidate not in sys.path:
@@ -27,9 +28,8 @@ def _install_core_path():
         parent = os.path.dirname(candidate)
         if parent == candidate:
             raise ImportError(
-                "RuriBridge cannot find the ruri_bridge core above {0}; the add-on must "
-                "stay inside its checkout (junction the checkout, do not copy one "
-                "folder out of it)".format(here))
+                "RuriBridge cannot find the ruri_bridge core at or above {0}; the "
+                "add-on must stay inside its checkout".format(here))
         candidate = parent
 
 
@@ -73,7 +73,7 @@ class _Connection:
         self.arena = None
         self.publisher = None
         self.subscriber = None
-        self.last_report = ""
+        self.last_state = {}
 
     @property
     def is_open(self):
@@ -139,6 +139,25 @@ def request_export(preset_name, resolution_log2=None):
     return CONNECTION.publisher.publish_record(payload)
 
 
+def push_shader_parameters(context, scope="SELECTED"):
+    """Offer each material's data row to whatever shader Painter runs on it.
+
+    Blender does not filter by name here. It cannot know which uniforms the
+    shader on the other side exposes, and a table of names kept on this side
+    would be a second truth source for something Painter can be asked directly,
+    so the whole row goes and Painter reports what it could not use.
+    """
+    if not CONNECTION.is_open:
+        raise RuntimeError("not attached to a bridge session")
+    rows = mesh_publish.collect_material_rows(objects_in_scope(context, scope))
+    values = {row["name"]: row["properties"] for row in rows if row.get("properties")}
+    if not values:
+        raise RuntimeError(
+            "no material in scope {0} carries any custom property to offer".format(scope))
+    return CONNECTION.publisher.publish_record(
+        record_module.shader_apply("blender", values))
+
+
 def ingest_latest_textures(bind=True):
     """Take whatever Painter last exported, even if it predates this session."""
     if not CONNECTION.is_open:
@@ -146,7 +165,7 @@ def ingest_latest_textures(bind=True):
     generation = CONNECTION.subscriber.latest(record_module.KIND_TEXTURES)
     if generation is None:
         raise RuntimeError("Painter has not published any textures on this session")
-    report = texture_ingest.ingest(generation, bind=bind)
+    report = texture_ingest.ingest(generation, CONNECTION.arena.session, bind=bind)
     CONNECTION.subscriber.acknowledge(generation)
     return generation, report
 
@@ -165,8 +184,11 @@ def pump(bind=True):
         try:
             if generation.kind == record_module.KIND_TEXTURES:
                 handled.append((generation.number, generation.kind,
-                                texture_ingest.ingest(generation, bind=bind)))
-            elif generation.kind == record_module.KIND_PROJECT_STATE:
+                                texture_ingest.ingest(
+                                    generation, CONNECTION.arena.session, bind=bind)))
+            elif generation.kind in (record_module.KIND_PROJECT_STATE,
+                                     record_module.KIND_SHADER_STATE):
+                CONNECTION.last_state[generation.kind] = generation.record
                 handled.append((generation.number, generation.kind, generation.record))
             else:
                 LOG.warning("ignoring generation %d of unknown kind %r",
@@ -321,6 +343,24 @@ class RURIBRIDGE_OT_request_export(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class RURIBRIDGE_OT_push_shader_parameters(bpy.types.Operator):
+    bl_idname = "ruri_bridge.push_shader_parameters"
+    bl_label = "Send Shader Values"
+    bl_description = ("Offer each scoped material's custom properties to the shader "
+                      "Painter runs on the matching Texture Set")
+
+    def execute(self, context):
+        settings = context.scene.ruri_bridge
+        try:
+            generation = push_shader_parameters(context, settings.scope)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        settings.status = "sent shader values, generation {0}".format(generation.number)
+        self.report({"INFO"}, settings.status)
+        return {"FINISHED"}
+
+
 class RURIBRIDGE_OT_pull_textures(bpy.types.Operator):
     bl_idname = "ruri_bridge.pull_textures"
     bl_label = "Pull Latest Textures"
@@ -364,6 +404,7 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         column.prop(settings, "intent")
         column.prop(settings, "include_colors")
         column.operator(RURIBRIDGE_OT_publish_mesh.bl_idname, icon="EXPORT")
+        column.operator(RURIBRIDGE_OT_push_shader_parameters.bl_idname, icon="NODE_MATERIAL")
 
         column = layout.column(align=True)
         column.enabled = CONNECTION.is_open
@@ -384,7 +425,8 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
 
 _CLASSES = (RuriBridgeSettings, RURIBRIDGE_OT_connect, RURIBRIDGE_OT_disconnect,
             RURIBRIDGE_OT_publish_mesh, RURIBRIDGE_OT_request_export,
-            RURIBRIDGE_OT_pull_textures, RURIBRIDGE_PT_panel)
+            RURIBRIDGE_OT_pull_textures, RURIBRIDGE_OT_push_shader_parameters,
+            RURIBRIDGE_PT_panel)
 
 
 def register():

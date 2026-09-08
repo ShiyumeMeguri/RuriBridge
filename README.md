@@ -3,18 +3,22 @@
 Blender 5.x ⇄ Adobe Substance 3D Painter 的共享内存桥。网格从 Blender 直接写进
 Painter 会映射的**同一批物理页**,通道贴图从 Painter 原样回到 Blender。
 
-一个仓库,两个宿主入口,一份共享核心 —— 用目录联接挂进两个宿主,不复制、不分叉。
+**检出就住在 Blender 的 addons 目录里**,仓库根即 Blender 插件;Painter 用目录联接指回来。
+一份共享核心,不复制、不分叉。
 
 ```
-RuriDccBridge/
+<Blender scripts>/addons/RuriBridge/     ← 检出本体,也是 Blender 插件
+  __init__.py        bl_info / 面板 / 算子 / 定时器泵
+  mesh_publish.py    网格 → 映射页
+  texture_ingest.py  通道 → 图像数据块
   ruri_bridge/       共享核心。不 import bpy,不 import substance_painter,纯标准库
     arena.py         会话竞技场:控制块(seqlock 槽) + 不可变 generation 目录
     channel.py       单写者发布/订阅,append-only,未确认的不丢
     record.py        线格式:通道、记录种类、色彩空间判据
     glb.py           就地 GLB:先按计数排好版再映射,生产者一次写入即成品
     cli.py           无宿主的命令行:观测、验证、驱动
-  blender_addon/     Blender 插件(需要 numpy,Blender 自带)
-  painter_plugin/    Painter 插件(纯标准库 + PySide6 + substance_painter)
+  painter_plugin/    ← Painter 的 plugins 目录联接到这里
+    shader_state.py  经 substance_painter.js 读写视口着色器实例
 ```
 
 ## 为什么是这个机制
@@ -39,8 +43,13 @@ read 这一轮。竞技场创建的每个文件都带 `FILE_ATTRIBUTE_TEMPORARY`
 |---|---|---|
 | Blender 网格 → 竞技场 | **1 次** | `numpy.take(值, 顺序, out=映射页)`,直接 gather 进页面 |
 | 竞技场 → Painter 导入器 | **0 次** | Painter 打开的路径就是那批页,只是一次页查找 |
-| Painter 通道 → 竞技场 | **1 次** | Painter 的导出器自己写文件,写进的是页缓存 |
-| 竞技场 → Blender 图像 | **1 次** | bpy 没有借指针入口,`Image.pixels` 是 Blender 自己的 float 数组 |
+| Painter 通道 → 竞技场 | 1 次 | Painter 的导出器自己写文件,写进的是页缓存 |
+| 竞技场 → 耐久工作区 | 1 次 | 竞技场是传输,generation 被确认后就回收;图像不能指着它 |
+| 工作区 → Blender 图像 | 1 次 | bpy 没有借指针入口,`Image.pixels` 是 Blender 自己的 float 数组 |
+
+贴图腿**没有零拷贝可言**,这点不粉饰:接收缓冲区归 Blender 所有;落地那一步是为了让存盘后的
+.blend 不指向一块会被回收的传输区。工作区在 `%LOCALAPPDATA%\RuriDccBridge\textures\<会话>`,
+文件按名覆盖所以不随拉取次数增长,可用 `RURI_BRIDGE_TEXTURE_STORE` 改。**网格腿是真的零拷贝。**
 
 去重不物化它比较的值:两个角只要顶点索引相同,位置就必然相同,所以键 = 顶点索引 + 角域属性
 的原始 32 位字。点域数据完全不进键(顶点索引已经蕴含它),写的时候把两个索引数组复合起来,
@@ -48,15 +57,17 @@ read 这一轮。竞技场创建的每个文件都带 `FILE_ATTRIBUTE_TEMPORARY`
 
 ## 装进两个宿主
 
+Blender 侧不用装 —— 检出就在 addons 里。只需要把 Painter 指过来:
+
 ```bash
-python -m ruri_bridge.cli install --blender-addons "<Blender 用户 scripts>/addons" --painter-plugins "<Painter 用户 python>/plugins"
+python -m ruri_bridge.cli install --painter-plugins "<Painter 用户 python>/plugins" --enable-painter-plugin
 ```
 
-建的是目录联接(`mklink /J`,不需要管理员)。之后:
+建的是目录联接(`mklink /J`,不需要管理员)。`--enable-painter-plugin` 直接把
+`launch_at_start` 写进 QSettings(Windows 上就是注册表),**Painter 必须关着**——它在启动时读。
 
 - Blender:偏好设置 → 插件 → 启用 **RuriBridge**,面板在 3D 视图 N 面板 `RuriBridge` 页。
-- Painter:Python 菜单里勾上 **RuriBridge**(`plugins/` 下的插件是可选组件,勾一次就记住),
-  面板是一个停靠窗口。插件启动时会自动挂到默认会话。
+- Painter:插件随应用启动,面板是一个停靠窗口,启动时自动挂到默认会话。
 
 两侧必须用同一个会话名(默认 `default`,Painter 侧可用环境变量 `RURI_BRIDGE_SESSION` 覆盖)。
 会话根默认 `%TEMP%\RuriDccBridge`,可用 `RURI_BRIDGE_ROOT` 覆盖。
@@ -92,8 +103,8 @@ python -m ruri_bridge.cli pull-textures  --blender <blender.exe> --blend <场景
 
 | 通道 | 写者 | 记录种类 |
 |---|---|---|
-| `to_painter` | Blender | `mesh`(GLB + 材质数据行 + 意图)、`export_request` |
-| `to_blender` | Painter | `textures`(每张图的位深/格式/色彩空间)、`project_state` |
+| `to_painter` | Blender | `mesh`(GLB + 材质数据行 + 意图)、`export_request`、`shader_apply` |
+| `to_blender` | Painter | `textures`(每张图的位深/格式/色彩空间)、`project_state`、`shader_state` |
 
 `mesh` 记录里的 `materials` 是**原样搬运**的:名字 + Blender 材质的自定义属性 + 用到的节点组名。
 桥不解释它们 —— 着色器生成器改词汇,这里一行都不用动。
@@ -122,11 +133,29 @@ Painter 的 `Base_color`),两个通道归一化后同名则直接报错,不猜�
 代价说清楚:如果谁把 BaseColor 设成 RGB32F(线性 HDR 色彩),它会被标成 `Non-Color`。默认配置下
 与 `Linear Rec.709` 数值等价,非默认色彩管理下需要手动改。用格式单独判,这两种情况本来就区分不了。
 
+## 视口着色器参数
+
+`substance_painter` 包里**没有 `shaders` 模块** —— 着色器实例、参数、以及哪个纹理集跑哪个实例,
+只活在 `alg.shaders`。但 `substance_painter.js.evaluate` 本身就是 Python 入口,而且它**内部已经
+`json.loads`**,回来的是解析好的 Python 对象(类型标注写着 `-> str`,是过期的)。所以这条腿仍然
+是 Python 调 Painter。引擎是旧版,片段一律 ES5。
+
+Blender 侧**不按名字过滤**:它不可能知道对面的 shader 暴露了哪些 uniform,在这边维护一张名字表
+就是给一件能直接问出来的事造第二个真源。所以整行数据发过去,交集在 Painter 侧对着
+`alg.shaders.parameters` 算,算不上的**报回来**(`unknown` / `mismatched` / `unmapped`),
+不静默丢弃。类型按 `dataType` 的名字尾数推 arity(`Float3` → 3),所以出现 `Float4` 不用改代码。
+
+**共用实例是真陷阱**:默认工程里三个纹理集共用同一个「主要着色器」实例,所以针对两个材质的推送
+落在同一批 uniform 上。两边对同一个参数给了不同的值时,**两个都不写**,记进 `conflicting` ——
+静默取一个会让视口显示一个谁都没要求过的数。
+
+```bash
+python -m ruri_bridge.cli shaders --name intensity          # Painter 现在暴露什么、值多少
+python -m ruri_bridge.cli push-shader-values --blender <blender.exe> --blend <场景>
+```
+
 ## 已知边界
 
-- **Painter 的 Python API 没有 shader 参数面**。`substance_painter` 包里没有 `shaders` 模块,
-  参数只活在 JS 的 `alg.shaders`。所以桥不往 Painter 的视口 shader 里推 uniform,只把材质数据行
-  当数据搬过去。
 - 导出预设名按**实测目录**取(`Document channels + Normal + AO (No Alpha)`)。名字给错时错误信息
   会把 Painter 当前提供的全部预设列出来 —— 这条错误信息本身就是这个默认值第一次被改对的原因。
 - UDIM 摄取按 Blender 的 `<UDIM>` 平铺图实现了,但没有 UDIM 工程可跑,未实测。

@@ -26,8 +26,10 @@ CHANNELS = (CHANNEL_TO_PAINTER, CHANNEL_TO_BLENDER)
 
 KIND_MESH = "mesh"
 KIND_EXPORT_REQUEST = "export_request"
+KIND_SHADER_APPLY = "shader_apply"
 KIND_TEXTURES = "textures"
 KIND_PROJECT_STATE = "project_state"
+KIND_SHADER_STATE = "shader_state"
 
 INTENT_AUTO = "auto"
 INTENT_CREATE_PROJECT = "create_project"
@@ -137,6 +139,33 @@ def project_state(source, is_open, project_path, mesh_path, texture_sets):
         "project_path": project_path,
         "mesh_path": mesh_path,
         "texture_sets": texture_sets,
+    })
+    return record
+
+
+def shader_apply(source, values_by_texture_set, shader_url_by_texture_set=None):
+    """Blender -> Painter: offer these values to whatever shader each set runs.
+
+    The offer is deliberately unfiltered. Blender does not know which uniforms
+    Painter's shader exposes, and inventing a table of names here would be a
+    second truth source for something the shader can already be asked about, so
+    the intersection is computed on Painter's side and reported back.
+    """
+    record = _base(KIND_SHADER_APPLY, source)
+    record.update({
+        "by_texture_set": values_by_texture_set,
+        "shader_url_by_texture_set": shader_url_by_texture_set or {},
+    })
+    return record
+
+
+def shader_state(source, instances, parameters, assignment):
+    """Painter -> Blender: which shaders run where, and what they expose."""
+    record = _base(KIND_SHADER_STATE, source)
+    record.update({
+        "instances": instances,
+        "parameters": parameters,
+        "assignment": assignment,
     })
     return record
 

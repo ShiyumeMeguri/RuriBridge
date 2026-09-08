@@ -10,7 +10,9 @@ read from storage.
 Painter's own Python API is the whole vocabulary here: project creation and mesh
 reloading through ``substance_painter.project``, channel rendering through
 ``substance_painter.export``, texture set introspection through
-``substance_painter.textureset``. Nothing goes through the JavaScript engine.
+``substance_painter.textureset``, and -- because the package ships no shaders
+module at all -- viewport shader instances through ``substance_painter.js``,
+which is a Python entry point that already hands back parsed JSON.
 """
 
 import os
@@ -20,7 +22,7 @@ import time
 
 def _install_core_path():
     here = os.path.dirname(os.path.realpath(__file__))
-    candidate = os.path.dirname(here)
+    candidate = here
     while True:
         if os.path.isfile(os.path.join(candidate, "ruri_bridge", "__init__.py")):
             if candidate not in sys.path:
@@ -29,9 +31,8 @@ def _install_core_path():
         parent = os.path.dirname(candidate)
         if parent == candidate:
             raise ImportError(
-                "RuriBridge cannot find the ruri_bridge core above {0}; the plugin must "
-                "stay inside its checkout (junction the checkout, do not copy one "
-                "folder out of it)".format(here))
+                "RuriBridge cannot find the ruri_bridge core at or above {0}; the "
+                "plugin must stay inside its checkout".format(here))
         candidate = parent
 
 
@@ -49,7 +50,7 @@ from ruri_bridge import channel as channel_module
 from ruri_bridge import log as log_module
 from ruri_bridge import record as record_module
 
-from . import mesh_ingest, texture_publish
+from . import mesh_ingest, shader_state, texture_publish
 
 LOG = log_module.logger("painter")
 
@@ -113,6 +114,15 @@ def publish_project_state():
     if not CONNECTION.is_open:
         return None
     return CONNECTION.publisher.publish_record(texture_publish.current_project_state())
+
+
+def publish_shader_state():
+    """Tell Blender which shaders this project runs and what they expose."""
+    if not CONNECTION.is_open or not substance_painter.project.is_open():
+        return None
+    state = shader_state.read_state()
+    return CONNECTION.publisher.publish_record(record_module.shader_state(
+        "painter", state["instances"], state["parameters"], state["assignment"]))
 
 
 def publish_textures(preset_name):
@@ -239,6 +249,17 @@ def _handle(generation):
         _panel.set_status("mesh generation {0}: {1} ({2})".format(
             generation.number, intent, mesh_ingest.describe_scene(generation)))
         return True
+    if generation.kind == record_module.KIND_SHADER_APPLY:
+        report = shader_state.apply_by_texture_set(
+            generation.record.get("by_texture_set", {}),
+            generation.record.get("shader_url_by_texture_set"))
+        for label in ("unknown", "mismatched", "conflicting", "unmapped"):
+            if report[label]:
+                LOG.warning("shader values %s: %s", label, report[label])
+        _panel.set_status("shader values from generation {0}: applied {1}".format(
+            generation.number, report["applied"] or "nothing"))
+        publish_shader_state()
+        return False
     if generation.kind == record_module.KIND_EXPORT_REQUEST:
         preset = generation.record.get("preset_name") or _panel.preset_box.currentText()
         published = texture_publish.publish(
@@ -311,6 +332,10 @@ def _on_project_ready(_event):
     if _panel is not None:
         _panel.refresh_presets()
     publish_project_state()
+    try:
+        publish_shader_state()
+    except shader_state.ShaderStateError as error:
+        LOG.error("could not read the shader state: %s", error)
 
 
 def _on_project_closed(_event):
