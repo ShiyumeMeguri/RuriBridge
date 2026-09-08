@@ -41,7 +41,7 @@ from .log import logger
 LOG = logger("arena")
 
 CONTROL_MAGIC = b"RURIBRDG"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 CONTROL_FILE_NAME = "control.bin"
 SESSION_DIRECTORY_NAME = "RuriDccBridge"
 ROOT_ENVIRONMENT_VARIABLE = "RURI_BRIDGE_ROOT"
@@ -50,7 +50,12 @@ DEFAULT_SESSION = "default"
 HEADER_SIZE = 64
 SLOT_SIZE = 128
 CHANNEL_NAME_SIZE = 32
-INLINE_CAPACITY = 8192
+"""The inline area holds one whole state record, and a state record grows with
+the project: a character with a dozen Texture Sets on a generated uber shader
+measured 76 KB of uniform values. Sized for that with room to spare -- it is
+mapped, not resident, so an unused half costs nothing -- and anything past it
+still raises rather than truncating."""
+INLINE_CAPACITY = 524288
 
 SLOT_OFFSET_SEQUENCE = 32
 SLOT_OFFSET_GENERATION = 40

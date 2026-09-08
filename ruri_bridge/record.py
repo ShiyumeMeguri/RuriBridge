@@ -30,6 +30,7 @@ QUEUED_CHANNELS = (CHANNEL_TO_PAINTER, CHANNEL_TO_BLENDER)
 STATE_CHANNELS = (CHANNEL_STATE_TO_PAINTER, CHANNEL_STATE_TO_BLENDER)
 
 KIND_MESH = "mesh"
+KIND_MESH_REQUEST = "mesh_request"
 KIND_EXPORT_REQUEST = "export_request"
 KIND_TEXTURES = "textures"
 KIND_PROJECT_STATE = "project_state"
@@ -106,6 +107,16 @@ def mesh(source, intent, scene, materials, unit_scale, up_axis):
         "up_axis": up_axis,
     })
     return record
+
+
+def mesh_request(source):
+    """Painter -> Blender: send me the scene as it stands.
+
+    The symmetric counterpart of an export request. Painter cannot read a
+    Blender scene, so asking is the only move it has, and having it is what lets
+    the two panels offer the same actions from either side.
+    """
+    return _base(KIND_MESH_REQUEST, source)
 
 
 def export_request(source, preset_name, resolution_log2=None, texture_sets=None):

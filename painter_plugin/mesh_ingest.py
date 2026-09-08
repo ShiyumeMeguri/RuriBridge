@@ -28,10 +28,18 @@ class MeshIngestError(RuntimeError):
 
 
 def resolve_intent(declared):
-    """Turn the declared intent into the one Painter can actually perform."""
+    """Turn the declared intent into the one Painter can actually perform.
+
+    Reloading into nothing means creating: an intent says what the sender wants
+    to be looking at, and with no project open there is exactly one way to
+    satisfy that. Refusing instead -- which is what this did -- loses the mesh
+    entirely when a session is caught up from a reload that arrived after the
+    create it was meant to follow.
+    """
+    if not substance_painter.project.is_open():
+        return record_module.INTENT_CREATE_PROJECT
     if declared == record_module.INTENT_AUTO:
-        return (record_module.INTENT_RELOAD_MESH if substance_painter.project.is_open()
-                else record_module.INTENT_CREATE_PROJECT)
+        return record_module.INTENT_RELOAD_MESH
     return declared
 
 
@@ -60,10 +68,6 @@ def apply(generation, texture_resolution, on_finished=None):
             substance_painter.project.create(mesh_file_path=str(scene_path), settings=settings)
             report("created")
         else:
-            if not substance_painter.project.is_open():
-                raise MeshIngestError(
-                    "generation {0} asks to reload the mesh but no project is open".format(
-                        generation.number))
             settings = substance_painter.project.MeshReloadingSettings(
                 import_cameras=False, preserve_strokes=True)
             substance_painter.project.reload_mesh(

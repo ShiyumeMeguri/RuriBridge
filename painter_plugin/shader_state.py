@@ -101,21 +101,30 @@ def parameter_values():
 
 
 def instance_by_texture_set():
-    """Texture Set name -> shader instance id.
+    """Texture Set identity -> shader instance id.
 
     Painter states this in two halves: the assignment names, per Texture Set, the
-    shader instance *label* it uses, and the instance list carries the id that
-    every other call wants. Joining them here keeps that two-step in one place.
+    shader instance *label* it uses, and the instance list carries the id every
+    other call wants. Joining them here keeps that two-step in one place.
+
+    Keyed by identity rather than by the displayed name, because the other side
+    speaks identities -- a Texture Set renamed on either side has to stay the
+    same Texture Set.
     """
+    import substance_painter.textureset
+
     identifier_by_label = {entry["label"]: entry["id"] for entry in instances()}
+    identity_by_display = {texture_set.name(): texture_set.original_name
+                           for texture_set in substance_painter.textureset.all_texture_sets()}
     mapping = {}
-    for texture_set, body in assignment().get("texturesets", {}).items():
+    for display, body in assignment().get("texturesets", {}).items():
         label = body.get("shader")
+        identity = identity_by_display.get(display, display)
         if label in identifier_by_label:
-            mapping[texture_set] = identifier_by_label[label]
+            mapping[identity] = identifier_by_label[label]
         else:
             LOG.warning("Texture Set %r names shader instance %r, which is not in the "
-                        "instance list", texture_set, label)
+                        "instance list", display, label)
     return mapping
 
 

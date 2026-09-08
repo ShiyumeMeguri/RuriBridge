@@ -21,6 +21,9 @@ it to the corner domain first.
 
 from __future__ import annotations
 
+import uuid
+
+import bpy
 import numpy
 
 from ruri_bridge import record as record_module
@@ -32,6 +35,7 @@ from ruri_bridge.log import logger
 LOG = logger("blender.mesh")
 
 MAXIMUM_TEXCOORD_SETS = 8
+IDENTITY_PROPERTY = "ruri_bridge_identity"
 NEGATIVE_ZERO_PATTERN = numpy.uint32(0x80000000)
 
 
@@ -53,18 +57,37 @@ class AttributeSource:
 class ObjectData:
     """One source object, resolved down to index arrays and its own buffers."""
 
-    __slots__ = ("name", "node_matrix", "vertex_count", "sources", "primitives")
+    __slots__ = ("name", "node_matrix", "vertex_count", "sources", "primitives",
+                 "identity")
 
-    def __init__(self, name, node_matrix, vertex_count, sources, primitives):
+    def __init__(self, name, node_matrix, vertex_count, sources, primitives, identity):
         self.name = name
         self.node_matrix = node_matrix
         self.vertex_count = vertex_count
         self.sources = sources
         self.primitives = primitives
+        self.identity = identity
 
 
 def _column_major(matrix):
     return [matrix[row][column] for column in range(4) for row in range(4)]
+
+
+def identity_of(datablock):
+    """A name the other side can rely on, which renaming here cannot move.
+
+    Names are what people read, so people change them -- and Painter matches a
+    Texture Set to the mesh material it came from by name, which means a rename
+    in Blender would have arrived there as a *different* material and taken the
+    paint with it. So the name Painter is told is this identity, minted once and
+    stored on the datablock; the readable name travels beside it, as a label.
+    """
+    existing = datablock.get(IDENTITY_PROPERTY)
+    if existing:
+        return existing
+    minted = uuid.uuid4().hex
+    datablock[IDENTITY_PROPERTY] = minted
+    return minted
 
 
 def _material_row(material):
@@ -73,9 +96,11 @@ def _material_row(material):
     Custom properties are how a Blender-side generator stores a material data
     row, so they travel as they are. The bridge does not read them.
     """
-    row = {"name": material.name}
+    row = {"identity": identity_of(material), "name": material.name}
     properties = {}
     for key in material.keys():
+        if key == IDENTITY_PROPERTY:
+            continue
         value = material[key]
         try:
             properties[key] = value if isinstance(
@@ -109,16 +134,49 @@ def collect_material_rows(objects):
     return rows
 
 
-def _slot_material_names(object_reference):
-    names = []
-    for index, slot in enumerate(object_reference.material_slots):
+def ensure_materials(objects):
+    """Give every object a real material before its name crosses the bridge.
+
+    Painter names a Texture Set after the material it came from, and the return
+    trip finds its way home by that same name. An object with no material has no
+    name to give, so the old code invented one from the object -- and the paint
+    then came back addressed to a material that had never existed, landing in
+    image datablocks nothing referenced. Nothing failed; it simply never showed.
+
+    Creating the material here is the smallest thing that makes the round trip
+    closed by construction rather than by the user having remembered.
+    """
+    created = []
+    for object_reference in objects:
+        slots = list(object_reference.material_slots)
+        if not slots:
+            material = bpy.data.materials.new(object_reference.name)
+            material.use_nodes = True
+            object_reference.data.materials.append(material)
+            created.append(material.name)
+            continue
+        for index, slot in enumerate(slots):
+            if slot.material is not None:
+                continue
+            material = bpy.data.materials.new(object_reference.name)
+            material.use_nodes = True
+            object_reference.data.materials[index] = material
+            created.append(material.name)
+    if created:
+        LOG.info("created %d material(s) so the paint has somewhere to come back to: %s",
+                 len(created), ", ".join(created))
+    return created
+
+
+def _slot_material_identities(object_reference):
+    identities = []
+    for slot in object_reference.material_slots:
         if slot.material is None:
-            names.append("{0}_slot{1}".format(object_reference.name, index))
-        else:
-            names.append(slot.material.name)
-    if not names:
-        names.append(object_reference.name)
-    return names
+            raise RuntimeError(
+                "{0} still has an empty material slot; ensure_materials should have "
+                "filled it before the identities were read".format(object_reference.name))
+        identities.append(identity_of(slot.material))
+    return identities
 
 
 def _read_colors(mesh, corner_count, vertex_count):
@@ -212,19 +270,21 @@ def gather_object(object_reference, depsgraph, include_colors=True):
                 SEMANTIC_COLOR_0, colors,
                 vertex_order if color_domain == "POINT" else order))
 
-        material_names = _slot_material_names(object_reference)
+        material_identities = _slot_material_identities(object_reference)
         triangle_by_material = triangle_corners.reshape(-1, 3)
         primitives = []
         for material_index in sorted(set(int(value) for value in triangle_material)):
             rows = triangle_by_material[
                 numpy.flatnonzero(triangle_material == material_index)].reshape(-1)
-            name = (material_names[material_index] if material_index < len(material_names)
-                    else material_names[-1])
-            primitives.append((name, inverse[rows]))
+            identity = (material_identities[material_index]
+                        if material_index < len(material_identities)
+                        else material_identities[-1])
+            primitives.append((identity, inverse[rows]))
 
         return ObjectData(object_reference.name,
                           _column_major(object_reference.matrix_world),
-                          int(order.shape[0]), sources, primitives)
+                          int(order.shape[0]), sources, primitives,
+                          identity_of(object_reference))
     finally:
         evaluated.to_mesh_clear()
 
@@ -275,6 +335,7 @@ def write_glb(arena, path, objects):
                     "triangle_count": int(indices.shape[0] // 3),
                 })
             scene_description.append({
+                "identity": entry.identity,
                 "name": entry.name,
                 "node_matrix": [float(value) for value in entry.node_matrix],
                 "vertex_count": entry.vertex_count,
@@ -289,6 +350,9 @@ def write_glb(arena, path, objects):
 def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
             include_colors=True):
     """Gather, write and publish one mesh generation. Returns the generation."""
+    created_materials = ensure_materials(objects_to_send)
+    if created_materials:
+        depsgraph.update()
     gathered = []
     for object_reference in objects_to_send:
         entry = gather_object(object_reference, depsgraph, include_colors)

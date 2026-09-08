@@ -37,6 +37,7 @@ WILDCARDS = ("colorSpace", "sceneMaterial", "textureSet", "uvTileName",
              "project", "mesh", "udim")
 _TOKEN = re.compile(r"\$(" + "|".join(WILDCARDS) + ")")
 _LEFTOVER_TOKEN = re.compile(r"\$\w+")
+_EMPTY_GROUP = re.compile(r"[(\[{][_\-. ]*[)\]}]")
 _SEPARATORS = "_-. "
 
 
@@ -81,7 +82,8 @@ def _map_key(file_name, document_names, other_names, index):
     if leftover:
         LOG.warning("export preset uses wildcards this build does not know: %s",
                     ", ".join(sorted(set(leftover))))
-    stripped = _LEFTOVER_TOKEN.sub("", _TOKEN.sub("", file_name)).strip(_SEPARATORS)
+    stripped = _LEFTOVER_TOKEN.sub("", _TOKEN.sub("", file_name))
+    stripped = _EMPTY_GROUP.sub("", stripped).strip(_SEPARATORS)
     while "__" in stripped:
         stripped = stripped.replace("__", "_")
     if stripped:
@@ -314,6 +316,7 @@ def publish(arena, publisher, preset_name=DEFAULT_PRESET_NAME, selected_texture_
                     "source_channels": planned_map.source_channels,
                 })
             texture_sets.append({
+                "identity": texture_set.original_name,
                 "name": texture_set.name(),
                 "stack": stack.name(),
                 "resolution": [resolution.width, resolution.height],
@@ -325,6 +328,32 @@ def publish(arena, publisher, preset_name=DEFAULT_PRESET_NAME, selected_texture_
             project_path=substance_painter.project.file_path(),
             mesh_path=substance_painter.project.last_imported_mesh_path(),
             texture_sets=texture_sets))
+
+
+def apply_display_names(names_by_identity):
+    """Show the readable material names Blender knows, keyed by identity.
+
+    The name Blender puts in the mesh is an identity, so that renaming a material
+    there cannot arrive here as a different material and strand the paint. That
+    identity is what ``original_name`` reports for ever after, and it is also what
+    the Texture Set would be called in the UI -- which is unreadable. So the
+    display name is set from what Blender calls the material today, and reset
+    whenever Blender says it changed.
+    """
+    renamed = {}
+    for texture_set in substance_painter.textureset.all_texture_sets():
+        wanted = names_by_identity.get(texture_set.original_name)
+        if not wanted or texture_set.name() == wanted:
+            continue
+        try:
+            texture_set.name = wanted
+        except ValueError as error:
+            LOG.warning("cannot show %r as %r: %s", texture_set.original_name, wanted, error)
+            continue
+        renamed[texture_set.original_name] = wanted
+    if renamed:
+        LOG.info("renamed %d Texture Set(s) to follow Blender", len(renamed))
+    return renamed
 
 
 def current_project_state():
@@ -342,6 +371,7 @@ def current_project_state():
                                    for channel_type in stack.all_channels()),
             })
         texture_sets.append({
+            "identity": texture_set.original_name,
             "name": texture_set.name(),
             "resolution": [resolution.width, resolution.height],
             "stacks": stacks,

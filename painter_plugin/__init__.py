@@ -63,6 +63,7 @@ DEFAULT_TEXTURE_RESOLUTION = 2048
 MESH_LOAD_DEADLINE_SECONDS = 600.0
 SHADER_QUIET_SECONDS = 0.35
 TEXTURE_QUIET_SECONDS = 0.9
+SHADER_POLL_DUTY = 20.0
 
 _SEVERITY = {
     "DEBUG": substance_painter.logging.DBG_INFO,
@@ -212,8 +213,21 @@ class RuriBridgePanel(QtWidgets.QWidget):
         self.live_box.setChecked(True)
         layout.addWidget(self.live_box)
 
+        legs = QtWidgets.QHBoxLayout()
+        self.live_textures_box = QtWidgets.QCheckBox("Textures")
+        self.live_textures_box.setChecked(True)
+        self.live_values_box = QtWidgets.QCheckBox("Shader Values")
+        self.live_values_box.setChecked(True)
+        legs.addWidget(self.live_textures_box)
+        legs.addWidget(self.live_values_box)
+        layout.addLayout(legs)
+
         self.send_button = QtWidgets.QPushButton("Send Textures To Blender")
         layout.addWidget(self.send_button)
+        self.send_values_button = QtWidgets.QPushButton("Send Shader Values To Blender")
+        layout.addWidget(self.send_values_button)
+        self.request_mesh_button = QtWidgets.QPushButton("Ask Blender For The Scene")
+        layout.addWidget(self.request_mesh_button)
 
         self.link_label = QtWidgets.QLabel("")
         layout.addWidget(self.link_label)
@@ -228,6 +242,8 @@ class RuriBridgePanel(QtWidgets.QWidget):
 
         self.attach_button.clicked.connect(self._toggle_attachment)
         self.send_button.clicked.connect(self._send_textures)
+        self.send_values_button.clicked.connect(self._send_values)
+        self.request_mesh_button.clicked.connect(self._request_mesh)
 
     @property
     def texture_resolution(self):
@@ -235,6 +251,36 @@ class RuriBridgePanel(QtWidgets.QWidget):
 
     def live_enabled(self):
         return self.live_box.isChecked()
+
+    def live_textures_enabled(self):
+        return self.live_box.isChecked() and self.live_textures_box.isChecked()
+
+    def live_values_enabled(self):
+        return self.live_box.isChecked() and self.live_values_box.isChecked()
+
+    def _send_values(self):
+        if not CONNECTION.is_open or not substance_painter.project.is_open():
+            self.set_status("no project open")
+            return
+        try:
+            values = _values_by_texture_set(shader_state.parameter_values())
+            _shader_gate.prime(shader_state.parameter_values())
+            CONNECTION.state_writer.write(record_module.shader_values("painter", values))
+        except Exception as error:
+            LOG.error("could not send shader values: %s", error)
+            self.set_status("send failed: {0}".format(error))
+            return
+        self.set_status("sent {0} shader value(s)".format(
+            sum(len(entry) for entry in values.values())))
+
+    def _request_mesh(self):
+        if not CONNECTION.is_open:
+            self.set_status("not attached")
+            return
+        generation = CONNECTION.publisher.publish_record(
+            record_module.mesh_request("painter"))
+        self.set_status("asked Blender for the scene, generation {0}".format(
+            generation.number))
 
     def set_status(self, message):
         self.status_label.setText(message)
@@ -300,6 +346,8 @@ _texture_gate = sync_module.ChangeGate("painter.textures", TEXTURE_QUIET_SECONDS
 _dirty_textures = set()
 _texture_serial = 0
 _shader_poll_cost = None
+_shader_poll_due = 0.0
+_pending_display_names = {}
 
 
 def _on_texture_state(event):
@@ -345,23 +393,35 @@ def _publish_dirty_textures():
 def _values_by_texture_set(values_by_label):
     """Re-key the shader instances' values by the Texture Sets that run them.
 
-    The other side thinks in materials, which are Texture Sets here; instance
-    labels mean nothing to it, and several sets can share one instance.
+    Keyed by identity, which is what the other side addresses materials with;
+    instance labels mean nothing over there, and several Texture Sets can share
+    one instance.
     """
+    identity_by_display = {
+        texture_set.name(): texture_set.original_name
+        for texture_set in substance_painter.textureset.all_texture_sets()}
     by_texture_set = {}
-    for texture_set, body in shader_state.assignment().get("texturesets", {}).items():
+    for display, body in shader_state.assignment().get("texturesets", {}).items():
         groups = values_by_label.get(body.get("shader"))
         if not groups:
             continue
         flattened = {}
         for members in groups.values():
             flattened.update(members)
-        by_texture_set[texture_set] = flattened
+        by_texture_set[identity_by_display.get(display, display)] = flattened
     return by_texture_set
 
 
 def live_sync():
-    """Publish what changed on this side, once it has stopped changing."""
+    """Publish what changed on this side, once it has stopped changing.
+
+    The shader poll paces itself. Asking Painter for every uniform costs under a
+    millisecond on a default project and a quarter of a second on a character
+    with a dozen Texture Sets on a generated shader, so a fixed interval is
+    either wasteful or ruinous. Each poll instead sets the next one far enough
+    out that watching never takes more than a small share of a core, measured
+    rather than assumed.
+    """
     global _shader_poll_cost
     if not CONNECTION.is_open or _panel is None or not _panel.live_enabled():
         return
@@ -369,15 +429,21 @@ def live_sync():
         return
     if substance_painter.project.is_busy():
         return
-    if _dirty_textures and _texture_gate.should_publish(
+    if _panel.live_textures_enabled() and _dirty_textures and _texture_gate.should_publish(
             {"dirty": sorted((stack, channel.name) for stack, channel in _dirty_textures),
              "serial": _texture_serial}):
         _publish_dirty_textures()
+    global _shader_poll_due
+    if not _panel.live_values_enabled() or time.monotonic() < _shader_poll_due:
+        return
     started = time.monotonic()
     values = shader_state.parameter_values()
-    if _shader_poll_cost is None:
-        _shader_poll_cost = time.monotonic() - started
-        LOG.info("watching shader values costs %.1f ms a poll", _shader_poll_cost * 1000.0)
+    cost = time.monotonic() - started
+    _shader_poll_due = time.monotonic() + cost * SHADER_POLL_DUTY
+    if _shader_poll_cost is None or abs(cost - _shader_poll_cost) > 0.5 * _shader_poll_cost:
+        _shader_poll_cost = cost
+        LOG.info("watching shader values costs %.0f ms; asking again in %.1f s",
+                 cost * 1000.0, cost * SHADER_POLL_DUTY)
     if _shader_gate.should_publish(values):
         CONNECTION.state_writer.write(record_module.shader_values(
             "painter", _values_by_texture_set(values)))
@@ -388,6 +454,10 @@ def _handle(generation):
     """Apply one generation. Returns True when Painter is now busy with it."""
     global _mesh_deadline
     if generation.kind == record_module.KIND_MESH:
+        _pending_display_names.clear()
+        _pending_display_names.update(
+            {row["identity"]: row["name"] for row in generation.record.get("materials", [])
+             if row.get("identity")})
         _mesh_deadline = time.monotonic() + MESH_LOAD_DEADLINE_SECONDS
         try:
             intent = mesh_ingest.apply(generation, _panel.texture_resolution)
@@ -504,6 +574,8 @@ def _on_project_ready(_event):
         _shader_gate.prime(shader_state.parameter_values())
     except shader_state.ShaderStateError as error:
         LOG.error("could not adopt the shader values: %s", error)
+    if _pending_display_names:
+        texture_publish.apply_display_names(_pending_display_names)
     if _panel is not None:
         _panel.refresh_presets()
     publish_project_state()

@@ -81,7 +81,7 @@ class _Connection:
         self.state_writer = None
         self.state_reader = None
         self.last_state = {}
-        self.published_objects = []
+        self.has_published = False
 
     @property
     def is_open(self):
@@ -128,14 +128,17 @@ def disconnect():
 
 
 def objects_in_scope(context, scope):
-    if scope == "PUBLISHED":
-        return watched_objects()
+    """The objects a publish covers, resolved fresh every time.
+
+    Read through the view layer rather than through ``context.selected_objects``
+    so the same call works from a timer, which is what lets live sync answer the
+    same question the button does -- including for an object created after the
+    last publish.
+    """
+    objects = [entry for entry in context.view_layer.objects if entry.type == "MESH"]
     if scope == "SELECTED":
-        chosen = [entry for entry in context.selected_objects if entry.type == "MESH"]
-    else:
-        chosen = [entry for entry in context.view_layer.objects
-                  if entry.type == "MESH" and entry.visible_get()]
-    return chosen
+        return [entry for entry in objects if entry.select_get() and entry.visible_get()]
+    return [entry for entry in objects if entry.visible_get()]
 
 
 def publish_mesh(context, scope="SELECTED", intent=record_module.INTENT_AUTO,
@@ -150,9 +153,9 @@ def publish_mesh(context, scope="SELECTED", intent=record_module.INTENT_AUTO,
     generation = mesh_publish.publish(
         CONNECTION.arena, CONNECTION.publisher, chosen, depsgraph, intent,
         context.scene.unit_settings.scale_length, include_colors)
-    CONNECTION.published_objects = [entry.name for entry in chosen]
+    CONNECTION.has_published = True
     MESH_GATE.prime({"serial": _mesh_serial})
-    SHADER_GATE.prime(material_values())
+    SHADER_GATE.prime(material_values(context.scene.ruri_bridge))
     return generation
 
 
@@ -174,7 +177,7 @@ def push_shader_parameters(context, scope="SELECTED"):
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
     rows = mesh_publish.collect_material_rows(objects_in_scope(context, scope))
-    values = {row["name"]: row["properties"] for row in rows if row.get("properties")}
+    values = {row["identity"]: row["properties"] for row in rows if row.get("properties")}
     if not values:
         raise RuntimeError(
             "no material in scope {0} carries any custom property to offer".format(scope))
@@ -182,36 +185,30 @@ def push_shader_parameters(context, scope="SELECTED"):
     return CONNECTION.state_writer.write(record_module.shader_values("blender", values))
 
 
-def watched_objects():
-    """The objects live sync follows: the ones last published, by name.
-
-    Not the current selection. Selection moves constantly while working, and a
-    timer's context cannot read it anyway; the objects Painter was given are the
-    ones Painter has Texture Sets for, so they are what "keep this in sync" means.
-    """
-    return [bpy.data.objects[name] for name in CONNECTION.published_objects
-            if name in bpy.data.objects]
+def watched_objects(settings):
+    """The objects live sync follows: whatever the scope says, right now."""
+    return objects_in_scope(bpy.context, settings.scope)
 
 
-def material_values():
-    """The data rows live sync watches and offers."""
-    rows = mesh_publish.collect_material_rows(watched_objects())
-    return {row["name"]: row["properties"] for row in rows if row.get("properties")}
+def material_values(settings):
+    """The data rows live sync watches and offers, keyed by identity."""
+    rows = mesh_publish.collect_material_rows(watched_objects(settings))
+    return {row["identity"]: row["properties"] for row in rows if row.get("properties")}
 
 
 def live_sync(settings):
     """Publish what changed here, once it has settled. Never what just arrived."""
-    if not CONNECTION.is_open or not settings.live_sync or not CONNECTION.published_objects:
+    if not CONNECTION.is_open or not settings.live_sync or not CONNECTION.has_published:
         return None
     if settings.live_shader_values:
-        values = material_values()
+        values = material_values(settings)
         if SHADER_GATE.should_publish(values):
             CONNECTION.state_writer.write(record_module.shader_values("blender", values))
             return "sent {0} shader value(s)".format(
                 sum(len(entry) for entry in values.values()))
     if settings.live_mesh and bpy.context.mode == "OBJECT":
         if MESH_GATE.should_publish({"serial": _mesh_serial}):
-            generation = publish_mesh(bpy.context, "PUBLISHED", settings.intent,
+            generation = publish_mesh(bpy.context, settings.scope, settings.intent,
                                       settings.include_colors)
             return "sent mesh, generation {0}".format(generation.number)
     return None
@@ -262,8 +259,8 @@ def apply_values(values_by_texture_set):
     vocabulary into the .blend rather than keep two declared things equal.
     """
     written = {}
-    for texture_set, values in values_by_texture_set.items():
-        material = bpy.data.materials.get(texture_set)
+    for identity, values in values_by_texture_set.items():
+        material = texture_ingest.resolve_material(identity, identity)
         if material is None:
             continue
         for name, value in values.items():
@@ -275,11 +272,18 @@ def apply_values(values_by_texture_set):
             if current == value:
                 continue
             material[name] = value
-            written.setdefault(texture_set, []).append(name)
+            written.setdefault(material.name, []).append(name)
     if written:
         LOG.info("mirrored incoming values onto %s", written)
-    SHADER_GATE.suppress(material_values())
+    settings = _settings_or_none()
+    if settings is not None:
+        SHADER_GATE.suppress(material_values(settings))
     return written
+
+
+def settings_scope():
+    settings = _settings_or_none()
+    return settings.scope if settings is not None else "VISIBLE"
 
 
 def pump(bind=True):
@@ -305,6 +309,10 @@ def pump(bind=True):
                 CONNECTION.last_state[generation.kind] = generation.record
                 remember_painter_executable(generation.record.get("host_executable"))
                 handled.append((generation.number, generation.kind, generation.record))
+            elif generation.kind == record_module.KIND_MESH_REQUEST:
+                published = publish_mesh(bpy.context, settings_scope(),
+                                         record_module.INTENT_AUTO, True)
+                handled.append((generation.number, generation.kind, published.number))
             else:
                 LOG.warning("ignoring generation %d of unknown kind %r",
                             generation.number, generation.kind)
@@ -326,10 +334,11 @@ class RuriBridgeSettings(bpy.types.PropertyGroup):
         default=arena_module.DEFAULT_SESSION)
     scope: bpy.props.EnumProperty(
         name="Scope",
-        description="Which objects a publish sends",
-        items=[("SELECTED", "Selected", "Selected mesh objects"),
-               ("VISIBLE", "Visible", "Every visible mesh object in the view layer")],
-        default="SELECTED")
+        description="Which objects a publish sends, re-read on every live update "
+                    "so an object added later is included",
+        items=[("VISIBLE", "Whole Scene", "Every visible mesh object in the view layer"),
+               ("SELECTED", "Selected", "Selected mesh objects only")],
+        default="VISIBLE")
     intent: bpy.props.EnumProperty(
         name="Intent",
         description="What Painter should do with the mesh",
@@ -385,8 +394,15 @@ def _timer():
         return settings.poll_seconds
     CONNECTION.arena.touch(record_module.CHANNEL_TO_PAINTER)
     if handled:
-        summary = ", ".join("{0}#{1}".format(kind, number) for number, kind, _ in handled)
-        settings.status = "received " + summary
+        homeless = sorted({entry["texture_set"] for _number, kind, report in handled
+                           if kind == record_module.KIND_TEXTURES
+                           for entry in report if entry.get("homeless")})
+        if homeless:
+            settings.status = ("{0} has no material of that name here, so its paint is "
+                               "not shown; send the mesh again".format(", ".join(homeless)))
+        else:
+            settings.status = "received " + ", ".join(
+                "{0}#{1}".format(kind, number) for number, kind, _ in handled)
         _tag_redraw()
     try:
         sent = live_sync(settings)
@@ -624,9 +640,14 @@ class RURIBRIDGE_OT_pull_textures(bpy.types.Operator):
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        bound = sum(entry["bound_nodes"] for entry in report)
-        settings.status = "pulled generation {0}: {1} texture set(s), {2} node(s) bound".format(
-            generation.number, len(report), bound)
+        arrived = sum(entry["bound_nodes"] for entry in report)
+        connected = sum(entry.get("connected_nodes", 0) for entry in report)
+        settings.status = ("generation {0}: {1} set(s), {2} channel(s) placed, "
+                           "{3} wired".format(generation.number, len(report),
+                                              arrived, connected))
+        if arrived and not connected:
+            settings.status += " -- label a texture node after a channel, or declare "
+            settings.status += "ruri_bridge_channels on the material, to wire them"
         self.report({"INFO"}, settings.status)
         return {"FINISHED"}
 
@@ -668,8 +689,8 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         row.enabled = settings.live_sync
         row.prop(settings, "live_shader_values", toggle=True)
         row.prop(settings, "live_mesh", toggle=True)
-        if CONNECTION.is_open and not CONNECTION.published_objects:
-            live.label(text="Send the mesh once to start live sync", icon="INFO")
+        if CONNECTION.is_open and not CONNECTION.has_published:
+            live.label(text="Send the scene once to start live sync", icon="INFO")
 
         manual = layout.column(align=True)
         manual.enabled = CONNECTION.is_open

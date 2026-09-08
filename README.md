@@ -130,6 +130,50 @@ python -m ruri_bridge.cli pull-textures  --blender <blender.exe> --blend <场景
 `verify-mesh` 是真判据,不是打印:它重新读回发布的 GLB,核对文件头声明的字节数与实际大小、
 每个 bufferView 落在二进制块内、每个索引落在自己的顶点数内、声明的包围盒真的包住位置。
 
+## 身份:名字会变,身份不会
+
+**跨桥的材质名是身份,不是名字。** 每个材质和对象在第一次发布时被打上一个
+`ruri_bridge_identity`(uuid,存成自定义属性),glTF 里的材质名放的就是它。
+
+为什么必须这样:Painter 是**按网格里的材质名**把纹理集认回去的。要是把 Blender 的材质名直接
+发过去,你在 Blender 里改一次材质名,下次 reload_mesh 时 Painter 就会认为那是一个**新材质**、
+建一个新纹理集,**你画的东西留在旧的那个上,等于丢了**。身份不动,这件事就不可能发生。
+
+- 在 Blender 改材质名 → 身份不变 → Painter 那边纹理集原地不动,只是显示名跟着改。
+- 在 Painter 改纹理集名 → `original_name`(= 身份)不受 setter 影响 → 回程照样认得。
+- 图像数据块也按身份索引(`<身份>/<通道>`),数据块的**名字**用可读名,改名时跟着更新。
+
+纹理集在 Painter 里显示的是**可读名**,不是 uuid —— 每次网格发布都会带上当前的可读名,
+Painter 用它设 `TextureSet.name`。
+
+## 材质是回程的落点,没有就建一个
+
+回程要落地,得有一个身份对得上的 Blender 材质。所以发布时会检查:**任何没有材质槽、或者槽里
+是空的对象,当场给它建一个材质**(按对象名命名),并在日志和状态栏里说出来。
+
+这不是多事:之前没有这一步时,一个没有材质的对象会让桥拿对象名当材质名发过去,回来时
+Blender 里根本没有那个材质 —— 贴图**确实到了**(图像数据块都在),但没有任何材质在用它,
+于是"画了没反应"。那是静默错,不是用户忘了。
+
+回程落地时,材质里已有的、按通道名打了标签的图像纹理节点优先;**没有的就现建一个**,并接到
+名字对得上的着色器输入上(比较时忽略大小写与分隔符,所以生成的节点组只要输入名按通道命名
+就自动接上)。接哪个走**输入的类型**判断:向量输入自动插一个法线贴图节点。对不上的通道也会
+建出带标签的节点,只是不接线 —— 到货了,等你用,而不是消失。
+
+## 两侧面板是对称的
+
+| 动作 | Blender | Painter |
+|---|---|---|
+| 发几何 | Send To Painter | Ask Blender For The Scene(请对面发) |
+| 发贴图 | Ask For Textures(请对面发) | Send Textures To Blender |
+| 发参数 | Send Shader Values | Send Shader Values To Blender |
+| 取贴图 | Pull Latest Textures | —(Painter 不吃贴图) |
+| 实时开关 | Live Sync + Shader Values / Mesh | Live sync + Textures / Shader Values |
+| 在场 | Painter is attached | Blender is attached |
+
+两边都能主动发起,所以你在哪边都不用切窗口。
+
+
 ## 通道与记录
 
 两个通道,各只有一个写者,所以除了槽本身的 seqlock 之外没有任何锁。
@@ -185,8 +229,11 @@ Painter 的 `Base_color`),两个通道归一化后同名则直接报错,不猜�
 关掉:Blender N 面板的 **Live Sync**(以及分开的 Shader Values / Mesh),Painter 停靠面板的
 **Live sync to Blender**。默认全开。
 
-活同步盯的是**上次发布过的那批对象**,不是当前选择 —— 选择在工作中一直变,而且定时器里的
-`bpy.context` 本来就读不到它。发一次网格建立链接,之后全自动。
+作用域默认是**整个场景的可见 mesh**,而且**每次都重新解析** —— 后来新建的对象自动进同步,
+不用重发。要只发选中的,把作用域改成 Selected。
+
+(选择是通过视图层的 `select_get()` 读的,不是 `context.selected_objects` —— 后者在定时器里
+读不到,而实测前者在真 timer 回调里可用,这样按钮和活同步问的是同一个问题。)
 
 **三件事必须一起做对,否则不是活同步而是灾难**,`ruri_bridge/sync.py` 的 `ChangeGate` 一次解决:
 
