@@ -129,6 +129,7 @@ def ingest_map(identity, display_name, entry, directory):
         image[BRIDGE_KEY_PROPERTY] = key
         image.use_fake_user = True
     else:
+        _drop_stale_pack(image)
         image.filepath = filepath
     if image.name != readable:
         image.name = readable
@@ -144,6 +145,48 @@ def ingest_map(identity, display_name, entry, directory):
     image.reload()
     LOG.info("ingested %s (%s, %s)", key, entry["color_space"], os.path.basename(filepath))
     return image
+
+
+def _is_packed(image):
+    return image.packed_file is not None or len(image.packed_files) > 0
+
+
+def _drop_stale_pack(image):
+    """Forget data packed by an earlier save, so the new pages are what is read.
+
+    Saving takes bridge textures into the .blend, because the arena keeps only
+    its newest generations and a file saved on top of an older one would open
+    with nothing behind its images. Packed data then wins over the file path, so
+    an image repointed at a newer generation would go on showing the old paint
+    until that pack is dropped.
+    """
+    if _is_packed(image):
+        image.unpack(method="REMOVE")
+
+
+def keep_textures_in_file():
+    """Take every bridge texture into the .blend. Returns how many were taken.
+
+    Nothing is copied while both applications are live: an ingested image reads
+    the very pages Painter exported into. Those pages belong to an arena
+    generation though, and the arena keeps only the newest, so persistence has to
+    be paid for at the moment it is asked for -- which is the moment somebody
+    saves. Packing is Blender's own answer to a source file that will not be
+    there later, and it puts the data in the one file that needs it.
+    """
+    taken = 0
+    for image in bpy.data.images:
+        if image.get(BRIDGE_KEY_PROPERTY) is None or _is_packed(image):
+            continue
+        try:
+            image.pack()
+        except RuntimeError as error:
+            LOG.warning("could not take %s into the file: %s", image.name, error)
+            continue
+        taken += 1
+    if taken:
+        LOG.info("took %d bridge texture(s) into the file", taken)
+    return taken
 
 
 def _comparable(name):

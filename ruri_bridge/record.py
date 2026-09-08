@@ -90,7 +90,23 @@ def _base(kind, source):
     }
 
 
-def mesh(source, intent, scene, materials, unit_scale, up_axis):
+def binding(scene_identity, scene_identity_is_new, document, project_path):
+    """Which document on the sending side a Painter project belongs to.
+
+    This travels into the Painter project's own metadata, where saving carries
+    it along, so a project opened again days later still knows which scene it
+    answers to. Names cannot do that job: both hosts let people rename anything,
+    and a path moves the moment somebody reorganises a drive.
+    """
+    return {
+        "scene_identity": scene_identity,
+        "scene_identity_is_new": scene_identity_is_new,
+        "document": document,
+        "project_path": project_path,
+    }
+
+
+def mesh(source, intent, scene, materials, unit_scale, up_axis, binding_record=None):
     """Blender -> Painter: geometry lives in the GLB, everything else here.
 
     ``scene`` describes what went into the GLB (object names, primitive counts,
@@ -105,6 +121,7 @@ def mesh(source, intent, scene, materials, unit_scale, up_axis):
         "materials": materials,
         "unit_scale": unit_scale,
         "up_axis": up_axis,
+        "binding": binding_record or {},
     })
     return record
 

@@ -152,11 +152,28 @@ def publish_mesh(context, scope="SELECTED", intent=record_module.INTENT_AUTO,
     depsgraph = context.evaluated_depsgraph_get()
     generation = mesh_publish.publish(
         CONNECTION.arena, CONNECTION.publisher, chosen, depsgraph, intent,
-        context.scene.unit_settings.scale_length, include_colors)
+        context.scene.unit_settings.scale_length, include_colors,
+        binding=scene_binding(context))
     CONNECTION.has_published = True
     MESH_GATE.prime({"serial": _mesh_serial})
     SHADER_GATE.prime(material_values(context.scene.ruri_bridge))
     return generation
+
+
+def scene_binding(context):
+    """The durable answer to "which project does this scene paint into".
+
+    The scene identity is minted the same way a material's is, so it survives
+    every rename on either side, and it is what Painter stores inside the saved
+    project. The project path travels beside it as the place to look first; the
+    identity is what decides whether the project found there is the right one.
+    """
+    scene = context.scene
+    stored = scene.ruri_bridge.painter_project
+    identity, is_new = mesh_publish.mint_identity(scene)
+    return record_module.binding(
+        identity, is_new, bpy.data.filepath,
+        bpy.path.abspath(stored) if stored else "")
 
 
 def request_export(preset_name, resolution_log2=None):
@@ -212,6 +229,18 @@ def live_sync(settings):
                                       settings.include_colors)
             return "sent mesh, generation {0}".format(generation.number)
     return None
+
+
+@bpy.app.handlers.persistent
+def _on_save_pre(_path):
+    """Saving is when persistence is asked for, so it is when it gets paid for."""
+    settings = getattr(bpy.context.scene, "ruri_bridge", None)
+    if settings is None or not settings.keep_textures:
+        return
+    try:
+        texture_ingest.keep_textures_in_file()
+    except Exception as error:
+        LOG.error("could not take the bridge textures into the file: %s", error)
 
 
 def _on_depsgraph_update(scene, depsgraph):
@@ -308,6 +337,7 @@ def pump(bind=True):
             elif generation.kind == record_module.KIND_PROJECT_STATE:
                 CONNECTION.last_state[generation.kind] = generation.record
                 remember_painter_executable(generation.record.get("host_executable"))
+                remember_painter_project(generation.record.get("project_path"))
                 handled.append((generation.number, generation.kind, generation.record))
             elif generation.kind == record_module.KIND_MESH_REQUEST:
                 published = publish_mesh(bpy.context, settings_scope(),
@@ -367,10 +397,23 @@ class RuriBridgeSettings(bpy.types.PropertyGroup):
                     "Each send is a whole-mesh reload on Painter's side, so it fires "
                     "on leaving Edit Mode rather than per vertex",
         default=True)
+    keep_textures: bpy.props.BoolProperty(
+        name="Keep Textures In File",
+        description="On save, pack the textures Painter sent into the .blend. They "
+                    "are read straight out of the arena while both applications are "
+                    "live, and the arena keeps only its newest generations, so "
+                    "without this a saved file opens with them missing",
+        default=True)
     bind_on_receive: bpy.props.BoolProperty(
         name="Bind On Receive",
         description="Fill Image Texture nodes whose label matches an incoming channel",
         default=True)
+    painter_project: bpy.props.StringProperty(
+        name="Painter Project",
+        description="The .spp this scene paints into. Painter fills it in the moment "
+                    "the project is saved, and a later send reopens that project "
+                    "instead of starting a new one",
+        subtype="FILE_PATH", default="")
     export_preset: bpy.props.StringProperty(
         name="Export Preset",
         description="Painter export preset an export request asks for",
@@ -487,6 +530,22 @@ def remember_painter_executable(path):
         LOG.info("learned where Painter lives: %s", path)
 
 
+def remember_painter_project(path):
+    """Bind the scene to the project Painter just told us it saved.
+
+    Painter reports a path only once the project has one, which is the moment
+    somebody saves it. Keeping it on the scene rather than in the session is what
+    makes it outlive both applications: it goes into the .blend, so tomorrow's
+    send knows to reopen that project instead of starting a fresh one and leaving
+    the painted work sitting on disk, correct and unused.
+    """
+    settings = getattr(bpy.context.scene, "ruri_bridge", None)
+    if settings is None or not path or settings.painter_project == path:
+        return
+    settings.painter_project = path
+    LOG.info("this scene now paints into %s", path)
+
+
 def painter_is_attached():
     """Whether Painter's half of the bridge is alive, not whether it is running.
 
@@ -593,10 +652,17 @@ class RURIBRIDGE_OT_publish_mesh(bpy.types.Operator):
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
+        fresh = sum(1 for row in generation.record.get("materials", [])
+                    if row.get("identity_is_new"))
         settings.status = "sent mesh {0}{1}".format(
             generation.number,
             "; Painter is starting and takes it as it opens" if starting else "")
         self.report({"INFO"}, settings.status)
+        if fresh:
+            self.report({"WARNING"},
+                        "{0} material(s) had no identity until now; save this file or "
+                        "the next session sends different ones and Painter builds new "
+                        "Texture Sets beside the painted ones".format(fresh))
         return {"FINISHED"}
 
 
@@ -687,6 +753,7 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         column.prop(settings, "scope")
         column.prop(settings, "intent")
         column.prop(settings, "include_colors")
+        column.prop(settings, "painter_project", text="Project")
         column.separator()
         column.operator(RURIBRIDGE_OT_publish_mesh.bl_idname, icon="EXPORT")
 
@@ -703,6 +770,7 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         manual.enabled = CONNECTION.is_open
         manual.prop(settings, "export_preset", text="Preset")
         manual.prop(settings, "bind_on_receive")
+        manual.prop(settings, "keep_textures")
         manual.operator(RURIBRIDGE_OT_request_export.bl_idname, icon="IMPORT")
         manual.operator(RURIBRIDGE_OT_pull_textures.bl_idname, icon="FILE_REFRESH")
         manual.operator(RURIBRIDGE_OT_push_shader_parameters.bl_idname, icon="NODE_MATERIAL")
@@ -747,6 +815,8 @@ def register():
     log_module.install_stream_sink()
     if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
+    if _on_save_pre not in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.append(_on_save_pre)
     for entry in _CLASSES:
         bpy.utils.register_class(entry)
     bpy.types.Scene.ruri_bridge = bpy.props.PointerProperty(type=RuriBridgeSettings)
@@ -761,6 +831,8 @@ def unregister():
     _stop_timer()
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
+    if _on_save_pre in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.remove(_on_save_pre)
     CONNECTION.close()
     del bpy.types.Scene.ruri_bridge
     for entry in reversed(_CLASSES):

@@ -481,7 +481,7 @@ def live_sync():
     global _shader_poll_cost
     if not CONNECTION.is_open or _panel is None or not _panel.live_enabled():
         return
-    if _mesh_deadline is not None or not substance_painter.project.is_open():
+    if _mesh_deadline is not None or not substance_painter.project.is_in_edition_state():
         return
     if substance_painter.project.is_busy():
         return
@@ -618,7 +618,23 @@ def _on_timer():
 
 
 def _on_project_ready(_event):
-    """A project just became editable. Show the panel and adopt its values.
+    """A project just became editable.
+
+    Reopening a bound project happens in two steps, because Painter opens
+    asynchronously: the project arrives here, and only then can the mesh that
+    asked for it go in. While that reload runs the project holds the previous
+    mesh, so settling waits for it rather than reporting on what is still there.
+    """
+    global _mesh_deadline
+    _mesh_deadline = None
+    if mesh_ingest.resume_after_open(_on_project_settled):
+        _mesh_deadline = time.monotonic() + MESH_LOAD_DEADLINE_SECONDS
+        return
+    _on_project_settled()
+
+
+def _on_project_settled():
+    """The project now holds the mesh that was sent. Show the panel, adopt values.
 
     The dock belongs to Painter's project modes, so on the home screen it exists
     but is not shown -- which looks exactly like a plugin that failed. Opening a
@@ -652,6 +668,16 @@ def _on_project_ready(_event):
 
 
 def _on_project_closed(_event):
+    publish_project_state()
+
+
+def _on_project_saved(_event):
+    """Tell Blender where the project now lives, so the scene can bind to it.
+
+    Saving is the only moment a project acquires a path, and it is somebody
+    pressing a key in Painter, not anything the bridge drives. Publishing the
+    state here is how the other side learns a path it never chose.
+    """
     publish_project_state()
 
 
@@ -690,6 +716,8 @@ def start_plugin():
     substance_painter.event.DISPATCHER.connect_strong(
         substance_painter.event.ProjectClosed, _on_project_closed)
     substance_painter.event.DISPATCHER.connect_strong(
+        substance_painter.event.ProjectSaved, _on_project_saved)
+    substance_painter.event.DISPATCHER.connect_strong(
         substance_painter.event.TextureStateEvent, _on_texture_state)
     _timer = QtCore.QTimer(_panel)
     _timer.timeout.connect(_on_timer)
@@ -719,6 +747,8 @@ def close_plugin():
         substance_painter.event.ProjectEditionEntered, _on_project_ready)
     substance_painter.event.DISPATCHER.disconnect(
         substance_painter.event.ProjectClosed, _on_project_closed)
+    substance_painter.event.DISPATCHER.disconnect(
+        substance_painter.event.ProjectSaved, _on_project_saved)
     substance_painter.event.DISPATCHER.disconnect(
         substance_painter.event.TextureStateEvent, _on_texture_state)
     CONNECTION.close()

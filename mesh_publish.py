@@ -73,6 +73,23 @@ def _column_major(matrix):
     return [matrix[row][column] for column in range(4) for row in range(4)]
 
 
+def mint_identity(datablock):
+    """The identity, and whether it had to be minted just now.
+
+    Whether it is new is worth carrying: an identity only becomes durable once
+    the file holding it is saved, so a caller that has just minted one is
+    admitting it has no memory of previous sessions. The receiving side can then
+    adopt rather than compare, instead of reading a fresh identity as proof that
+    this is somebody else's work.
+    """
+    existing = datablock.get(IDENTITY_PROPERTY)
+    if existing:
+        return existing, False
+    minted = uuid.uuid4().hex
+    datablock[IDENTITY_PROPERTY] = minted
+    return minted, True
+
+
 def identity_of(datablock):
     """A name the other side can rely on, which renaming here cannot move.
 
@@ -82,21 +99,37 @@ def identity_of(datablock):
     paint with it. So the name Painter is told is this identity, minted once and
     stored on the datablock; the readable name travels beside it, as a label.
     """
-    existing = datablock.get(IDENTITY_PROPERTY)
-    if existing:
-        return existing
-    minted = uuid.uuid4().hex
-    datablock[IDENTITY_PROPERTY] = minted
-    return minted
+    return mint_identity(datablock)[0]
 
 
-def _material_row(material):
+def adopt_identities(objects):
+    """Give every material its identity now, and name the ones that had none.
+
+    An identity lives in the .blend, so a file that has not been saved since the
+    bridge first touched it mints a fresh set every session -- and Painter, which
+    matches Texture Sets by exactly that, then reads every material as new and
+    builds a second set of Texture Sets beside the painted ones. Doing it in one
+    pass before anything is written is what makes that visible while it can still
+    be prevented, instead of after the paint is stranded.
+    """
+    fresh = set()
+    for object_reference in objects:
+        for slot in object_reference.material_slots:
+            if slot.material is None:
+                continue
+            if mint_identity(slot.material)[1]:
+                fresh.add(slot.material.name)
+    return fresh
+
+
+def _material_row(material, fresh=()):
     """Whatever the producing side calls a material, carried verbatim.
 
     Custom properties are how a Blender-side generator stores a material data
     row, so they travel as they are. The bridge does not read them.
     """
-    row = {"identity": identity_of(material), "name": material.name}
+    row = {"identity": identity_of(material), "name": material.name,
+           "identity_is_new": material.name in fresh}
     properties = {}
     for key in material.keys():
         if key == IDENTITY_PROPERTY:
@@ -117,7 +150,7 @@ def _material_row(material):
     return row
 
 
-def collect_material_rows(objects):
+def collect_material_rows(objects, fresh=()):
     """Every distinct material row across these objects, first use wins.
 
     One collection point, because a mesh publish and a shader push must offer the
@@ -130,7 +163,7 @@ def collect_material_rows(objects):
             if slot.material is None or slot.material.name in seen:
                 continue
             seen.add(slot.material.name)
-            rows.append(_material_row(slot.material))
+            rows.append(_material_row(slot.material, fresh))
     return rows
 
 
@@ -348,11 +381,18 @@ def write_glb(arena, path, objects):
 
 
 def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
-            include_colors=True):
+            include_colors=True, binding=None):
     """Gather, write and publish one mesh generation. Returns the generation."""
     created_materials = ensure_materials(objects_to_send)
     if created_materials:
         depsgraph.update()
+    fresh = adopt_identities(objects_to_send)
+    if fresh:
+        LOG.warning(
+            "%d material(s) had no identity and were given one just now. Save the "
+            ".blend: an unsaved file mints different identities next session, and "
+            "Painter then builds new Texture Sets beside the ones already painted",
+            len(fresh))
     gathered = []
     for object_reference in objects_to_send:
         entry = gather_object(object_reference, depsgraph, include_colors)
@@ -370,6 +410,7 @@ def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
             source="blender",
             intent=intent,
             scene=scene_description,
-            materials=collect_material_rows(objects_to_send),
+            materials=collect_material_rows(objects_to_send, fresh),
             unit_scale=unit_scale,
-            up_axis="Z"))
+            up_axis="Z",
+            binding_record=binding))
