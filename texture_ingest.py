@@ -23,19 +23,21 @@ has no user at all, and Blender does not write user-less datablocks when the fil
 is saved -- so without this, pulling textures, saving and reopening would silently
 lose exactly the maps that were not wired up yet.
 
-The arena is a transport, not a texture library: a generation is retired once the
-consumer acknowledges it, and a .blend whose images pointed into one would come
-back with dangling paths. So each map is landed in a durable per-session working
-store first, under a name that does not change between pulls -- the next pull
-overwrites the same file, so an image datablock keeps one stable path for its
-whole life and the store never grows with the number of pulls.
+Images point straight into the arena, and nothing is copied out of it. That is
+safe because retirement keeps two generations alive -- the newest and the one
+this side last acknowledged -- so the payload an image was loaded from survives
+until a newer payload replaces it and the image is repointed. Copying every map
+into a private store would be a whole extra pass over every texture, every pull,
+to buy durability the arena already provides.
+
+The arena therefore lives somewhere durable rather than in the temporary folder;
+see ``arena.default_root``.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import shutil
 
 import bpy
 
@@ -45,30 +47,7 @@ LOG = logger("blender.textures")
 
 BRIDGE_KEY_PROPERTY = "ruri_bridge_key"
 UDIM_TOKEN = "<UDIM>"
-WORKING_STORE_ENVIRONMENT_VARIABLE = "RURI_BRIDGE_TEXTURE_STORE"
-WORKING_STORE_NAME = "RuriDccBridge"
 _TILE_PATTERN = re.compile(r"^(?P<stem>.*?)(?P<tile>1[0-9]{3})(?P<suffix>\.[^.]+)$")
-
-
-def working_store(session):
-    """Where ingested maps live for good, outside the arena's retirement."""
-    override = os.environ.get(WORKING_STORE_ENVIRONMENT_VARIABLE)
-    base = override or os.path.join(
-        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), WORKING_STORE_NAME)
-    directory = os.path.join(base, "textures", session)
-    os.makedirs(directory, exist_ok=True)
-    return directory
-
-
-def _land(source, destination):
-    """Copy one map out of the transport, over whatever a previous pull left."""
-    try:
-        shutil.copyfile(source, destination)
-    except PermissionError as error:
-        raise RuntimeError(
-            "{0} is held open by something else, so this pull cannot replace it: "
-            "{1}".format(destination, error))
-    return destination
 
 
 def _image_key(texture_set_name, channel_name):
@@ -101,15 +80,14 @@ def _tiled_filepath(paths):
     return template, sorted(tiles)
 
 
-def ingest_map(texture_set_name, entry, directory, store):
+def ingest_map(texture_set_name, entry, directory):
     """Bring one channel of one texture set in, reusing its datablock."""
     channel_name = entry["channel"]
     key = _image_key(texture_set_name, channel_name)
-    arena_paths = [os.path.join(directory, name) for name in entry["files"]]
-    missing = [path for path in arena_paths if not os.path.exists(path)]
+    paths = [os.path.join(directory, name) for name in entry["files"]]
+    missing = [path for path in paths if not os.path.exists(path)]
     if missing:
         raise RuntimeError("Painter reported {0} but it is not in the arena".format(missing[0]))
-    paths = [_land(path, os.path.join(store, os.path.basename(path))) for path in arena_paths]
 
     if len(paths) > 1:
         filepath, tiles = _tiled_filepath(paths)
@@ -178,17 +156,16 @@ def bind_into_material(material, images_by_channel):
     return bound
 
 
-def ingest(generation, session, bind=True):
+def ingest(generation, bind=True):
     """Consume one textures generation. Returns a per-texture-set report."""
     payload = generation.record
     directory = str(generation.path(payload["directory"]))
-    store = working_store(session)
     report = []
     for texture_set in payload["texture_sets"]:
         name = texture_set["name"]
         images_by_channel = {}
         for entry in texture_set["maps"]:
-            images_by_channel[entry["channel"]] = ingest_map(name, entry, directory, store)
+            images_by_channel[entry["channel"]] = ingest_map(name, entry, directory)
         bound = 0
         material = bpy.data.materials.get(name)
         if bind and material is not None:

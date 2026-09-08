@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import json
 import mmap
 import os
 import shutil
@@ -40,7 +41,7 @@ from .log import logger
 LOG = logger("arena")
 
 CONTROL_MAGIC = b"RURIBRDG"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 CONTROL_FILE_NAME = "control.bin"
 SESSION_DIRECTORY_NAME = "RuriDccBridge"
 ROOT_ENVIRONMENT_VARIABLE = "RURI_BRIDGE_ROOT"
@@ -49,6 +50,7 @@ DEFAULT_SESSION = "default"
 HEADER_SIZE = 64
 SLOT_SIZE = 128
 CHANNEL_NAME_SIZE = 32
+INLINE_CAPACITY = 8192
 
 SLOT_OFFSET_SEQUENCE = 32
 SLOT_OFFSET_GENERATION = 40
@@ -56,6 +58,7 @@ SLOT_OFFSET_PAYLOAD_BYTES = 48
 SLOT_OFFSET_ACKNOWLEDGED = 56
 SLOT_OFFSET_DROPPED = 64
 SLOT_OFFSET_WRITER_PROCESS = 72
+SLOT_OFFSET_INLINE_BYTES = 80
 
 MAX_OUTSTANDING_GENERATIONS = 8
 SEQLOCK_READ_ATTEMPTS = 64
@@ -86,13 +89,19 @@ def _mark_temporary(path):
 
 
 def default_root():
-    """Where sessions live unless the environment says otherwise."""
+    """Where sessions live unless the environment says otherwise.
+
+    Not the temporary folder, even though the files carry the temporary
+    attribute: those two things are unrelated. The attribute asks the cache
+    manager to keep the pages in memory, while the folder decides who may delete
+    them -- and a consumer whose images point at a payload here would lose them
+    to a disk cleanup it never asked for.
+    """
     override = os.environ.get(ROOT_ENVIRONMENT_VARIABLE)
     if override:
         return Path(override)
-    import tempfile
-
-    return Path(tempfile.gettempdir()) / SESSION_DIRECTORY_NAME
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return Path(base) / SESSION_DIRECTORY_NAME / "sessions"
 
 
 class SlotState:
@@ -162,7 +171,11 @@ class Arena:
 
     @staticmethod
     def _control_size(channel_count):
-        return HEADER_SIZE + SLOT_SIZE * channel_count
+        return HEADER_SIZE + (SLOT_SIZE + INLINE_CAPACITY) * channel_count
+
+    @staticmethod
+    def _inline_base(channel_count, index):
+        return HEADER_SIZE + SLOT_SIZE * channel_count + INLINE_CAPACITY * index
 
     @classmethod
     def _materialise_control(cls, control_path, channels):
@@ -294,6 +307,56 @@ class Arena:
         """Record how far the reader has consumed. One aligned store, no lock."""
         base = self._slot_base(channel)
         self._write_unsigned_64(base + SLOT_OFFSET_ACKNOWLEDGED, generation)
+
+    def write_state(self, channel, payload):
+        """Publish a small record entirely inside the mapped control block.
+
+        For state that only ever means "the latest value" -- a handful of shader
+        uniforms, say -- a generation directory is the wrong shape: it costs a
+        directory and a file per change, and it preserves an ordering nobody
+        reads, because a superseded value has no meaning. This writes the bytes
+        into pages both processes already have mapped, under the same seqlock
+        that guards the rest of the slot, so a change costs no filesystem at all.
+        """
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > INLINE_CAPACITY:
+            raise ArenaError(
+                "state record for {0} is {1} bytes and the inline area holds {2}; it "
+                "belongs in a generation, not in the control block".format(
+                    channel, len(encoded), INLINE_CAPACITY))
+        index = self.slot_index(channel)
+        base = HEADER_SIZE + index * SLOT_SIZE
+        inline = self._inline_base(len(self.channels), index)
+        sequence = self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE)
+        self._write_unsigned_64(base + SLOT_OFFSET_SEQUENCE, sequence + 1)
+        self._control[inline:inline + len(encoded)] = encoded
+        self._write_unsigned_64(base + SLOT_OFFSET_INLINE_BYTES, len(encoded))
+        self._write_unsigned_64(base + SLOT_OFFSET_GENERATION,
+                                self._read_unsigned_64(base + SLOT_OFFSET_GENERATION) + 1)
+        _UNSIGNED_32.pack_into(self._control, base + SLOT_OFFSET_WRITER_PROCESS, os.getpid())
+        self._write_unsigned_64(base + SLOT_OFFSET_SEQUENCE, sequence + 2)
+
+    def read_state(self, channel):
+        """The latest inline record and its generation, or (None, 0)."""
+        index = self.slot_index(channel)
+        base = HEADER_SIZE + index * SLOT_SIZE
+        inline = self._inline_base(len(self.channels), index)
+        for _ in range(SEQLOCK_READ_ATTEMPTS):
+            first = self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE)
+            if first % 2:
+                continue
+            length = self._read_unsigned_64(base + SLOT_OFFSET_INLINE_BYTES)
+            generation = self._read_unsigned_64(base + SLOT_OFFSET_GENERATION)
+            if length == 0:
+                if self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE) == first:
+                    return None, generation
+                continue
+            encoded = bytes(self._control[inline:inline + length])
+            if self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE) != first:
+                continue
+            return json.loads(encoded.decode("utf-8")), generation
+        raise ArenaError("state slot {0!r} never settled in {1} attempts".format(
+            channel, SEQLOCK_READ_ATTEMPTS))
 
     def channel_directory(self, channel):
         path = self.directory / channel

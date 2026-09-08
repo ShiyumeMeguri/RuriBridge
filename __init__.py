@@ -55,15 +55,19 @@ from ruri_bridge import arena as arena_module
 from ruri_bridge import channel as channel_module
 from ruri_bridge import log as log_module
 from ruri_bridge import record as record_module
+from ruri_bridge import sync as sync_module
 
 from . import mesh_publish, texture_ingest
 
-for _module in (arena_module, channel_module, record_module, mesh_publish, texture_ingest):
+for _module in (arena_module, channel_module, record_module, sync_module,
+                mesh_publish, texture_ingest):
     importlib.reload(_module)
 
 LOG = log_module.logger("blender")
 
 DEFAULT_POLL_SECONDS = 0.25
+SHADER_QUIET_SECONDS = 0.35
+MESH_QUIET_SECONDS = 1.2
 
 
 class _Connection:
@@ -73,7 +77,10 @@ class _Connection:
         self.arena = None
         self.publisher = None
         self.subscriber = None
+        self.state_writer = None
+        self.state_reader = None
         self.last_state = {}
+        self.published_objects = []
 
     @property
     def is_open(self):
@@ -86,6 +93,11 @@ class _Connection:
         self.publisher = channel_module.Publisher(self.arena, record_module.CHANNEL_TO_PAINTER)
         self.subscriber = channel_module.Subscriber(self.arena, record_module.CHANNEL_TO_BLENDER)
         self.subscriber.skip_to_latest()
+        self.state_writer = channel_module.StateWriter(
+            self.arena, record_module.CHANNEL_STATE_TO_PAINTER)
+        self.state_reader = channel_module.StateReader(
+            self.arena, record_module.CHANNEL_STATE_TO_BLENDER)
+        self.state_reader.skip_to_latest()
         LOG.info("attached to session %s at %s", session, self.arena.directory)
         return self.arena
 
@@ -95,9 +107,14 @@ class _Connection:
         self.arena = None
         self.publisher = None
         self.subscriber = None
+        self.state_writer = None
+        self.state_reader = None
 
 
 CONNECTION = _Connection()
+SHADER_GATE = sync_module.ChangeGate("blender.shader", SHADER_QUIET_SECONDS)
+MESH_GATE = sync_module.ChangeGate("blender.mesh", MESH_QUIET_SECONDS)
+_mesh_serial = 0
 
 
 def connect(session=arena_module.DEFAULT_SESSION, root=None):
@@ -110,6 +127,8 @@ def disconnect():
 
 
 def objects_in_scope(context, scope):
+    if scope == "PUBLISHED":
+        return watched_objects()
     if scope == "SELECTED":
         chosen = [entry for entry in context.selected_objects if entry.type == "MESH"]
     else:
@@ -127,9 +146,13 @@ def publish_mesh(context, scope="SELECTED", intent=record_module.INTENT_AUTO,
     if not chosen:
         raise RuntimeError("no mesh object in scope {0}".format(scope))
     depsgraph = context.evaluated_depsgraph_get()
-    return mesh_publish.publish(
+    generation = mesh_publish.publish(
         CONNECTION.arena, CONNECTION.publisher, chosen, depsgraph, intent,
         context.scene.unit_settings.scale_length, include_colors)
+    CONNECTION.published_objects = [entry.name for entry in chosen]
+    MESH_GATE.prime({"serial": _mesh_serial})
+    SHADER_GATE.prime(material_values())
+    return generation
 
 
 def request_export(preset_name, resolution_log2=None):
@@ -154,8 +177,57 @@ def push_shader_parameters(context, scope="SELECTED"):
     if not values:
         raise RuntimeError(
             "no material in scope {0} carries any custom property to offer".format(scope))
-    return CONNECTION.publisher.publish_record(
-        record_module.shader_apply("blender", values))
+    SHADER_GATE.prime(values)
+    return CONNECTION.state_writer.write(record_module.shader_values("blender", values))
+
+
+def watched_objects():
+    """The objects live sync follows: the ones last published, by name.
+
+    Not the current selection. Selection moves constantly while working, and a
+    timer's context cannot read it anyway; the objects Painter was given are the
+    ones Painter has Texture Sets for, so they are what "keep this in sync" means.
+    """
+    return [bpy.data.objects[name] for name in CONNECTION.published_objects
+            if name in bpy.data.objects]
+
+
+def material_values():
+    """The data rows live sync watches and offers."""
+    rows = mesh_publish.collect_material_rows(watched_objects())
+    return {row["name"]: row["properties"] for row in rows if row.get("properties")}
+
+
+def live_sync(settings):
+    """Publish what changed here, once it has settled. Never what just arrived."""
+    if not CONNECTION.is_open or not settings.live_sync or not CONNECTION.published_objects:
+        return None
+    if settings.live_shader_values:
+        values = material_values()
+        if SHADER_GATE.should_publish(values):
+            CONNECTION.state_writer.write(record_module.shader_values("blender", values))
+            return "sent {0} shader value(s)".format(
+                sum(len(entry) for entry in values.values()))
+    if settings.live_mesh and bpy.context.mode == "OBJECT":
+        if MESH_GATE.should_publish({"serial": _mesh_serial}):
+            generation = publish_mesh(bpy.context, "PUBLISHED", settings.intent,
+                                      settings.include_colors)
+            return "sent mesh, generation {0}".format(generation.number)
+    return None
+
+
+def _on_depsgraph_update(scene, depsgraph):
+    """Count geometry edits only.
+
+    Shading updates are excluded on purpose: mirroring Painter's shader values
+    onto a material is itself a depsgraph update, and counting it here would make
+    every value that arrives from Painter trigger a mesh republish back at it.
+    """
+    global _mesh_serial
+    for update in depsgraph.updates:
+        if update.is_updated_geometry:
+            _mesh_serial += 1
+            return
 
 
 def ingest_latest_textures(bind=True):
@@ -165,9 +237,48 @@ def ingest_latest_textures(bind=True):
     generation = CONNECTION.subscriber.latest(record_module.KIND_TEXTURES)
     if generation is None:
         raise RuntimeError("Painter has not published any textures on this session")
-    report = texture_ingest.ingest(generation, CONNECTION.arena.session, bind=bind)
+    report = texture_ingest.ingest(generation, bind=bind)
     CONNECTION.subscriber.acknowledge(generation)
     return generation, report
+
+
+def take_shader_values(bind=True):
+    """Mirror Painter's live values back, straight out of the control block."""
+    if not CONNECTION.is_open or not bind:
+        return None
+    payload = CONNECTION.state_reader.take()
+    if payload is None:
+        return None
+    return apply_values(payload.get("by_texture_set", {}))
+
+
+def apply_values(values_by_texture_set):
+    """Write incoming values onto the material rows that already name them.
+
+    Only names the Blender material already carries are written. The material's
+    row is what this side considers the material to be about; the other side's
+    shader exposes far more, and copying all of it in would move Painter's
+    vocabulary into the .blend rather than keep two declared things equal.
+    """
+    written = {}
+    for texture_set, values in values_by_texture_set.items():
+        material = bpy.data.materials.get(texture_set)
+        if material is None:
+            continue
+        for name, value in values.items():
+            if name not in material.keys():
+                continue
+            current = material[name]
+            if hasattr(current, "to_list"):
+                current = current.to_list()
+            if current == value:
+                continue
+            material[name] = value
+            written.setdefault(texture_set, []).append(name)
+    if written:
+        LOG.info("mirrored incoming values onto %s", written)
+    SHADER_GATE.suppress(material_values())
+    return written
 
 
 def pump(bind=True):
@@ -184,10 +295,12 @@ def pump(bind=True):
         try:
             if generation.kind == record_module.KIND_TEXTURES:
                 handled.append((generation.number, generation.kind,
-                                texture_ingest.ingest(
-                                    generation, CONNECTION.arena.session, bind=bind)))
-            elif generation.kind in (record_module.KIND_PROJECT_STATE,
-                                     record_module.KIND_SHADER_STATE):
+                                texture_ingest.ingest(generation, bind=bind)))
+            elif generation.kind == record_module.KIND_SHADER_STATE:
+                CONNECTION.last_state[generation.kind] = generation.record
+                handled.append((generation.number, generation.kind,
+                                len(generation.record.get("instances", []))))
+            elif generation.kind == record_module.KIND_PROJECT_STATE:
                 CONNECTION.last_state[generation.kind] = generation.record
                 handled.append((generation.number, generation.kind, generation.record))
             else:
@@ -198,6 +311,9 @@ def pump(bind=True):
                       generation.number, generation.kind, error)
             handled.append((generation.number, "failed", str(error)))
         CONNECTION.subscriber.acknowledge(generation)
+    written = take_shader_values(bind)
+    if written:
+        handled.append((0, record_module.KIND_SHADER_VALUES, written))
     return handled
 
 
@@ -225,6 +341,20 @@ class RuriBridgeSettings(bpy.types.PropertyGroup):
     include_colors: bpy.props.BoolProperty(
         name="Vertex Colors",
         description="Send the active color attribute alongside positions and normals",
+        default=True)
+    live_sync: bpy.props.BoolProperty(
+        name="Live Sync",
+        description="Publish changes as soon as they settle, instead of on demand",
+        default=True)
+    live_shader_values: bpy.props.BoolProperty(
+        name="Shader Values",
+        description="Follow the published materials' custom properties both ways",
+        default=True)
+    live_mesh: bpy.props.BoolProperty(
+        name="Mesh",
+        description="Re-send the published objects after a geometry edit settles. "
+                    "Each send is a whole-mesh reload on Painter's side, so it fires "
+                    "on leaving Edit Mode rather than per vertex",
         default=True)
     bind_on_receive: bpy.props.BoolProperty(
         name="Bind On Receive",
@@ -254,6 +384,15 @@ def _timer():
     if handled:
         summary = ", ".join("{0}#{1}".format(kind, number) for number, kind, _ in handled)
         settings.status = "received " + summary
+        _tag_redraw()
+    try:
+        sent = live_sync(settings)
+    except Exception as error:
+        LOG.error("live sync failed: %s", error)
+        settings.status = "live sync failed: {0}".format(error)
+        return settings.poll_seconds
+    if sent:
+        settings.status = "live: " + sent
         _tag_redraw()
     return settings.poll_seconds
 
@@ -413,6 +552,15 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         column.operator(RURIBRIDGE_OT_request_export.bl_idname, icon="IMPORT")
         column.operator(RURIBRIDGE_OT_pull_textures.bl_idname, icon="FILE_REFRESH")
 
+        box = layout.box()
+        box.prop(settings, "live_sync")
+        row = box.row(align=True)
+        row.enabled = settings.live_sync
+        row.prop(settings, "live_shader_values", toggle=True)
+        row.prop(settings, "live_mesh", toggle=True)
+        if CONNECTION.is_open and not CONNECTION.published_objects:
+            box.label(text="send the mesh once to start live sync", icon="INFO")
+
         layout.prop(settings, "poll_seconds")
         box = layout.box()
         box.label(text=settings.status, icon="INFO")
@@ -431,6 +579,8 @@ _CLASSES = (RuriBridgeSettings, RURIBRIDGE_OT_connect, RURIBRIDGE_OT_disconnect,
 
 def register():
     log_module.install_stream_sink()
+    if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
     for entry in _CLASSES:
         bpy.utils.register_class(entry)
     bpy.types.Scene.ruri_bridge = bpy.props.PointerProperty(type=RuriBridgeSettings)
@@ -438,6 +588,8 @@ def register():
 
 def unregister():
     _stop_timer()
+    if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
     CONNECTION.close()
     del bpy.types.Scene.ruri_bridge
     for entry in reversed(_CLASSES):

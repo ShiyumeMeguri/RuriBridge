@@ -88,6 +88,18 @@ def read_state():
     }
 
 
+def parameter_values():
+    """Just the values, for watching. Small enough to ask for on a timer.
+
+    ``parameters()`` carries every parameter's full description -- labels, help
+    text, widget hints -- which is tens of kilobytes per instance and pointless
+    to re-read while looking for a changed number. The assignment object holds
+    the same values with none of that.
+    """
+    return {label: body.get("parameters", {})
+            for label, body in assignment().get("shaders", {}).items()}
+
+
 def instance_by_texture_set():
     """Texture Set name -> shader instance id.
 

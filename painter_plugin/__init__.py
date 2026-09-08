@@ -43,12 +43,14 @@ from PySide6 import QtCore, QtWidgets
 import substance_painter.event
 import substance_painter.logging
 import substance_painter.project
+import substance_painter.textureset
 import substance_painter.ui
 
 from ruri_bridge import arena as arena_module
 from ruri_bridge import channel as channel_module
 from ruri_bridge import log as log_module
 from ruri_bridge import record as record_module
+from ruri_bridge import sync as sync_module
 
 from . import mesh_ingest, shader_state, texture_publish
 
@@ -58,6 +60,8 @@ SESSION_ENVIRONMENT_VARIABLE = "RURI_BRIDGE_SESSION"
 POLL_MILLISECONDS = 250
 DEFAULT_TEXTURE_RESOLUTION = 2048
 MESH_LOAD_DEADLINE_SECONDS = 600.0
+SHADER_QUIET_SECONDS = 0.35
+TEXTURE_QUIET_SECONDS = 0.9
 
 _SEVERITY = {
     "DEBUG": substance_painter.logging.DBG_INFO,
@@ -81,6 +85,8 @@ class _Connection:
         self.arena = None
         self.publisher = None
         self.subscriber = None
+        self.state_writer = None
+        self.state_reader = None
 
     @property
     def is_open(self):
@@ -92,6 +98,11 @@ class _Connection:
         self.publisher = channel_module.Publisher(self.arena, record_module.CHANNEL_TO_BLENDER)
         self.subscriber = channel_module.Subscriber(self.arena, record_module.CHANNEL_TO_PAINTER)
         self.subscriber.skip_to_latest()
+        self.state_writer = channel_module.StateWriter(
+            self.arena, record_module.CHANNEL_STATE_TO_BLENDER)
+        self.state_reader = channel_module.StateReader(
+            self.arena, record_module.CHANNEL_STATE_TO_PAINTER)
+        self.state_reader.skip_to_latest()
         LOG.info("attached to session %s at %s", session, self.arena.directory)
         return self.arena
 
@@ -101,6 +112,8 @@ class _Connection:
         self.arena = None
         self.publisher = None
         self.subscriber = None
+        self.state_writer = None
+        self.state_reader = None
 
 
 CONNECTION = _Connection()
@@ -160,6 +173,13 @@ class RuriBridgePanel(QtWidgets.QWidget):
         form.addRow("Export preset", self.preset_box)
         layout.addLayout(form)
 
+        self.live_box = QtWidgets.QCheckBox("Live sync to Blender")
+        self.live_box.setToolTip(
+            "Send painted channels and changed shader values as soon as they settle, "
+            "instead of waiting to be asked")
+        self.live_box.setChecked(True)
+        layout.addWidget(self.live_box)
+
         self.send_button = QtWidgets.QPushButton("Send Textures To Blender")
         layout.addWidget(self.send_button)
 
@@ -177,6 +197,9 @@ class RuriBridgePanel(QtWidgets.QWidget):
     @property
     def texture_resolution(self):
         return int(self.resolution_box.currentData())
+
+    def live_enabled(self):
+        return self.live_box.isChecked()
 
     def set_status(self, message):
         self.status_label.setText(message)
@@ -234,6 +257,93 @@ _dock = None
 _timer = None
 _log_handler = None
 _mesh_deadline = None
+_shader_gate = sync_module.ChangeGate("painter.shader", SHADER_QUIET_SECONDS)
+_texture_gate = sync_module.ChangeGate("painter.textures", TEXTURE_QUIET_SECONDS)
+_dirty_textures = set()
+_texture_serial = 0
+_shader_poll_cost = None
+
+
+def _on_texture_state(event):
+    """Painter's only signal that a stroke landed. Kept to two stores.
+
+    Painter warns that work done in this callback hurts the painting experience,
+    and it fires per texture per throttle window while a brush is down, so
+    nothing is resolved here -- the ids become names later, once, after the burst
+    has settled.
+    """
+    global _texture_serial
+    _dirty_textures.add((event.stack_id, event.channel_type))
+    _texture_serial += 1
+
+
+def _resolve_dirty_textures():
+    by_texture_set = {}
+    for stack_id, channel_type in _dirty_textures:
+        try:
+            name = substance_painter.textureset.Stack(stack_id).material().name()
+        except Exception as error:
+            LOG.warning("stack %s no longer resolves: %s", stack_id, error)
+            continue
+        by_texture_set.setdefault(name, set()).add(channel_type.name.lower())
+    return by_texture_set
+
+
+def _publish_dirty_textures():
+    dirty = _resolve_dirty_textures()
+    _dirty_textures.clear()
+    _texture_gate.prime({"dirty": [], "serial": _texture_serial})
+    if not dirty:
+        return None
+    generation = texture_publish.publish(
+        CONNECTION.arena, CONNECTION.publisher, _panel.preset_box.currentText(),
+        sorted(dirty), dirty)
+    _panel.set_status("live: sent {0} of {1}".format(
+        ", ".join(sorted({channel for names in dirty.values() for channel in names})),
+        ", ".join(sorted(dirty))))
+    return generation
+
+
+def _values_by_texture_set(values_by_label):
+    """Re-key the shader instances' values by the Texture Sets that run them.
+
+    The other side thinks in materials, which are Texture Sets here; instance
+    labels mean nothing to it, and several sets can share one instance.
+    """
+    by_texture_set = {}
+    for texture_set, body in shader_state.assignment().get("texturesets", {}).items():
+        groups = values_by_label.get(body.get("shader"))
+        if not groups:
+            continue
+        flattened = {}
+        for members in groups.values():
+            flattened.update(members)
+        by_texture_set[texture_set] = flattened
+    return by_texture_set
+
+
+def live_sync():
+    """Publish what changed on this side, once it has stopped changing."""
+    global _shader_poll_cost
+    if not CONNECTION.is_open or _panel is None or not _panel.live_enabled():
+        return
+    if _mesh_deadline is not None or not substance_painter.project.is_open():
+        return
+    if substance_painter.project.is_busy():
+        return
+    if _dirty_textures and _texture_gate.should_publish(
+            {"dirty": sorted((stack, channel.name) for stack, channel in _dirty_textures),
+             "serial": _texture_serial}):
+        _publish_dirty_textures()
+    started = time.monotonic()
+    values = shader_state.parameter_values()
+    if _shader_poll_cost is None:
+        _shader_poll_cost = time.monotonic() - started
+        LOG.info("watching shader values costs %.1f ms a poll", _shader_poll_cost * 1000.0)
+    if _shader_gate.should_publish(values):
+        CONNECTION.state_writer.write(record_module.shader_values(
+            "painter", _values_by_texture_set(values)))
+        _panel.set_status("live: sent shader values")
 
 
 def _handle(generation):
@@ -249,17 +359,6 @@ def _handle(generation):
         _panel.set_status("mesh generation {0}: {1} ({2})".format(
             generation.number, intent, mesh_ingest.describe_scene(generation)))
         return True
-    if generation.kind == record_module.KIND_SHADER_APPLY:
-        report = shader_state.apply_by_texture_set(
-            generation.record.get("by_texture_set", {}),
-            generation.record.get("shader_url_by_texture_set"))
-        for label in ("unknown", "mismatched", "conflicting", "unmapped"):
-            if report[label]:
-                LOG.warning("shader values %s: %s", label, report[label])
-        _panel.set_status("shader values from generation {0}: applied {1}".format(
-            generation.number, report["applied"] or "nothing"))
-        publish_shader_state()
-        return False
     if generation.kind == record_module.KIND_EXPORT_REQUEST:
         preset = generation.record.get("preset_name") or _panel.preset_box.currentText()
         published = texture_publish.publish(
@@ -271,6 +370,31 @@ def _handle(generation):
     LOG.warning("ignoring generation %d of unknown kind %r",
                 generation.number, generation.kind)
     return False
+
+
+def take_shader_values():
+    """Apply values arriving in the control block, and never echo them back."""
+    if not CONNECTION.is_open or not substance_painter.project.is_open():
+        return None
+    payload = CONNECTION.state_reader.take()
+    if payload is None:
+        return None
+    report = shader_state.apply_by_texture_set(
+        payload.get("by_texture_set", {}),
+        payload.get("shader_url_by_texture_set"))
+    refused = [label for label in ("unknown", "mismatched", "conflicting", "unmapped")
+               if report[label]]
+    for label in refused:
+        LOG.warning("shader values %s: %s", label, report[label])
+    values = shader_state.parameter_values()
+    _shader_gate.suppress(values)
+    if refused:
+        CONNECTION.state_writer.write(record_module.shader_values(
+            "painter", _values_by_texture_set(values)))
+        LOG.info("wrote back what actually stuck, because %s", ", ".join(refused))
+    if _panel is not None:
+        _panel.set_status("applied shader values: {0}".format(report["applied"] or "nothing"))
+    return report
 
 
 def pump():
@@ -303,6 +427,7 @@ def pump():
         _mesh_deadline = None
     if substance_painter.project.is_busy():
         return
+    take_shader_values()
     for generation in CONNECTION.subscriber.pending():
         try:
             became_busy = _handle(generation)
@@ -320,6 +445,7 @@ def pump():
 def _on_timer():
     try:
         pump()
+        live_sync()
     except Exception as error:
         LOG.error("pump failed: %s", error)
         if _panel is not None:
@@ -327,8 +453,18 @@ def _on_timer():
 
 
 def _on_project_ready(_event):
+    """A project just became editable. Adopt its shader values without sending them.
+
+    Priming rather than publishing is what stops a freshly created project's
+    defaults from overwriting values the other side authored: on connect neither
+    side asserts, and only an actual change afterwards travels.
+    """
     global _mesh_deadline
     _mesh_deadline = None
+    try:
+        _shader_gate.prime(shader_state.parameter_values())
+    except shader_state.ShaderStateError as error:
+        LOG.error("could not adopt the shader values: %s", error)
     if _panel is not None:
         _panel.refresh_presets()
     publish_project_state()
@@ -351,6 +487,8 @@ def start_plugin():
         substance_painter.event.ProjectEditionEntered, _on_project_ready)
     substance_painter.event.DISPATCHER.connect_strong(
         substance_painter.event.ProjectClosed, _on_project_closed)
+    substance_painter.event.DISPATCHER.connect_strong(
+        substance_painter.event.TextureStateEvent, _on_texture_state)
     _timer = QtCore.QTimer(_panel)
     _timer.timeout.connect(_on_timer)
     _timer.start(POLL_MILLISECONDS)
@@ -374,6 +512,8 @@ def close_plugin():
         substance_painter.event.ProjectEditionEntered, _on_project_ready)
     substance_painter.event.DISPATCHER.disconnect(
         substance_painter.event.ProjectClosed, _on_project_closed)
+    substance_painter.event.DISPATCHER.disconnect(
+        substance_painter.event.TextureStateEvent, _on_texture_state)
     CONNECTION.close()
     if _dock is not None:
         substance_painter.ui.delete_ui_element(_dock)

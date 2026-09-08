@@ -124,13 +124,20 @@ class Publisher:
             return staging.publish(record)
 
     def _retire(self, newest):
-        """Drop acknowledged generations, and cap an unacknowledged backlog."""
+        """Drop what nobody can still be using, and cap an unread backlog.
+
+        The generation the consumer acknowledged *last* is kept alongside the
+        newest one, because acknowledging means "I have taken this", not "I have
+        finished with it": a Blender image loaded out of a payload keeps pointing
+        at it until a newer payload replaces it, and retiring it underneath would
+        leave that image dangling. Two survivors is the whole cost.
+        """
         state = self.arena.read_slot(self.channel)
         acknowledged = state.acknowledged_generation
         dropped = state.dropped_generations
         outstanding = []
         for number in self.arena.existing_generations(self.channel):
-            if number >= newest:
+            if number >= newest or number == acknowledged:
                 continue
             if number <= acknowledged:
                 self.arena.discard_generation(self.channel, number)
@@ -224,3 +231,41 @@ class Subscriber:
         self._acknowledged = max(self._acknowledged, generation.number
                                  if isinstance(generation, Generation) else generation)
         self.arena.acknowledge(self.channel, self._acknowledged)
+
+
+class StateWriter:
+    """The writing end of an inline state channel."""
+
+    def __init__(self, arena, channel):
+        self.arena = arena
+        self.channel = channel
+
+    def write(self, record):
+        self.arena.write_state(self.channel, record)
+        return record
+
+
+class StateReader:
+    """The reading end of an inline state channel.
+
+    Latest-wins by construction: there is one slot, so a value that was replaced
+    before this side looked was never news. What it tracks is only the generation
+    counter, to answer "is this different from what I last saw".
+    """
+
+    def __init__(self, arena, channel):
+        self.arena = arena
+        self.channel = channel
+        self._seen = arena.read_state(channel)[1]
+
+    def skip_to_latest(self):
+        self._seen = self.arena.read_state(self.channel)[1]
+        return self._seen
+
+    def take(self):
+        """The record if it changed since the last take, otherwise None."""
+        payload, generation = self.arena.read_state(self.channel)
+        if payload is None or generation == self._seen:
+            return None
+        self._seen = generation
+        return payload

@@ -22,14 +22,19 @@ FORMAT_VERSION = 1
 
 CHANNEL_TO_PAINTER = "to_painter"
 CHANNEL_TO_BLENDER = "to_blender"
-CHANNELS = (CHANNEL_TO_PAINTER, CHANNEL_TO_BLENDER)
+CHANNEL_STATE_TO_PAINTER = "state_to_painter"
+CHANNEL_STATE_TO_BLENDER = "state_to_blender"
+CHANNELS = (CHANNEL_TO_PAINTER, CHANNEL_TO_BLENDER,
+            CHANNEL_STATE_TO_PAINTER, CHANNEL_STATE_TO_BLENDER)
+QUEUED_CHANNELS = (CHANNEL_TO_PAINTER, CHANNEL_TO_BLENDER)
+STATE_CHANNELS = (CHANNEL_STATE_TO_PAINTER, CHANNEL_STATE_TO_BLENDER)
 
 KIND_MESH = "mesh"
 KIND_EXPORT_REQUEST = "export_request"
-KIND_SHADER_APPLY = "shader_apply"
 KIND_TEXTURES = "textures"
 KIND_PROJECT_STATE = "project_state"
 KIND_SHADER_STATE = "shader_state"
+KIND_SHADER_VALUES = "shader_values"
 
 INTENT_AUTO = "auto"
 INTENT_CREATE_PROJECT = "create_project"
@@ -143,15 +148,23 @@ def project_state(source, is_open, project_path, mesh_path, texture_sets):
     return record
 
 
-def shader_apply(source, values_by_texture_set, shader_url_by_texture_set=None):
-    """Blender -> Painter: offer these values to whatever shader each set runs.
+def shader_values(source, values_by_texture_set, shader_url_by_texture_set=None):
+    """Either way: the current value of every watched uniform, and nothing else.
 
-    The offer is deliberately unfiltered. Blender does not know which uniforms
-    Painter's shader exposes, and inventing a table of names here would be a
-    second truth source for something the shader can already be asked about, so
-    the intersection is computed on Painter's side and reported back.
+    This is the record that rides in the control block rather than in a
+    generation, because it is state and not an event -- a value that has already
+    been replaced has nothing to say, so the latest one overwriting the previous
+    one in place is exactly right, and it costs no filesystem at all.
+
+    An offer is deliberately unfiltered. The sender does not know which uniforms
+    the other side's shader exposes, and a table of names kept here would be a
+    second truth source for something the shader can be asked about directly, so
+    the intersection is computed by the receiver and reported back.
+
+    Which shader each Texture Set runs travels in the same record because it is
+    state too: assigning the shader an instance already runs is nothing.
     """
-    record = _base(KIND_SHADER_APPLY, source)
+    record = _base(KIND_SHADER_VALUES, source)
     record.update({
         "by_texture_set": values_by_texture_set,
         "shader_url_by_texture_set": shader_url_by_texture_set or {},

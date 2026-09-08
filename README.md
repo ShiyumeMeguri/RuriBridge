@@ -1,4 +1,4 @@
-# RuriDccBridge
+# RuriBridge
 
 Blender 5.x ⇄ Adobe Substance 3D Painter 的共享内存桥。网格从 Blender 直接写进
 Painter 会映射的**同一批物理页**,通道贴图从 Painter 原样回到 Blender。
@@ -43,13 +43,16 @@ read 这一轮。竞技场创建的每个文件都带 `FILE_ATTRIBUTE_TEMPORARY`
 |---|---|---|
 | Blender 网格 → 竞技场 | **1 次** | `numpy.take(值, 顺序, out=映射页)`,直接 gather 进页面 |
 | 竞技场 → Painter 导入器 | **0 次** | Painter 打开的路径就是那批页,只是一次页查找 |
-| Painter 通道 → 竞技场 | 1 次 | Painter 的导出器自己写文件,写进的是页缓存 |
-| 竞技场 → 耐久工作区 | 1 次 | 竞技场是传输,generation 被确认后就回收;图像不能指着它 |
-| 工作区 → Blender 图像 | 1 次 | bpy 没有借指针入口,`Image.pixels` 是 Blender 自己的 float 数组 |
+| shader 参数,双向 | **0 次** | 直接读写控制块的内联区,两侧都已映射,不碰文件系统 |
+| Painter 通道 → 竞技场 | 1 次 | Painter 的导出器自己写,写进的是页缓存 |
+| 竞技场 → Blender 图像 | 1 次 | bpy 没有借指针入口,`Image.pixels` 是 Blender 自己的数组 |
 
-贴图腿**没有零拷贝可言**,这点不粉饰:接收缓冲区归 Blender 所有;落地那一步是为了让存盘后的
-.blend 不指向一块会被回收的传输区。工作区在 `%LOCALAPPDATA%\RuriDccBridge\textures\<会话>`,
-文件按名覆盖所以不随拉取次数增长,可用 `RURI_BRIDGE_TEXTURE_STORE` 改。**网格腿是真的零拷贝。**
+**为什么贴图腿到不了零拷贝**(查证过,不是没试):Painter 既没有 C++/原生插件 SDK,Python API
+也没有任何缓冲区形态的纹理入口或出口 —— Adobe 自己 2018 年那篇把 GL 纹理倒进共享内存的 R&D
+改的是**引擎本体**,是 Labs 原型,从未作为公开 API 发布。Blender 这侧 5.2 确有
+`imbuf.load_from_buffer` / `ImBuf.with_buffer`,但 `bpy.types.Image` **不接受 ImBuf**,走它反而
+多一次拷贝。所以地板就是:Painter 往共享页写一次,Blender 从那页读一次。**不额外落地** ——
+图像直接指向竞技场,靠保留策略保证它指着的那一代不会被抽掉。
 
 去重不物化它比较的值:两个角只要顶点索引相同,位置就必然相同,所以键 = 顶点索引 + 角域属性
 的原始 32 位字。点域数据完全不进键(顶点索引已经蕴含它),写的时候把两个索引数组复合起来,
@@ -70,7 +73,13 @@ python -m ruri_bridge.cli install --painter-plugins "<Painter 用户 python>/plu
 - Painter:插件随应用启动,面板是一个停靠窗口,启动时自动挂到默认会话。
 
 两侧必须用同一个会话名(默认 `default`,Painter 侧可用环境变量 `RURI_BRIDGE_SESSION` 覆盖)。
-会话根默认 `%TEMP%\RuriDccBridge`,可用 `RURI_BRIDGE_ROOT` 覆盖。
+会话根默认 `%LOCALAPPDATA%\RuriDccBridge\sessions`,可用 `RURI_BRIDGE_ROOT` 覆盖。
+
+**不放临时目录**,尽管文件都带 `FILE_ATTRIBUTE_TEMPORARY` —— 这两件事无关:属性是求缓存管理器
+把页留在内存,目录决定谁有权删它。消费者的图像指着这里的载荷,不能让一次磁盘清理把它抹掉。
+
+**保留策略**:回收时保住两代 —— 最新的,和消费者**最后确认的那一代**。确认的含义是「我取到了」,
+不是「我用完了」:Blender 的图像会一直指着它,直到更新的一代把它替换掉。两代就是全部代价。
 
 `--copy` 也支持,但复制单个宿主目录会找不到上层的共享核心 —— 要复制就整仓复制。
 
@@ -81,6 +90,8 @@ python -m ruri_bridge.cli status                 # 控制块:每个通道的代�
 python -m ruri_bridge.cli inspect --channel to_painter
 python -m ruri_bridge.cli verify-mesh            # 重读发布的 GLB 并逐项判定
 python -m ruri_bridge.cli textures --into <目录>  # 列出 Painter 最新一批贴图,可另存
+python -m ruri_bridge.cli values                 # 内联状态槽:双向的 shader 值,不落任何文件
+python -m ruri_bridge.cli shaders --name intensity
 python -m ruri_bridge.cli sessions / remove
 python -m ruri_bridge.cli publish-mesh   --blender <blender.exe> --blend <场景> --scope VISIBLE
 python -m ruri_bridge.cli request-export --blender <blender.exe> --blend <场景>
@@ -103,8 +114,14 @@ python -m ruri_bridge.cli pull-textures  --blender <blender.exe> --blend <场景
 
 | 通道 | 写者 | 记录种类 |
 |---|---|---|
-| `to_painter` | Blender | `mesh`(GLB + 材质数据行 + 意图)、`export_request`、`shader_apply` |
-| `to_blender` | Painter | `textures`(每张图的位深/格式/色彩空间)、`project_state`、`shader_state` |
+| `to_painter` | Blender | `mesh`(GLB + 材质数据行 + 意图)、`export_request` |
+| `to_blender` | Painter | `textures`(位深/格式/色彩空间)、`project_state`、`shader_state` |
+| `state_to_painter` | Blender | `shader_values` —— **内联在控制块里,零文件** |
+| `state_to_blender` | Painter | `shader_values` —— 同上 |
+
+前两条是**队列**:不可变 generation 目录,未确认的不丢,顺序有意义。后两条是**状态**:一个槽,
+后写覆盖前写,因为一个已被取代的值没有任何意义 —— 为它造目录和文件是错的形状。两种语义分在
+不同通道上,不混在一条里。
 
 `mesh` 记录里的 `materials` 是**原样搬运**的:名字 + Blender 材质的自定义属性 + 用到的节点组名。
 桥不解释它们 —— 着色器生成器改词汇,这里一行都不用动。
@@ -132,6 +149,36 @@ Painter 的 `Base_color`),两个通道归一化后同名则直接报错,不猜�
 
 代价说清楚:如果谁把 BaseColor 设成 RGB32F(线性 HDR 色彩),它会被标成 `Non-Color`。默认配置下
 与 `Linear Rec.709` 数值等价,非默认色彩管理下需要手动改。用格式单独判,这两种情况本来就区分不了。
+
+## 实时同步(默认开,可关)
+
+三条腿都是**变更驱动**的,不是请求驱动:
+
+| 腿 | 怎么察觉 | 静默期 | 实测代价 |
+|---|---|---|---|
+| Painter 画笔 → Blender | `TextureStateEvent`(Painter 唯一的落笔信号) | 0.9s | **只导脏通道**,157KB 对全量 545KB |
+| shader 参数,双向 | 各自轮询自己的值比对指纹 | 0.35s | Painter 侧 **0.9 ms 一次**,250ms 节拍 ≈ 0.36% 单核 |
+| Blender 几何 → Painter | `depsgraph_update_post` 只数 `is_updated_geometry` | 1.2s | 一次整网格重载,所以按「离开编辑模式」的节奏走 |
+
+关掉:Blender N 面板的 **Live Sync**(以及分开的 Shader Values / Mesh),Painter 停靠面板的
+**Live sync to Blender**。默认全开。
+
+活同步盯的是**上次发布过的那批对象**,不是当前选择 —— 选择在工作中一直变,而且定时器里的
+`bpy.context` 本来就读不到它。发一次网格建立链接,之后全自动。
+
+**三件事必须一起做对,否则不是活同步而是灾难**,`ruri_bridge/sync.py` 的 `ChangeGate` 一次解决:
+
+1. **察觉**:宿主不会为桥关心的一切发事件,所以要么用它确实发的事件,要么在定时器上比对便宜的指纹。
+2. **收敛**:一笔、一次拖动、一次拽点产生的是**一串**变更。逐事件发布会送出几百代,网格腿还会让
+   对面在拖动中途重载。所以指纹**停下来**并过了静默期才发。
+3. **不回声**:两边都发布自己观察到的状态,值就会永远弹来弹去。解法不是定时器也不是会衰减的标志位,
+   是**记住从对面来的那个指纹并拒绝发布它**。
+
+首次连接两侧都只「认领现状」不发布 —— 否则新建工程的缺省值会盖掉你在 .blend 里写好的值。
+
+Painter 应用完之后,只要有名字没被采纳(未知/类型不符/冲突),它会把**实际生效的值写回来**,
+让冲突在 Blender 里现形,而不是在 .blend 里留一个假值。
+
 
 ## 视口着色器参数
 

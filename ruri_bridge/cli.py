@@ -64,8 +64,14 @@ def command_status(arguments):
         print("directory {0}".format(arena.directory))
         print("epoch     {0}".format(arena.epoch))
         for state in arena.describe():
+            if state.channel in record_module.STATE_CHANNELS:
+                payload, generation = arena.read_state(state.channel)
+                print("  {0:<17} revision={1} inline={2} bytes writer={3}".format(
+                    state.channel, generation,
+                    len(json.dumps(payload)) if payload else 0, state.writer_process_id))
+                continue
             generations = arena.existing_generations(state.channel)
-            print("  {0:<12} generation={1} acknowledged={2} dropped={3} "
+            print("  {0:<17} generation={1} acknowledged={2} dropped={3} "
                   "payload={4} writer={5} on disk={6}".format(
                       state.channel, state.generation, state.acknowledged_generation,
                       state.dropped_generations, state.payload_bytes,
@@ -73,9 +79,27 @@ def command_status(arguments):
     return 0
 
 
+def command_values(arguments):
+    """Read the inline state slots, which carry no files at all."""
+    with _open(arguments) as arena:
+        for name in record_module.STATE_CHANNELS:
+            payload, generation = arena.read_state(name)
+            if payload is None:
+                print("{0}: nothing written".format(name))
+                continue
+            print("{0}: revision {1}, from {2}".format(
+                name, generation, payload.get("source")))
+            for texture_set, values in sorted(payload.get("by_texture_set", {}).items()):
+                print("  {0}".format(texture_set))
+                for key, value in sorted(values.items()):
+                    print("    {0:<28} {1}".format(key, value))
+    return 0
+
+
 def command_inspect(arguments):
     with _open(arguments) as arena:
-        channels = [arguments.channel] if arguments.channel else list(arena.channels)
+        channels = [arguments.channel] if arguments.channel else list(
+            record_module.QUEUED_CHANNELS)
         for name in channels:
             state = arena.read_slot(name)
             if state.generation == 0:
@@ -452,10 +476,12 @@ def build_parser():
     subparsers.add_parser("status").set_defaults(handler=command_status)
 
     inspect = subparsers.add_parser("inspect")
-    inspect.add_argument("--channel", default=None, choices=list(record_module.CHANNELS))
+    inspect.add_argument("--channel", default=None,
+                         choices=list(record_module.QUEUED_CHANNELS))
     inspect.set_defaults(handler=command_inspect)
 
     subparsers.add_parser("remove").set_defaults(handler=command_remove)
+    subparsers.add_parser("values").set_defaults(handler=command_values)
     subparsers.add_parser("verify-mesh").set_defaults(handler=command_verify_mesh)
 
     textures = subparsers.add_parser("textures")

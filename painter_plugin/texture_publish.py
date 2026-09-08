@@ -199,7 +199,22 @@ def plan_stack(preset_name, texture_set, stack):
     return planned
 
 
-def build_configuration(export_directory, preset_name, selected_texture_sets=None):
+def _touched_by(planned_map, dirty_channels):
+    """Whether one map has to be re-rendered for this set of changed channels.
+
+    A map with no document channel behind it is derived from the stack by
+    Painter -- a converted normal, a mixed occlusion -- and there is no way from
+    here to say which channel it was derived from, so it re-renders whenever
+    anything in its stack did.
+    """
+    document_sources = [name for name in planned_map.source_channels if name.islower()]
+    if not document_sources:
+        return True
+    return any(name in dirty_channels for name in document_sources)
+
+
+def build_configuration(export_directory, preset_name, selected_texture_sets=None,
+                        dirty_channels_by_texture_set=None):
     """The export JSON, plus the plan needed to read its output back."""
     if not substance_painter.project.is_open():
         raise TexturePublishError("no project is open")
@@ -211,6 +226,9 @@ def build_configuration(export_directory, preset_name, selected_texture_sets=Non
             continue
         for stack in texture_set.all_stacks():
             planned = plan_stack(preset_name, texture_set, stack)
+            if dirty_channels_by_texture_set is not None:
+                dirty = dirty_channels_by_texture_set.get(texture_set.name(), set())
+                planned = [entry for entry in planned if _touched_by(entry, dirty)]
             if not planned:
                 continue
             generated_name = "ruri_{0}".format(str(stack).replace("/", "_"))
@@ -250,14 +268,21 @@ def _attribute(paths, planned, export_directory):
     return by_key, unmatched
 
 
-def publish(arena, publisher, preset_name=DEFAULT_PRESET_NAME, selected_texture_sets=None):
-    """Export every channel into a fresh generation and publish it."""
+def publish(arena, publisher, preset_name=DEFAULT_PRESET_NAME, selected_texture_sets=None,
+            dirty_channels_by_texture_set=None):
+    """Export channels into a fresh generation and publish it.
+
+    Passing the changed channels turns this into an incremental publish: only
+    those maps are rendered and written, which is what makes a paint stroke cost
+    one map rather than a whole Texture Set.
+    """
     with publisher.staging() as staging:
         export_directory = staging.path(record_module.TEXTURE_DIRECTORY_NAME)
         export_directory.mkdir(parents=True, exist_ok=True)
 
         configuration, plan_by_stack = build_configuration(
-            export_directory, preset_name, selected_texture_sets)
+            export_directory, preset_name, selected_texture_sets,
+            dirty_channels_by_texture_set)
         result = substance_painter.export.export_project_textures(configuration)
         if result.status != substance_painter.export.ExportStatus.Success:
             LOG.warning("export finished as %s: %s", result.status, result.message)
