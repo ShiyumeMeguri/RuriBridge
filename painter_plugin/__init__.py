@@ -212,7 +212,10 @@ class RuriBridgePanel(QtWidgets.QWidget):
         self.setWindowTitle("RuriBridge")
         self.setWindowIcon(_panel_icon())
 
-        layout = QtWidgets.QVBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout(self._themed_body())
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
         session_row = QtWidgets.QHBoxLayout()
         self.session_field = QtWidgets.QLineEdit(default_session())
         self.attach_button = QtWidgets.QPushButton("Attach")
@@ -271,6 +274,31 @@ class RuriBridgePanel(QtWidgets.QWidget):
         self.send_button.clicked.connect(self._send_textures)
         self.send_values_button.clicked.connect(self._send_values)
         self.request_mesh_button.clicked.connect(self._request_mesh)
+
+    def _themed_body(self):
+        """The widget the controls live in, chosen so Painter's own theme paints it.
+
+        Painter themes through a 300-kilobyte application stylesheet rather than
+        through the palette; its main window's palette is still Qt's default light
+        one. That stylesheet dresses the widget classes Painter knows, which is
+        why the buttons and fields looked right from the start while the panel
+        behind them arrived bright blue: a bare QWidget matches nothing in it, so
+        what showed through was the dock's own accent colour.
+
+        A scroll area does match, so it paints Painter's panel grey and keeps
+        following the theme wherever that goes, without a colour written down
+        here. It also lets the panel scroll when the dock is short, which a dock
+        sharing the right-hand column with the layer stack usually is.
+        """
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        outer.addWidget(scroll)
+        body = QtWidgets.QWidget()
+        scroll.setWidget(body)
+        return body
 
     @property
     def texture_resolution(self):
