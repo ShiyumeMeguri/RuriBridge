@@ -36,7 +36,7 @@ from ...Kernel import session as session_module
 from ...Kernel import sync as sync_module
 from ...Kernel import topic as topic_module
 
-from . import mesh_ingest, shader_state, texture_publish
+from . import mesh_ingest, shader_state, texture_ingest, texture_publish
 
 LOG = log_module.logger("painter")
 
@@ -58,6 +58,14 @@ MESH_LOAD_DEADLINE_SECONDS = 600.0
 SHADER_QUIET_SECONDS = 0.35
 TEXTURE_QUIET_SECONDS = 0.9
 SHADER_POLL_DUTY = 20.0
+#: However cheap the answer is, never ask more often than the pump that would
+#: carry it: a poll whose result cannot leave before the next one is work with
+#: nowhere to go.
+SHADER_POLL_FLOOR_TICKS = 1.0
+#: A cost has to move by this much, in milliseconds, before it is worth saying so.
+#: The old test was a ratio, and one millisecond against three is a 200% change
+#: every single time.
+SHADER_POLL_REPORT_MILLISECONDS = 25.0
 
 _SEVERITY = {
     "DEBUG": substance_painter.logging.DBG_INFO,
@@ -465,6 +473,10 @@ _texture_serial = 0
 _shader_poll_cost = None
 _shader_poll_due = 0.0
 _pending_display_names = {}
+#: The generation whose textures still have to be put in, once the project holds
+#: the mesh they came with. Cleared when they are applied, so a reload that
+#: carries none does not re-apply the previous send's.
+_pending_textures = [None]
 
 
 def _on_texture_state(event):
@@ -556,11 +568,16 @@ def live_sync():
     started = time.monotonic()
     values = shader_state.parameter_values()
     cost = time.monotonic() - started
-    _shader_poll_due = time.monotonic() + cost * SHADER_POLL_DUTY
-    if _shader_poll_cost is None or abs(cost - _shader_poll_cost) > 0.5 * _shader_poll_cost:
+    interval = max(cost * SHADER_POLL_DUTY,
+                   POLL_MILLISECONDS / 1000.0 * SHADER_POLL_FLOOR_TICKS)
+    _shader_poll_due = time.monotonic() + interval
+    moved = (_shader_poll_cost is None
+             or abs(cost - _shader_poll_cost) * 1000.0
+             > SHADER_POLL_REPORT_MILLISECONDS)
+    if moved:
         _shader_poll_cost = cost
         LOG.info("watching shader values costs %.0f ms; asking again in %.1f s",
-                 cost * 1000.0, cost * SHADER_POLL_DUTY)
+                 cost * 1000.0, interval)
     if _shader_gate.should_publish(values):
         CONNECTION.writer(topic_module.SHADING).write(record_module.shading(
             HOST.name, _values_by_texture_set(values)))
@@ -571,6 +588,7 @@ def _handle(topic, generation):
     """Apply one arrival. Returns True when Painter is now busy with it."""
     global _mesh_deadline
     if topic is topic_module.MESH:
+        _pending_textures[0] = generation if generation.record.get("textures") else None
         _pending_display_names.clear()
         _pending_display_names.update(
             {row["identity"]: row["name"] for row in generation.record.get("materials", [])
@@ -615,11 +633,18 @@ def take_shader_values():
         return None
     report = shader_state.apply_by_texture_set(
         payload.get("by_texture_set", {}),
-        payload.get("shader_url_by_texture_set"))
-    refused = [label for label in ("unknown", "mismatched", "conflicting", "unmapped")
+        payload.get("shader_url_by_texture_set"),
+        payload.get("vocabulary_by_texture_set"))
+    for texture_set, wanted in sorted(report["wrong_shader"].items()):
+        LOG.warning("%s speaks %r and the shader it runs exposes none of it; give that "
+                    "Texture Set the shader for %s and the values land",
+                    texture_set, wanted, wanted)
+    refused = [label for label in ("unknown", "mismatched", "conflicting", "unmapped",
+                                   "wrong_shader")
                if report[label]]
     for label in refused:
-        LOG.warning("shader values %s: %s", label, report[label])
+        if label != "wrong_shader":
+            LOG.warning("shader values %s: %s", label, report[label])
     values = shader_state.parameter_values()
     _shader_gate.suppress(values)
     if refused:
@@ -718,6 +743,16 @@ def _on_project_settled():
         LOG.error("could not adopt the shader values: %s", error)
     if _pending_display_names:
         texture_publish.apply_display_names(_pending_display_names)
+    arrived = _pending_textures[0]
+    _pending_textures[0] = None
+    if arrived is not None:
+        try:
+            report = texture_ingest.apply(arrived)
+            if _panel is not None and report["applied"]:
+                _panel.set_status("took {0} texture(s) into {1} Texture Set(s)".format(
+                    report["applied"], len(report["sets"])))
+        except Exception as error:
+            LOG.error("could not put the incoming textures in: %s", error)
     mesh_ingest.save_where_the_scene_asked()
     if _panel is not None:
         _panel.refresh_presets()
