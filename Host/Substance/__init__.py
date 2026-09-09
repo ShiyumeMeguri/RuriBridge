@@ -17,27 +17,7 @@ which is a Python entry point that already hands back parsed JSON.
 
 import ctypes
 import os
-import sys
 import time
-
-
-def _install_core_path():
-    here = os.path.dirname(os.path.realpath(__file__))
-    candidate = here
-    while True:
-        if os.path.isfile(os.path.join(candidate, "ruri_bridge", "__init__.py")):
-            if candidate not in sys.path:
-                sys.path.insert(0, candidate)
-            return candidate
-        parent = os.path.dirname(candidate)
-        if parent == candidate:
-            raise ImportError(
-                "RuriBridge cannot find the ruri_bridge core at or above {0}; the "
-                "plugin must stay inside its checkout".format(here))
-        candidate = parent
-
-
-REPOSITORY_ROOT = _install_core_path()
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -47,17 +27,28 @@ import substance_painter.project
 import substance_painter.textureset
 import substance_painter.ui
 
-from ruri_bridge import arena as arena_module
-from ruri_bridge import channel as channel_module
-from ruri_bridge import log as log_module
-from ruri_bridge import record as record_module
-from ruri_bridge import sync as sync_module
+from ...Kernel import arena as arena_module
+from ...Kernel import channel as channel_module
+from ...Kernel import log as log_module
+from ...Kernel import record as record_module
+from ...Kernel import sync as sync_module
 
 from . import mesh_ingest, shader_state, texture_publish
 
 LOG = log_module.logger("painter")
 
 SESSION_ENVIRONMENT_VARIABLE = "RURI_BRIDGE_SESSION"
+
+
+def package_root():
+    """Where the package this leg came from actually is.
+
+    Resolved, because Painter reaches it through a directory junction: the
+    unresolved path is the junction's, which says nothing about which checkout is
+    live, and telling two checkouts apart is the whole reason to log it.
+    """
+    here = os.path.dirname(os.path.realpath(__file__))
+    return os.path.dirname(os.path.dirname(here))
 POLL_MILLISECONDS = 250
 DEFAULT_TEXTURE_RESOLUTION = 2048
 MESH_LOAD_DEADLINE_SECONDS = 600.0
@@ -786,7 +777,7 @@ def start_plugin():
     except Exception as error:
         LOG.error("could not attach on start: %s", error)
         _panel.set_status("attach failed: {0}".format(error))
-    LOG.info("plugin started from %s", REPOSITORY_ROOT)
+    LOG.info("plugin started from %s", package_root())
 
 
 def close_plugin():

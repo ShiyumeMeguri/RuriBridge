@@ -11,4 +11,4 @@ from __future__ import annotations
 
 __version__ = "1.0.0"
 
-from . import arena, channel, glb, log, record  # noqa: F401
+from . import arena, channel, glb, log, painter_host, record, sync  # noqa: F401

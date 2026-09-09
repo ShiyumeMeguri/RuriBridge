@@ -42,7 +42,7 @@ import re
 
 import bpy
 
-from ruri_bridge.log import logger
+from ...Kernel.log import logger
 
 LOG = logger("blender.textures")
 

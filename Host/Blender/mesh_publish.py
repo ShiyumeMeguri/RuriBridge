@@ -26,11 +26,11 @@ import uuid
 import bpy
 import numpy
 
-from ruri_bridge import record as record_module
-from ruri_bridge.glb import (AttributeLayout, GlbWriter, MeshLayout, PrimitiveLayout,
+from ...Kernel import record as record_module
+from ...Kernel.glb import (AttributeLayout, GlbWriter, MeshLayout, PrimitiveLayout,
                              SceneLayout, SEMANTIC_COLOR_0, SEMANTIC_NORMAL,
                              SEMANTIC_POSITION, TEXCOORD_PREFIX)
-from ruri_bridge.log import logger
+from ...Kernel.log import logger
 
 LOG = logger("blender.mesh")
 

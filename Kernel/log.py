@@ -40,7 +40,7 @@ def install_stream_sink(level=logging.INFO):
     return handler
 
 
-def install_callable_sink(emit, level=logging.INFO):
+def install_callable_sink(sink, level=logging.INFO):
     """Attach a handler that forwards (level_name, category, message) to a host.
 
     Painter's log takes a message and a channel name rather than a stream, so
@@ -56,7 +56,7 @@ def install_callable_sink(emit, level=logging.INFO):
 
         def emit(self, record):
             category = record.name[len(ROOT_NAME) + 1:] or "bridge"
-            emit(record.levelname, category, self.format(record))
+            sink(record.levelname, category, self.format(record))
 
     handler = _CallableHandler()
     handler.setFormatter(logging.Formatter("%(message)s"))

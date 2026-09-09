@@ -24,7 +24,7 @@ import json
 
 import substance_painter.js
 
-from ruri_bridge.log import logger
+from ...Kernel.log import logger
 
 LOG = logger("painter.shaders")
 

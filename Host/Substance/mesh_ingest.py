@@ -24,8 +24,8 @@ import os
 import substance_painter.project
 import substance_painter.textureset
 
-from ruri_bridge import record as record_module
-from ruri_bridge.log import logger
+from ...Kernel import record as record_module
+from ...Kernel.log import logger
 
 LOG = logger("painter.mesh")
 
