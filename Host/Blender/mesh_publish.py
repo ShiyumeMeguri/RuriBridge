@@ -188,6 +188,25 @@ def _next_free_identity(identity, claimed):
     return "{0}.{1:03d}".format(identity, suffix)
 
 
+def _linear(value):
+    """One authored channel, as the shader reads it.
+
+    The engine these materials come from linearises a gamma-encoded property on
+    upload, and this is that curve to the letter -- including the branch at one,
+    which is a plain 2.2 power rather than the sRGB piece, and which is what
+    carries an HDR colour's overbright range through instead of flattening it.
+    Written out here because the value has to be identical to the one the
+    producing side's own shader reads; a curve that agreed only below one would
+    put every emissive colour somewhere else.
+    """
+    one = float(value)
+    if one <= 0.04045:
+        return one / 12.92
+    if one < 1.0:
+        return ((one + 0.055) / 1.055) ** 2.4
+    return one ** 2.2
+
+
 def _plain(value):
     """One custom property value as something that can cross."""
     if isinstance(value, (bool, int, float, str)):
@@ -235,6 +254,18 @@ def _declared_row(material):
     # nothing reported anywhere.
     for name, value in dict(declaration.get("constants") or {}).items():
         row[name] = _plain(value)
+    # An offer is what the far side's shader should READ, and a gamma-encoded
+    # parameter is stored authored and read linear. This side converts on the way
+    # into its own shader; a row handed over as it is stored arrives a whole
+    # gamma curve away, with every name matching and nothing to report -- the
+    # colours are simply wrong. Which names those are is the material's to say.
+    for name in list(declaration.get("gamma") or []):
+        value = row.get(str(name))
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            row[str(name)] = _linear(value)
+        elif isinstance(value, list) and len(value) >= 3:
+            # The fourth component of a colour was never chromatic.
+            row[str(name)] = [_linear(one) for one in value[:3]] + list(value[3:])
     return {"shader": str(declaration.get("shader") or ""),
             "name": str(declaration.get("name") or ""),
             "variant": str(declaration.get("variant") or ""),
