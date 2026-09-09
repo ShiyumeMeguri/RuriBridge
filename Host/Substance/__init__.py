@@ -80,7 +80,21 @@ DEFAULT_TEXTURE_RESOLUTION = 2048
 MESH_LOAD_DEADLINE_SECONDS = 600.0
 SHADER_QUIET_SECONDS = 0.35
 TEXTURE_QUIET_SECONDS = 0.9
-SHADER_POLL_DUTY = 20.0
+#: The share of the thread this poll runs on that it may take. The thread it runs
+#: on is the one that paints, and the cost is not reducible: reading this
+#: application's shader values takes about a second on a character with sixteen
+#: Texture Sets on a generated shader, and asking it only whether they *changed*
+#: -- a digest computed inside the application, so that two numbers cross instead
+#: of the whole object -- was measured at the same 1059 ms. The second is the
+#: application's own bookkeeping, not the crossing, so there is nothing to make
+#: cheaper and only the spacing left to choose.
+#:
+#: A one-second stall is not five percent of anything a person experiences, it is
+#: a hitch, so the spacing is chosen to make it rare rather than to keep an
+#: average low. Turn the whole watch off in the panel if even that is too often;
+#: it is the leg that carries this application's own knobs back, and a model
+#: authored on the other side does not take them anyway.
+SHADER_POLL_DUTY = 60.0
 #: However cheap the answer is, never ask more often than this many pump ticks.
 #: A poll whose result cannot leave before the next one is work with nowhere to
 #: go, and the pump's own period is short enough now that "one tick" would let a
