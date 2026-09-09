@@ -41,7 +41,7 @@ from .log import logger
 LOG = logger("arena")
 
 CONTROL_MAGIC = b"RURIBRDG"
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 CONTROL_FILE_NAME = "control.bin"
 SESSION_DIRECTORY_NAME = "RuriDccBridge"
 ROOT_ENVIRONMENT_VARIABLE = "RURI_BRIDGE_ROOT"
@@ -177,21 +177,33 @@ class Arena:
         directory.mkdir(parents=True, exist_ok=True)
         _mark_temporary(directory)
         control_path = directory / CONTROL_FILE_NAME
-        if control_path.exists() and not cls._speaks_this_format(control_path):
+        if control_path.exists() and not cls._speaks_this_format(control_path, channels):
             cls._discard_stale(directory, control_path)
         if not control_path.exists():
             cls._materialise_control(control_path, channels)
         return cls._attach(root, session, channels, control_path)
 
     @classmethod
-    def _speaks_this_format(cls, control_path):
+    def _speaks_this_format(cls, control_path, channels):
+        """Magic, version, AND the exact channel list.
+
+        The channels are part of the format because they are not configuration:
+        they are computed from which applications this build knows about, so a
+        session carrying a different list was laid out by different software and
+        its slots do not mean what this build would read them as.
+        """
         try:
             with open(control_path, "rb") as handle:
                 magic, version, _count, _epoch = _HEADER.unpack_from(
                     handle.read(HEADER_SIZE), 0)
         except (OSError, struct.error):
             return False
-        return magic == CONTROL_MAGIC and version == FORMAT_VERSION
+        if magic != CONTROL_MAGIC or version != FORMAT_VERSION:
+            return False
+        try:
+            return cls._read_channel_names(control_path) == tuple(channels)
+        except ArenaError:
+            return False
 
     @classmethod
     def _discard_stale(cls, directory, control_path):
@@ -295,7 +307,9 @@ class Arena:
             control_map.close()
             control_file.close()
             raise ArenaError(
-                "session {0} carries {1} channels, this build declares {2}".format(
+                "session {0} carries {1} channels and this build computes {2}; "
+                "open_session rebuilds such a session, so reaching here means "
+                "something attached to one it did not build".format(
                     session, count, len(channels)))
         arena = cls(root, session, channels, control_file, control_map, epoch)
         LOG.debug("attached to session %s at %s (epoch %d)", session, arena.directory, epoch)
