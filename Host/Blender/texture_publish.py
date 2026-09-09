@@ -24,6 +24,7 @@ other side maps the same pages rather than reading them back off storage.
 from __future__ import annotations
 
 import os
+import shutil
 
 import bpy
 import numpy
@@ -250,24 +251,45 @@ def _source_bytes(image):
     return None
 
 
-def _write_image(image, directory, stem):
-    """Put one image in the session, without making a second copy of it.
+def _encode_whole(image, path):
+    """The file this image already is, written out once.
 
     Encoding is the fallback and not the road: it is for an image that exists
     nowhere but in memory. Everything else is bytes that are already correct.
     """
-    path = os.path.join(directory, stem + _extension_of(image))
     raw = _source_bytes(image)
     if raw is not None:
         with open(path, "wb") as handle:
             handle.write(raw)
+        return
+    previous = image.filepath_raw, image.file_format
+    try:
+        image.filepath_raw = path
+        image.save()
+    finally:
+        image.filepath_raw, image.file_format = previous
+
+
+def _write_image(image, directory, stem):
+    """Put one image in the session, without making a second copy of it.
+
+    Even copying bytes that are already correct is eighteen megabytes a send on
+    one character, and every send does it again for images that did not move --
+    so the copy happens once into the cache and every generation after that links
+    to it.
+    """
+    path = os.path.join(directory, stem + _extension_of(image))
+    stamp = _content_stamp(image)
+    if stamp is None:
+        _encode_whole(image, path)
     else:
-        previous = image.filepath_raw, image.file_format
-        try:
-            image.filepath_raw = path
-            image.save()
-        finally:
-            image.filepath_raw, image.file_format = previous
+        cache = _picture_cache_directory()
+        kept = os.path.join(cache, "{0}_whole_{1}{2}".format(
+            _safe(image.name), stamp, _extension_of(image)))
+        if not os.path.isfile(kept):
+            os.makedirs(cache, exist_ok=True)
+            _encode_whole(image, kept)
+        _place(kept, path)
     arena_module.keep_in_memory(path)
     return os.path.basename(path), os.path.getsize(path)
 
@@ -321,8 +343,56 @@ def _cut(image, lane, operation):
     return out
 
 
-def _write_cut(image, lane, operation, directory, stem):
-    """Write the picture a lane is, as its own file beside the model.
+#: Where the pictures that crossed are kept between sends. Beside the sessions
+#: rather than inside one, because a generation is immutable and thrown away
+#: while the picture made from an image that did not change is the same picture
+#: every time.
+PICTURE_CACHE_DIRECTORY_NAME = "pictures"
+
+
+def _picture_cache_directory():
+    return os.path.join(str(arena_module.default_root().parent),
+                        PICTURE_CACHE_DIRECTORY_NAME)
+
+
+def _place(kept, path):
+    """Put a cached picture in the generation without copying its bytes again.
+
+    A hard link is the same file under a second name: the generation gets a real
+    entry that survives the cache being cleaned, and costs a directory write
+    rather than the eighteen megabytes a character's textures actually are.
+    Across volumes there is no such thing, so that falls back to a copy.
+    """
+    if os.path.exists(path):
+        os.remove(path)
+    try:
+        os.link(kept, path)
+    except OSError:
+        shutil.copyfile(kept, path)
+
+
+def _content_stamp(image):
+    """Something that moves when an image's pixels do, cheaply.
+
+    The bytes themselves are the only exact answer and reading a scene's worth of
+    them to decide whether to skip work costs what the work costs. What is free
+    is what the file system already knows: for a packed image the size of the
+    block Blender is holding, for a linked one the size and modification time of
+    the file it came from. An image that exists only as pixels in memory answers
+    nothing, and is cut every time rather than cached wrongly.
+    """
+    packed = image.packed_file
+    if packed is not None and packed.data:
+        return "p{0}".format(len(packed.data))
+    resolved = bpy.path.abspath(image.filepath_raw or image.filepath or "")
+    if resolved and os.path.isfile(resolved):
+        stat = os.stat(resolved)
+        return "f{0}-{1}".format(int(stat.st_mtime), stat.st_size)
+    return None
+
+
+def _encode_cut(image, lane, operation, path):
+    """Write the picture a lane is.
 
     The result is measurement, not colour -- a roughness map is not looked at,
     it is read -- so it is marked as data and no transfer function is applied on
@@ -330,15 +400,37 @@ def _write_cut(image, lane, operation, directory, stem):
     """
     pixels = _cut(image, lane, operation)
     height, width, _ = pixels.shape
-    made = bpy.data.images.new(stem, width, height, alpha=True, is_data=True)
+    made = bpy.data.images.new(os.path.basename(path), width, height,
+                               alpha=True, is_data=True)
     try:
         made.pixels.foreach_set(pixels.reshape(-1))
         made.file_format = "PNG"
-        path = os.path.join(directory, stem + ".png")
         made.filepath_raw = path
         made.save()
     finally:
         bpy.data.images.remove(made)
+
+
+def _write_cut(image, lane, operation, directory, stem):
+    """One lane of a packed image, as a file beside the model.
+
+    Cutting a 2048 square costs a quarter of a second, and a character's worth of
+    packed maps is most of a full send. The cut only depends on the image and the
+    lane, so it is kept: a later send of an unchanged document links to the
+    picture instead of decoding, splitting and re-encoding it.
+    """
+    path = os.path.join(directory, stem + ".png")
+    stamp = _content_stamp(image)
+    if stamp is None:
+        _encode_cut(image, lane, operation, path)
+    else:
+        cache = _picture_cache_directory()
+        kept = os.path.join(cache, "{0}_{1}_{2}_{3}.png".format(
+            _safe(image.name), lane, operation or "plain", stamp))
+        if not os.path.isfile(kept):
+            os.makedirs(cache, exist_ok=True)
+            _encode_cut(image, lane, operation, kept)
+        _place(kept, path)
     arena_module.keep_in_memory(path)
     return os.path.basename(path), os.path.getsize(path)
 
