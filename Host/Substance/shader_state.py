@@ -20,7 +20,9 @@ ignored uniform is indistinguishable from one that had no effect.
 
 from __future__ import annotations
 
+import io
 import json
+import os
 
 import substance_painter.js
 import substance_painter.resource
@@ -123,6 +125,79 @@ def _value_of(holder, field):
         return found() if callable(found) else found
     except TypeError:
         return found
+
+
+#: What a generated shader may ship beside itself, describing where each source
+#: texture lands. Read, never written: the generator writes it and whoever puts
+#: the shader in a shelf brings it along.
+MANIFEST_SUFFIX = ".manifest.json"
+
+_VOCABULARY = {}
+
+
+def shader_vocabulary(name):
+    """Which host channel each of a shader's source textures lands in.
+
+    A generated shader does not read a ramp and a face mask the same way: one is
+    a whole resource it samples, the other is a CHANNEL somebody paints. Which
+    is which -- and, for a channel, its number, width and label -- is decided
+    when the shader is generated, and written down beside it. Asking the file is
+    the only way to know; computing the same allocation here would be a second
+    place the answer comes from, and the two would drift the first time the
+    shader grew a texture.
+
+    Returns ``{source name: {"channel", "components", "format", "label"}}``,
+    empty when the shader ships no manifest (then every texture is a resource,
+    which is what this did before manifests existed).
+    """
+    if name in _VOCABULARY:
+        return _VOCABULARY[name]
+    found = {}
+    for path in _shelf_shader_files(name + MANIFEST_SUFFIX):
+        try:
+            with io.open(path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except (OSError, ValueError) as error:
+            LOG.warning("%s sits beside the shader and could not be read: %s", path, error)
+            continue
+        for entry in manifest.get("inputs") or []:
+            if entry.get("Kind") != "OverflowChannel":
+                continue
+            for source in entry.get("Sources") or []:
+                spelled = str(source.get("Source") or "")
+                if spelled:
+                    found[spelled] = {
+                        "channel": str(entry.get("Id") or ""),
+                        "components": int(entry.get("Components") or 0),
+                        "format": str(entry.get("Format") or ""),
+                        "label": str(entry.get("Label") or spelled),
+                    }
+        LOG.info("%s says %d of its textures are paintable channels", os.path.basename(path),
+                 len(found))
+        break
+    _VOCABULARY[name] = found
+    return found
+
+
+def _shelf_shader_files(file_name):
+    """Every shelf that holds a file of this name under its shaders folder."""
+    shelves = getattr(substance_painter.resource, "Shelves", None)
+    if shelves is None:
+        return
+    try:
+        every = shelves.all()
+    except Exception:
+        return
+    for shelf in every:
+        try:
+            root = shelf.path() if callable(getattr(shelf, "path", None)) else None
+        except Exception:
+            continue
+        if not root:
+            continue
+        candidate = os.path.join(root, "shaders", file_name)
+        if os.path.isfile(candidate):
+            yield candidate
 
 
 def shader_named(name):

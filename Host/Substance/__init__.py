@@ -866,7 +866,10 @@ def _on_project_settled():
     _pending_textures[0] = None
     if arrived is not None:
         try:
-            report = texture_ingest.apply(arrived)
+            names = shader_state.shader_by_texture_set()
+            wanted = sorted({name for name in names.values() if name})
+            vocabulary = shader_state.shader_vocabulary(wanted[0]) if wanted else {}
+            report = texture_ingest.apply(arrived, vocabulary)
             if report["lookups"]:
                 _apply_lookup_textures(report["lookups"])
             if _panel is not None and report["applied"]:
