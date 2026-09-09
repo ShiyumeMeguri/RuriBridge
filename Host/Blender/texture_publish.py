@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 
 import bpy
+import numpy
 
 from ...Kernel import arena as arena_module
 from ...Kernel import record as record_module
@@ -60,6 +61,34 @@ SHADING_DECLARATION = "ruri_shading"
 #: in red, metal in green -- and one file's worth of bytes is not one channel's
 #: worth of picture, so it needs splitting before it means anything.
 WHOLE_IMAGE_CHANNELS = ("rgb", "rgba")
+
+#: What a declared lane MEANS, said in the neutral channel vocabulary this record
+#: carries, and what has to happen to the numbers on the way.
+#:
+#: The declaration speaks the source engine's semantics; the record speaks a
+#: rendering one. Smoothness and roughness are the same measurement counted from
+#: opposite ends, and the side that knows it is holding smoothness is the side
+#: that should turn it round -- the receiving host is then only ever asked to put
+#: a picture in a channel, which is a thing any host can do without knowing whose
+#: convention the file came from.
+#:
+#: A semantic that is NOT in here has no neutral channel, and is refused by name
+#: rather than dropped into an approximate one.
+LANE_CHANNELS = {
+    "BaseColor": ("BaseColor", None),
+    "Opacity": ("Opacity", None),
+    "Metallic": ("Metallic", None),
+    "Roughness": ("Roughness", None),
+    "Smoothness": ("Roughness", "invert"),
+    "SpecularLevel": ("SpecularLevel", None),
+    "Occlusion": ("Occlusion", None),
+    "Height": ("Height", None),
+    "Emission": ("Emission", None),
+    "PackedTangentNormal": ("TangentNormal", None),
+}
+
+#: Where each lane letter sits in an RGBA pixel.
+LANE_COMPONENTS = {"r": 0, "g": 1, "b": 2, "a": 3}
 
 #: How far to walk back from a surface input before giving up. A base colour
 #: behind a mix, a normal behind a normal-map node and a colour ramp: real graphs
@@ -108,19 +137,22 @@ def _declared_images(material):
 
     Three answers come back, because a texture is one of three things here:
 
-    * a SURFACE CHANNEL, when a whole-image lane needs no arithmetic -- base
-      colour, emission. Those land in the texturing tool's own channels;
+    * a SURFACE CHANNEL. Sometimes that is the whole file (base colour,
+      emission) and it crosses byte for byte; sometimes it is one lane of a
+      packed file -- roughness in red, metal in green, a two-channel normal --
+      and that lane has to be cut out and made into a picture before it is a
+      channel at all. Both come back the same way, as the channel they land in
+      plus the cut that makes them;
     * a LOOKUP the shader samples directly, when the slot declares no channel
       lane at all: a diffuse ramp, a shadow LUT, an SDF lightmap, a matcap. The
       whole file is what the shader wants and it wants it under the slot's own
       name, so it crosses unchanged. Refusing these because "a ramp is not a
       base colour" was the bug that left the generated shader sampling black --
       it has 22 such samplers and they carry the entire stylised look;
-    * a PACKED map, when the lanes need arithmetic before they mean anything --
-      roughness in red and metal in green is three pictures in one file, and a
-      two-channel normal is not a normal until it is unpacked. Sending one of
-      those as it stands would put a wrong picture in a right-looking channel,
-      which is worse than not sending it. Those are named rather than dropped.
+    * REFUSED, when the lane means something this record has no channel for. A
+      mask the other side keeps in a numbered overflow slot is a real picture
+      with nowhere neutral to put it, and inventing a place for it would be
+      guessing. Those are named rather than dropped.
     """
     declaration = material.get(SHADING_DECLARATION)
     if declaration is None:
@@ -130,25 +162,31 @@ def _declared_images(material):
     packing = dict(section.get("packing") or {})
     found = {}
     raw = {}
-    packed = []
+    refused = []
     for slot in sorted(group.keys()):
         lanes = [tuple(lane) for lane in (packing.get(slot) or ())]
-        whole = [lane for lane in lanes
-                 if lane[0] in WHOLE_IMAGE_CHANNELS and not lane[2]]
         image = bpy.data.images.get(str(group[slot]))
         if image is None:
-            packed.append((slot, "names {0!r}, and no image here answers to it".format(
+            refused.append((slot, "names {0!r}, and no image here answers to it".format(
                 str(group[slot]))))
             continue
         if not lanes:
             raw[slot] = image
             continue
-        if not whole:
-            packed.append((slot, "packs {0} into single channels".format(
-                "/".join(lane[1] for lane in lanes))))
-            continue
-        found.setdefault(whole[0][1], image)
-    return found, raw, tuple(packed)
+        for lane, semantic, operation in lanes:
+            translated = LANE_CHANNELS.get(semantic)
+            if translated is None:
+                refused.append((slot, "{0} lane means {1!r}, which is not a channel this "
+                                      "record has a name for".format(lane, semantic)))
+                continue
+            channel, cut = translated
+            if channel in found:
+                continue
+            if lane in WHOLE_IMAGE_CHANNELS and not operation and cut is None:
+                found[channel] = (image, None, "")
+                continue
+            found[channel] = (image, lane, operation or cut or "")
+    return found, raw, tuple(refused)
 
 
 def images_of(material):
@@ -175,7 +213,7 @@ def images_of(material):
             continue
         image = _image_behind(socket)
         if image is not None:
-            found[channel] = image
+            found[channel] = (image, None, "")
     # An ordinary material has no slot vocabulary: everything it renders with
     # reaches a surface input, which is the whole of what it can say.
     return found, {}, ()
@@ -234,6 +272,77 @@ def _write_image(image, directory, stem):
     return os.path.basename(path), os.path.getsize(path)
 
 
+def _read_pixels(image):
+    """One image as a height x width x RGBA array of numbers.
+
+    ``foreach_get`` is the only read that does not go through Python per pixel;
+    a 2048 square costs one allocation and one copy instead of sixteen million
+    attribute lookups.
+    """
+    width, height = image.size
+    flat = numpy.empty(width * height * 4, dtype=numpy.float32)
+    image.pixels.foreach_get(flat)
+    return flat.reshape(height, width, 4)
+
+
+def _cut(image, lane, operation):
+    """The picture one lane of a packed image actually is.
+
+    A single lane becomes a grey picture of that measurement. A two-lane normal
+    becomes a normal: the source keeps x and y and throws z away, because z is
+    recoverable -- the vector is unit length -- and the two conventions differ
+    only in which lanes x and y were parked in.
+    """
+    pixels = _read_pixels(image)
+    if operation in ("unpack_normal_alpha_green", "unpack_normal_pair"):
+        if operation == "unpack_normal_alpha_green":
+            x = pixels[..., 0] * pixels[..., 3] * 2.0 - 1.0
+        else:
+            x = pixels[..., 0] * 2.0 - 1.0
+        y = pixels[..., 1] * 2.0 - 1.0
+        z = numpy.sqrt(numpy.clip(1.0 - x * x - y * y, 0.0, 1.0))
+        out = numpy.empty(pixels.shape, dtype=numpy.float32)
+        out[..., 0] = x * 0.5 + 0.5
+        out[..., 1] = y * 0.5 + 0.5
+        out[..., 2] = z * 0.5 + 0.5
+        out[..., 3] = 1.0
+        return out
+    component = LANE_COMPONENTS.get(lane)
+    if component is None:
+        raise ValueError("{0!r} is not a lane of one component".format(lane))
+    value = pixels[..., component]
+    if operation == "invert":
+        value = 1.0 - value
+    out = numpy.empty(pixels.shape, dtype=numpy.float32)
+    out[..., 0] = value
+    out[..., 1] = value
+    out[..., 2] = value
+    out[..., 3] = 1.0
+    return out
+
+
+def _write_cut(image, lane, operation, directory, stem):
+    """Write the picture a lane is, as its own file beside the model.
+
+    The result is measurement, not colour -- a roughness map is not looked at,
+    it is read -- so it is marked as data and no transfer function is applied on
+    the way out.
+    """
+    pixels = _cut(image, lane, operation)
+    height, width, _ = pixels.shape
+    made = bpy.data.images.new(stem, width, height, alpha=True, is_data=True)
+    try:
+        made.pixels.foreach_set(pixels.reshape(-1))
+        made.file_format = "PNG"
+        path = os.path.join(directory, stem + ".png")
+        made.filepath_raw = path
+        made.save()
+    finally:
+        bpy.data.images.remove(made)
+    arena_module.keep_in_memory(path)
+    return os.path.basename(path), os.path.getsize(path)
+
+
 def _safe(name):
     return "".join(character if character.isalnum() or character in "-_." else "_"
                    for character in name)
@@ -254,15 +363,17 @@ def publish_into(staging, materials):
     total = [0]
     left_behind = {}
 
-    def send(image, material, suffix):
-        """The file this image already is, written once however many materials
-        and slots point at it, described by what the image itself says."""
-        key = image.name
+    def send(image, material, suffix, lane=None, operation=""):
+        """One picture in the session, written once however many materials point
+        at it. ``lane`` names the part of a packed image to cut out; without it
+        the file crosses as it stands, which is both faster and exact."""
+        key = (image.name, lane, operation)
         if key not in seen:
             if not os.path.isdir(directory):
                 os.makedirs(directory, exist_ok=True)
             try:
-                seen[key] = _write_image(image, directory, suffix)
+                seen[key] = (_write_image(image, directory, suffix) if lane is None
+                             else _write_cut(image, lane, operation, directory, suffix))
             except Exception as error:
                 LOG.warning("could not send %s for %s: %s", image.name,
                             material.name, error)
@@ -271,10 +382,15 @@ def publish_into(staging, materials):
             total[0] += seen[key][1]
         return {
             "file": seen[key][0],
-            # The image's own answer. Nothing here derives it from the channel
-            # or the file name; both are measured to be wrong.
-            "color_space": image.colorspace_settings.name,
+            # The image's own answer for a file that crosses whole. A lane cut
+            # out of it is measurement rather than colour, and says so. Nothing
+            # here derives colour space from the channel or the file name; both
+            # are measured to be wrong.
+            "color_space": (image.colorspace_settings.name if lane is None
+                            else record_module.COLOR_SPACE_DATA),
             "image": image.name,
+            "lane": lane or "",
+            "operation": operation or "",
         }
 
     for material in materials:
@@ -286,8 +402,9 @@ def publish_into(staging, materials):
             continue
         identity = material.get("ruri_bridge_identity") or material.name
         channels = {}
-        for channel, image in sorted(found.items()):
-            entry = send(image, material, "{0}_{1}".format(_safe(identity), channel))
+        for channel, (image, lane, operation) in sorted(found.items()):
+            entry = send(image, material, "{0}_{1}".format(_safe(identity), channel),
+                         lane, operation)
             if entry is not None:
                 channels[channel] = entry
         lookups = {}
