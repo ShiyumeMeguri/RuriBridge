@@ -305,6 +305,16 @@ class Layout:
     def exposed(self, identifier):
         return exposed_parameters(identifier, self.shader_by_instance.get(identifier, ""))
 
+    def holds(self, identifier):
+        """What one instance's values are right now, by parameter name.
+
+        Off the same snapshot as everything else, so knowing what is already
+        there costs nothing beyond the read that was happening anyway.
+        """
+        label = self.label_by_instance.get(identifier)
+        body = (self.object.get("shaders") or {}).get(label) or {}
+        return _flat(body.get("parameters") or {})
+
 
 def instance_by_texture_set():
     """Texture Set identity -> shader instance id.
@@ -330,6 +340,20 @@ def instance_by_texture_set():
             LOG.warning("Texture Set %r names shader instance %r, which is not in the "
                         "instance list", display, label)
     return mapping
+
+
+def _same_value(held, offered):
+    """Whether the instance already holds this, across a 32-bit round trip.
+
+    A float that went out as 0.258 comes back as 0.257999986410141: equal for
+    every purpose here, and treating it as a change would rewrite every value on
+    every push forever.
+    """
+    if isinstance(held, (int, float)) and isinstance(offered, (int, float)):
+        return abs(float(held) - float(offered)) <= 1e-6
+    if isinstance(held, list) and isinstance(offered, list) and len(held) == len(offered):
+        return all(_same_value(one, other) for one, other in zip(held, offered))
+    return held == offered
 
 
 def _coerce(value, data_type):
@@ -466,7 +490,14 @@ def apply_by_texture_set(values_by_texture_set, shader_url_by_texture_set=None,
     for identifier, values in offers.items():
         for name in report["conflicting"].get(str(identifier), []):
             values.pop(name, None)
-        if values:
-            set_parameters(identifier, values)
-            report["applied"][str(identifier)] = sorted(values)
+        # Only what differs. One of these is a specialization uniform -- a
+        # compile-time constant -- so assigning it rebuilds the shader whether or
+        # not the number changed, and a scene's worth of Texture Sets recompiling
+        # on every push is the difference between a bridge and a stall.
+        holding = layout.holds(identifier)
+        changed = {name: value for name, value in values.items()
+                   if not _same_value(holding.get(name), value)}
+        if changed:
+            set_parameters(identifier, changed)
+        report["applied"][str(identifier)] = sorted(changed)
     return report
