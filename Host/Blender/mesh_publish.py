@@ -226,6 +226,15 @@ def _declared_row(material):
             continue
         for key in group.keys():
             row[spelling.format(key)] = _plain(group[key])
+    # Values the material has for its shader that are not in any of its property
+    # groups, because on this side they are not parameters at all. The part a
+    # material belongs to is the one that matters: this application compiles a
+    # tree per part, so the part is structure here and a uniform over there, and
+    # a shader that never hears it renders every material as part zero -- a
+    # character whose face, hair and eyes are all shaded as plain surfaces, with
+    # nothing reported anywhere.
+    for name, value in dict(declaration.get("constants") or {}).items():
+        row[name] = _plain(value)
     return {"shader": str(declaration.get("shader") or ""),
             "name": str(declaration.get("name") or ""),
             "variant": str(declaration.get("variant") or ""),

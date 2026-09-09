@@ -101,10 +101,14 @@ SHADER_POLL_DUTY = 60.0
 #: cheap project poll sixteen times a second for an answer that changes when
 #: somebody drags a slider.
 SHADER_POLL_FLOOR_TICKS = 4.0
-#: A cost has to move by this much, in milliseconds, before it is worth saying so.
-#: The old test was a ratio, and one millisecond against three is a 200% change
-#: every single time.
+#: A cost has to move by this much, in milliseconds AND by this share of what it
+#: was, before it is worth saying so. Either test alone fails at one end: a pure
+#: ratio calls one millisecond against three a 200% change and says so every
+#: time, and a pure floor calls half a second against nine hundred milliseconds
+#: news and also says so every time. A measurement that wanders inside its own
+#: noise is not a measurement changing.
 SHADER_POLL_REPORT_MILLISECONDS = 25.0
+SHADER_POLL_REPORT_SHARE = 0.5
 
 _SEVERITY = {
     "DEBUG": substance_painter.logging.DBG_INFO,
@@ -596,8 +600,9 @@ def live_sync():
                    POLL_MILLISECONDS / 1000.0 * SHADER_POLL_FLOOR_TICKS)
     _shader_poll_due = time.monotonic() + interval
     moved = (_shader_poll_cost is None
-             or abs(cost - _shader_poll_cost) * 1000.0
-             > SHADER_POLL_REPORT_MILLISECONDS)
+             or abs(cost - _shader_poll_cost) > max(
+                 SHADER_POLL_REPORT_MILLISECONDS / 1000.0,
+                 SHADER_POLL_REPORT_SHARE * _shader_poll_cost))
     if moved:
         _shader_poll_cost = cost
         LOG.info("watching shader values costs %.0f ms; asking again in %.1f s",
