@@ -37,6 +37,11 @@ LOG = logger("blender.mesh")
 
 MAXIMUM_TEXCOORD_SETS = 8
 IDENTITY_PROPERTY = "ruri_bridge_identity"
+#: The custom property a material uses to say what its shading row is: which
+#: shader vocabulary it speaks, which variant of it, and which property groups
+#: hold the values under what spelling. Written by whatever generated the
+#: material; the bridge only reads it.
+SHADING_DECLARATION = "ruri_shading"
 NEGATIVE_ZERO_PATTERN = numpy.uint32(0x80000000)
 
 
@@ -183,24 +188,72 @@ def _next_free_identity(identity, claimed):
     return "{0}.{1:03d}".format(identity, suffix)
 
 
+def _plain(value):
+    """One custom property value as something that can cross."""
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if hasattr(value, "to_list"):
+        return value.to_list()
+    return [_plain(entry) for entry in value]
+
+
+def _declared_row(material):
+    """The parameter row a material says it has, spelled the way its shader spells it.
+
+    A generator stores a row in whatever shape suits it -- this one keeps three
+    property groups by value type -- while a shader has one flat set of uniform
+    names. The two differ, and the difference is not guessable: here it is a
+    ``_ST`` suffix on one group of sixteen. So the material states it, and this
+    reads the statement: which property groups hold the row, and how each group's
+    keys spell out over there.
+
+    Nothing here knows what those groups are called. A table of group names kept
+    on this side would be a second copy of a rule that lives in the generator,
+    and the failure it buys is silent: a new group is simply not sent, and the
+    values that were in it look like values the far side chose not to expose.
+
+    A group the material does not name is not part of the row. Materials carry
+    other people's property groups -- an exporter's settings, a panel's fold
+    state -- and those are not shading parameters just because they are nearby.
+    """
+    declaration = material.get(SHADING_DECLARATION)
+    if declaration is None:
+        return None
+    row = {}
+    for group_name, spelling in dict(declaration.get("values") or {}).items():
+        group = material.get(group_name)
+        if group is None:
+            continue
+        for key in group.keys():
+            row[spelling.format(key)] = _plain(group[key])
+    return {"shader": str(declaration.get("shader") or ""),
+            "variant": str(declaration.get("variant") or ""),
+            "parameters": row}
+
+
 def _material_row(material, fresh=()):
     """Whatever the producing side calls a material, carried verbatim.
 
-    Custom properties are how a Blender-side generator stores a material data
-    row, so they travel as they are. The bridge does not read them.
+    A material that declares a shading row offers that row. One that does not --
+    an ordinary Blender material somebody put custom properties on -- offers the
+    properties themselves, which is the same statement made the only way a
+    material without a generator behind it can make it.
     """
     row = {"identity": identity_of(material), "name": material.name,
            "identity_is_new": material.name in fresh}
-    properties = {}
-    for key in material.keys():
-        if key == IDENTITY_PROPERTY:
-            continue
-        value = material[key]
-        try:
-            properties[key] = value if isinstance(
-                value, (int, float, str, bool)) else list(value)
-        except TypeError:
-            properties[key] = repr(value)
+    declared = _declared_row(material)
+    if declared is not None:
+        row["shading"] = {"shader": declared["shader"], "variant": declared["variant"]}
+        properties = declared["parameters"]
+    else:
+        properties = {}
+        for key in material.keys():
+            if key == IDENTITY_PROPERTY:
+                continue
+            value = material[key]
+            if hasattr(value, "keys"):
+                continue
+            properties[key] = _plain(value)
     if properties:
         row["properties"] = properties
     if material.use_nodes and material.node_tree is not None:

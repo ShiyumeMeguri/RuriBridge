@@ -37,16 +37,29 @@ LOG = logger("blender.textures")
 #: other side should call the channel it lands in. The names on the right are the
 #: neutral ones the record carries; the receiving side maps them into its own
 #: vocabulary, which is its business and not this side's.
+#:
+#: The neutral names are the ones a generated material declares for its own
+#: images, so a document with both kinds of material in it speaks one vocabulary
+#: rather than two that have to be reconciled somewhere further along.
 SURFACE_INPUTS = (
-    ("Base Color", "basecolor"),
-    ("Metallic", "metallic"),
-    ("Roughness", "roughness"),
-    ("Normal", "normal"),
-    ("Emission Color", "emissive"),
-    ("Emission", "emissive"),
-    ("Alpha", "opacity"),
-    ("Specular IOR Level", "specular"),
+    ("Base Color", "BaseColor"),
+    ("Metallic", "Metallic"),
+    ("Roughness", "Roughness"),
+    ("Normal", "TangentNormal"),
+    ("Emission Color", "Emission"),
+    ("Emission", "Emission"),
+    ("Alpha", "Opacity"),
+    ("Specular IOR Level", "SpecularLevel"),
 )
+
+#: The custom property a material uses to declare what it is made of. Written by
+#: whatever generated the material; read here and nowhere written.
+SHADING_DECLARATION = "ruri_shading"
+
+#: A lane that is the whole image. Anything narrower is a packed map -- roughness
+#: in red, metal in green -- and one file's worth of bytes is not one channel's
+#: worth of picture, so it needs splitting before it means anything.
+WHOLE_IMAGE_CHANNELS = ("rgb", "rgba")
 
 #: How far to walk back from a surface input before giving up. A base colour
 #: behind a mix, a normal behind a normal-map node and a colour ramp: real graphs
@@ -84,13 +97,64 @@ def _image_behind(socket, depth=0):
     return None
 
 
+def _declared_images(material):
+    """The images a generated material states it binds, and what each one IS.
+
+    A generated material has no surface node to read the answer off -- its graph
+    is a stack of groups, and the image that feeds base colour arrives through a
+    dozen nodes that all mean something. So the material says it instead, with
+    the same channel packing declaration the shader on the other side was
+    generated from.
+
+    Only lanes that are the whole image and need no arithmetic cross. A map with
+    roughness in red and metal in green is three pictures in one file, and a
+    two-channel normal has to be unpacked before it is a normal at all; sending
+    either one as it stands would put a wrong picture in a right-looking channel,
+    which is worse than not sending it. Those are named rather than dropped.
+    """
+    declaration = material.get(SHADING_DECLARATION)
+    if declaration is None:
+        return None, ()
+    section = dict(declaration).get("images") or {}
+    group = material.get(str(section.get("group") or "")) or {}
+    packing = dict(section.get("packing") or {})
+    found = {}
+    packed = []
+    for slot in sorted(group.keys()):
+        lanes = [tuple(lane) for lane in (packing.get(slot) or ())]
+        whole = [lane for lane in lanes
+                 if lane[0] in WHOLE_IMAGE_CHANNELS and not lane[2]]
+        if not lanes:
+            packed.append((slot, "declares no surface channel -- the whole image is a "
+                                 "lookup domain, and a ramp is not a base colour"))
+            continue
+        if not whole:
+            packed.append((slot, "packs {0} into single channels".format(
+                "/".join(lane[1] for lane in lanes))))
+            continue
+        image = bpy.data.images.get(str(group[slot]))
+        if image is None:
+            packed.append((slot, "names {0!r}, and no image here answers to it".format(
+                str(group[slot]))))
+            continue
+        found.setdefault(whole[0][1], image)
+    return found, tuple(packed)
+
+
 def images_of(material):
-    """Every image this material actually renders with, by neutral channel name."""
+    """Every image this material renders with, by neutral channel name.
+
+    Returns what crosses and what could not, so a texture that stayed behind is
+    something said out loud rather than a channel that silently came up grey.
+    """
+    declared, packed = _declared_images(material)
+    if declared is not None:
+        return declared, packed
     if not material.use_nodes or material.node_tree is None:
-        return {}
+        return {}, ()
     surface = _surface_node(material.node_tree)
     if surface is None:
-        return {}
+        return {}, ()
     found = {}
     for input_name, channel in SURFACE_INPUTS:
         if channel in found:
@@ -101,7 +165,7 @@ def images_of(material):
         image = _image_behind(socket)
         if image is not None:
             found[channel] = image
-    return found
+    return found, ()
 
 
 #: What Blender calls a format, and what the file is called.
@@ -174,8 +238,12 @@ def publish_into(staging, materials):
     seen = {}
     count = 0
     total = 0
+    left_behind = {}
     for material in materials:
-        found = images_of(material)
+        found, packed = images_of(material)
+        for slot, why in packed:
+            left_behind.setdefault("{0}: {1}".format(slot, why), 0)
+            left_behind["{0}: {1}".format(slot, why)] += 1
         if not found:
             continue
         identity = material.get("ruri_bridge_identity") or material.name
@@ -207,4 +275,6 @@ def publish_into(staging, materials):
     if count:
         LOG.info("sent %d texture(s) for %d material(s), %.1f MB",
                  count, len(written), total / 1e6)
+    for reason, times in sorted(left_behind.items()):
+        LOG.info("kept back, %dx: %s", times, reason)
     return {"directory": TEXTURE_DIRECTORY_NAME, "by_material": written} if written else {}

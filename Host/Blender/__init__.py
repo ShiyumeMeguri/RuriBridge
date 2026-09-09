@@ -261,14 +261,23 @@ def push_shader_parameters(context, scope="SELECTED"):
     """
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
-    rows = mesh_publish.collect_material_rows(objects_in_scope(context, scope))
-    values = {row["identity"]: row["properties"] for row in rows if row.get("properties")}
+    values, vocabulary = _offer(mesh_publish.collect_material_rows(
+        objects_in_scope(context, scope)))
     if not values:
         raise RuntimeError(
             "no material in scope {0} carries any custom property to offer".format(scope))
     SHADER_GATE.prime(values)
     return CONNECTION.writer(topic_module.SHADING).write(
-        record_module.shading(HOST.name, values))
+        record_module.shading(HOST.name, values,
+                              vocabulary_by_texture_set=vocabulary))
+
+
+def _offer(rows):
+    """What to send, and whose vocabulary it is in."""
+    values = {row["identity"]: row["properties"] for row in rows if row.get("properties")}
+    vocabulary = {row["identity"]: row["shading"]["shader"] for row in rows
+                  if row.get("shading", {}).get("shader")}
+    return values, vocabulary
 
 
 def watched_objects(settings):
@@ -276,10 +285,14 @@ def watched_objects(settings):
     return objects_in_scope(bpy.context, settings.scope)
 
 
+def material_offer(settings):
+    """The data rows live sync watches, and whose vocabulary they are in."""
+    return _offer(mesh_publish.collect_material_rows(watched_objects(settings)))
+
+
 def material_values(settings):
-    """The data rows live sync watches and offers, keyed by identity."""
-    rows = mesh_publish.collect_material_rows(watched_objects(settings))
-    return {row["identity"]: row["properties"] for row in rows if row.get("properties")}
+    """Just the values, which is all a change gate compares."""
+    return material_offer(settings)[0]
 
 
 def live_sync(settings):
@@ -287,10 +300,11 @@ def live_sync(settings):
     if not CONNECTION.is_open or not settings.live_sync or not CONNECTION.has_published:
         return None
     if settings.live_shader_values:
-        values = material_values(settings)
+        values, vocabulary = material_offer(settings)
         if SHADER_GATE.should_publish(values):
             CONNECTION.writer(topic_module.SHADING).write(
-                record_module.shading(HOST.name, values))
+                record_module.shading(HOST.name, values,
+                                      vocabulary_by_texture_set=vocabulary))
             return "sent {0} shader value(s)".format(
                 sum(len(entry) for entry in values.values()))
     if settings.live_mesh and bpy.context.mode == "OBJECT":
@@ -378,11 +392,22 @@ def apply_values(values_by_texture_set):
     row is what this side considers the material to be about; the other side's
     shader exposes far more, and copying all of it in would move Painter's
     vocabulary into the .blend rather than keep two declared things equal.
+
+    A material that declared a shading row is left alone. Its parameters reach
+    the picture through the generator's own write path -- node sockets, the
+    snapshot, and a column of the material table, all three at once -- so setting
+    the snapshot from here would change the file without changing what is on
+    screen, and the two would disagree with nothing to show for it. Blender is
+    where the model is authored; the other side's viewport knobs are its own.
     """
     written = {}
+    generated = []
     for identity, values in values_by_texture_set.items():
         material = texture_ingest.resolve_material(identity, identity)
         if material is None:
+            continue
+        if material.get(mesh_publish.SHADING_DECLARATION) is not None:
+            generated.append(material.name)
             continue
         for name, value in values.items():
             if name not in material.keys():
@@ -396,6 +421,9 @@ def apply_values(values_by_texture_set):
             written.setdefault(material.name, []).append(name)
     if written:
         LOG.info("mirrored incoming values onto %s", written)
+    if generated:
+        LOG.info("%d generated material(s) kept their own values; their parameters are "
+                 "authored here and read there", len(generated))
     settings = _settings_or_none()
     if settings is not None:
         SHADER_GATE.suppress(material_values(settings))

@@ -155,13 +155,19 @@ def _coerce(value, data_type):
     return True, [caster(component) for component in value]
 
 
-def apply_by_texture_set(values_by_texture_set, shader_url_by_texture_set=None):
+def apply_by_texture_set(values_by_texture_set, shader_url_by_texture_set=None,
+                         vocabulary_by_texture_set=None):
     """Set what the shader on each Texture Set actually exposes; report the rest.
 
     Several Texture Sets share one shader instance until somebody gives them
     different shaders, so an offer aimed at two of them lands on the same
     uniforms. Where those two disagree on a value, neither is written: taking one
     silently would make the viewport show a number nobody asked for.
+
+    An offer that says which shader it was written for, and lands on an instance
+    running something else, is reported as that -- one line naming the shader --
+    rather than as its hundred and thirty six names being individually unknown.
+    Both are true; only the first is a thing somebody can act on.
     """
     identifier_by_set = instance_by_texture_set()
     for texture_set, url in (shader_url_by_texture_set or {}).items():
@@ -173,14 +179,20 @@ def apply_by_texture_set(values_by_texture_set, shader_url_by_texture_set=None):
         update_shader(identifier, url)
     identifier_by_set = instance_by_texture_set()
 
+    spoken = vocabulary_by_texture_set or {}
     offers = {}
     report = {"applied": {}, "unknown": {}, "mismatched": {}, "conflicting": {},
+              "wrong_shader": {},
               "unmapped": sorted(set(values_by_texture_set) - set(identifier_by_set))}
     for texture_set, values in values_by_texture_set.items():
         identifier = identifier_by_set.get(texture_set)
         if identifier is None:
             continue
         exposed = parameters(identifier)
+        wanted = spoken.get(texture_set)
+        if wanted and values and not set(values) & set(exposed):
+            report["wrong_shader"][texture_set] = wanted
+            continue
         for name, value in values.items():
             if name not in exposed:
                 report["unknown"].setdefault(texture_set, []).append(name)

@@ -182,7 +182,8 @@ def presence(source, is_open, project_path, mesh_path, texture_sets,
 
 
 def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
-            instances=(), parameters=None, assignment=None):
+            instances=(), parameters=None, assignment=None,
+            vocabulary_by_texture_set=None):
     """The shading stack: what it IS and what its values ARE, in one record.
 
     These were two publications on two channels with two lifetimes -- the shape
@@ -192,7 +193,8 @@ def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
     both: a shader instance list replaced before the other side looked was never
     news either.
     """
-    record = _values(source, values_by_texture_set, shader_url_by_texture_set)
+    record = _values(source, values_by_texture_set, shader_url_by_texture_set,
+                     vocabulary_by_texture_set)
     record.update({
         "instances": list(instances),
         "parameters": parameters or {},
@@ -201,7 +203,8 @@ def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
     return record
 
 
-def _values(source, values_by_texture_set, shader_url_by_texture_set=None):
+def _values(source, values_by_texture_set, shader_url_by_texture_set=None,
+            vocabulary_by_texture_set=None):
     """Either way: the current value of every watched uniform, and nothing else.
 
     This is the record that rides in the control block rather than in a
@@ -216,11 +219,19 @@ def _values(source, values_by_texture_set, shader_url_by_texture_set=None):
 
     Which shader each Texture Set runs travels in the same record because it is
     state too: assigning the shader an instance already runs is nothing.
+
+    An offer may also say which shader's vocabulary it is spoken in, when the
+    material it came from declared one. That is not a filter either -- the
+    intersection is still the receiver's to compute -- but it is the difference
+    between "your shader does not expose these hundred and thirty six names" and
+    "these values are for a shader nobody here is running", and only one of those
+    two sentences tells somebody what to do about it.
     """
     record = _base("shade", source)
     record.update({
         "by_texture_set": values_by_texture_set,
         "shader_url_by_texture_set": shader_url_by_texture_set or {},
+        "vocabulary_by_texture_set": vocabulary_by_texture_set or {},
     })
     return record
 
