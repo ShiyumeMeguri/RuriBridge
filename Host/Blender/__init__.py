@@ -123,6 +123,9 @@ CONNECTION = _Connection()
 SHADER_GATE = sync_module.ChangeGate("blender.shader", SHADER_QUIET_SECONDS)
 MESH_GATE = sync_module.ChangeGate("blender.mesh", MESH_QUIET_SECONDS)
 _mesh_serial = 0
+#: Object and mesh-data names Blender has reported as edited since the last
+#: send. What lets a live send read one object instead of all of them.
+_CHANGED_GEOMETRY = set()
 
 
 def connect(session=arena_module.DEFAULT_SESSION, root=None):
@@ -149,8 +152,13 @@ def objects_in_scope(context, scope):
 
 
 def publish_mesh(context, scope="SELECTED", intent=record_module.INTENT_AUTO,
-                 include_colors=True):
-    """Gather the scoped objects and publish them as one mesh generation."""
+                 include_colors=True, changed=None):
+    """Gather the scoped objects and publish them as one mesh generation.
+
+    ``changed`` names what Blender reported as edited; everything else is handed
+    back from the previous gather. None means "read everything", which is what a
+    manual send wants.
+    """
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
     chosen = objects_in_scope(context, scope)
@@ -161,7 +169,8 @@ def publish_mesh(context, scope="SELECTED", intent=record_module.INTENT_AUTO,
     generation = mesh_publish.publish(
         CONNECTION.arena, CONNECTION.publisher(topic_module.MESH), chosen, depsgraph, intent,
         context.scene.unit_settings.scale_length, include_colors,
-        binding=scene_binding(context, chosen))
+        binding=scene_binding(context, chosen), changed=changed)
+    _CHANGED_GEOMETRY.clear()
     CONNECTION.has_published = True
     MESH_GATE.prime({"serial": _mesh_serial})
     SHADER_GATE.prime(material_values(context.scene.ruri_bridge))
@@ -287,7 +296,8 @@ def live_sync(settings):
     if settings.live_mesh and bpy.context.mode == "OBJECT":
         if MESH_GATE.should_publish({"serial": _mesh_serial}):
             generation = publish_mesh(bpy.context, settings.scope, settings.intent,
-                                      settings.include_colors)
+                                      settings.include_colors,
+                                      changed=frozenset(_CHANGED_GEOMETRY))
             return "sent mesh, generation {0}".format(generation.number)
     return None
 
@@ -305,17 +315,28 @@ def _on_save_pre(_path):
 
 
 def _on_depsgraph_update(scene, depsgraph):
-    """Count geometry edits only.
+    """Note WHICH geometry was edited, not just that some was.
 
     Shading updates are excluded on purpose: mirroring Painter's shader values
     onto a material is itself a depsgraph update, and counting it here would make
     every value that arrives from Painter trigger a mesh republish back at it.
+
+    The name kept is whatever the update names -- the object for a transform or a
+    modifier, the mesh data for an edit -- and the publisher treats an object as
+    stale if either of its two names is in the set. Resolving datablocks to their
+    owners here would put a scene-wide walk inside a handler that runs on every
+    edit, to answer a question the publisher can answer for free.
     """
     global _mesh_serial
+    touched = False
     for update in depsgraph.updates:
         if update.is_updated_geometry:
-            _mesh_serial += 1
-            return
+            name = getattr(update.id, "name", "")
+            if name:
+                _CHANGED_GEOMETRY.add(name)
+            touched = True
+    if touched:
+        _mesh_serial += 1
 
 
 def ingest_latest_textures(bind=True):

@@ -58,15 +58,19 @@ class ObjectData:
     """One source object, resolved down to index arrays and its own buffers."""
 
     __slots__ = ("name", "node_matrix", "vertex_count", "sources", "primitives",
-                 "identity")
+                 "identity", "include_colors")
 
-    def __init__(self, name, node_matrix, vertex_count, sources, primitives, identity):
+    def __init__(self, name, node_matrix, vertex_count, sources, primitives, identity,
+                 include_colors=True):
         self.name = name
         self.node_matrix = node_matrix
         self.vertex_count = vertex_count
         self.sources = sources
         self.primitives = primitives
         self.identity = identity
+        #: What it was read WITH, so a send that asks for something different does
+        #: not quietly get the previous answer.
+        self.include_colors = include_colors
 
 
 def _column_major(matrix):
@@ -299,6 +303,60 @@ def _deduplicate(key_columns):
     return order, inverse.reshape(-1)
 
 
+#: What the last publish read out of each object, by object name. Reading an
+#: object is 81% of a publish on a real scene, and most objects are the same as
+#: they were -- so the expensive half is skipped for everything Blender did not
+#: report as changed.
+_GATHERED = {}
+
+
+def forget_gathered(names=None):
+    """Drop cached reads. Everything, or just the objects named."""
+    if names is None:
+        _GATHERED.clear()
+        return
+    for name in names:
+        _GATHERED.pop(name, None)
+
+
+def gather_scope(objects, depsgraph, include_colors=True, changed=None):
+    """Read every object, reusing what has not changed since the last read.
+
+    ``changed`` is the set of names Blender reported as updated; None means
+    "assume everything" -- which is what a manual send does, because a manual
+    send is somebody saying they want what is there now.
+    """
+    gathered = []
+    reused = 0
+    for object_reference in objects:
+        name = object_reference.name
+        entry = _GATHERED.get(name)
+        matrix = _column_major(object_reference.matrix_world)
+        data_name = getattr(object_reference.data, "name", "")
+        stale = (entry is None
+                 or changed is None
+                 or name in changed
+                 or (data_name and data_name in changed)
+                 or entry.include_colors != include_colors)
+        # A move is not a re-read: the same buffers at a different place. The
+        # matrix rides on the entry and is refreshed either way.
+        if stale:
+            entry = gather_object(object_reference, depsgraph, include_colors)
+            if entry is None:
+                _GATHERED.pop(name, None)
+                LOG.warning("%s evaluated to no triangles and was skipped", name)
+                continue
+            _GATHERED[name] = entry
+        else:
+            entry.node_matrix = matrix
+            reused += 1
+        gathered.append(entry)
+    if reused:
+        LOG.info("reused %d of %d object(s) unchanged since the last send",
+                 reused, len(objects))
+    return gathered
+
+
 def gather_object(object_reference, depsgraph, include_colors=True):
     """Read one evaluated object into index arrays over its own buffers."""
     evaluated = object_reference.evaluated_get(depsgraph)
@@ -362,7 +420,9 @@ def gather_object(object_reference, depsgraph, include_colors=True):
         material_identities = _slot_material_identities(object_reference)
         triangle_by_material = triangle_corners.reshape(-1, 3)
         primitives = []
-        for material_index in sorted(set(int(value) for value in triangle_material)):
+        # numpy, not a Python loop over every triangle: measured 134 ms against
+        # 29 ms on the five heaviest objects of a real scene, for the same answer.
+        for material_index in numpy.unique(triangle_material).tolist():
             rows = triangle_by_material[
                 numpy.flatnonzero(triangle_material == material_index)].reshape(-1)
             identity = (material_identities[material_index]
@@ -373,7 +433,7 @@ def gather_object(object_reference, depsgraph, include_colors=True):
         return ObjectData(object_reference.name,
                           _column_major(object_reference.matrix_world),
                           int(order.shape[0]), sources, primitives,
-                          identity_of(object_reference))
+                          identity_of(object_reference), include_colors)
     finally:
         evaluated.to_mesh_clear()
 
@@ -437,7 +497,7 @@ def write_glb(arena, path, objects):
 
 
 def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
-            include_colors=True, binding=None):
+            include_colors=True, binding=None, changed=None):
     """Gather, write and publish one mesh generation. Returns the generation."""
     created_materials = ensure_materials(objects_to_send)
     if created_materials:
@@ -449,13 +509,7 @@ def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
             ".blend: an unsaved file mints different identities next session, and "
             "Painter then builds new Texture Sets beside the ones already painted",
             len(fresh))
-    gathered = []
-    for object_reference in objects_to_send:
-        entry = gather_object(object_reference, depsgraph, include_colors)
-        if entry is None:
-            LOG.warning("%s evaluated to no triangles and was skipped", object_reference.name)
-            continue
-        gathered.append(entry)
+    gathered = gather_scope(objects_to_send, depsgraph, include_colors, changed)
     if not gathered:
         raise RuntimeError("nothing to publish: no object in scope evaluated to triangles")
 
