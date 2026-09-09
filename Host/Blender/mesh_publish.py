@@ -233,44 +233,29 @@ def _declared_row(material):
 
 
 def _material_row(material, fresh=()):
-    """Whatever the producing side calls a material, carried verbatim.
+    """Which material this is, and whose shading vocabulary it speaks.
 
-    A material that declares a shading row offers that row. One that does not --
-    an ordinary Blender material somebody put custom properties on -- offers the
-    properties themselves, which is the same statement made the only way a
-    material without a generator behind it can make it.
+    Not what it is set to. The values are a state that keeps changing while the
+    model does not, they have a channel of their own that says so, and putting
+    them in every mesh generation as well was a hundred and ninety kilobytes and
+    ten milliseconds per live tick for a copy nobody read.
     """
     row = {"identity": identity_of(material), "name": material.name,
            "identity_is_new": material.name in fresh}
-    declared = _declared_row(material)
-    if declared is not None:
-        row["shading"] = {"shader": declared["shader"], "name": declared["name"],
-                          "variant": declared["variant"]}
-        properties = declared["parameters"]
-    else:
-        properties = {}
-        for key in material.keys():
-            if key == IDENTITY_PROPERTY:
-                continue
-            value = material[key]
-            if hasattr(value, "keys"):
-                continue
-            properties[key] = _plain(value)
-    if properties:
-        row["properties"] = properties
-    if material.use_nodes and material.node_tree is not None:
-        groups = sorted({node.node_tree.name for node in material.node_tree.nodes
-                         if node.type == "GROUP" and node.node_tree is not None})
-        if groups:
-            row["node_groups"] = groups
+    declaration = material.get(SHADING_DECLARATION)
+    if declaration is not None:
+        row["shading"] = {"shader": str(declaration.get("shader") or ""),
+                          "name": str(declaration.get("name") or ""),
+                          "variant": str(declaration.get("variant") or "")}
     return row
 
 
-def collect_material_rows(objects, fresh=()):
-    """Every distinct material row across these objects, first use wins.
+def parameter_rows(objects, fresh=()):
+    """Every distinct material in scope, with what it is set to.
 
-    One collection point, because a mesh publish and a shader push must offer the
-    other side the same idea of what a material is.
+    Read off the slots rather than off a payload: this answers "what is the
+    shading in scope", which is a question about the document and not about the
+    last thing that was sent.
     """
     rows = []
     seen = set()
@@ -279,7 +264,22 @@ def collect_material_rows(objects, fresh=()):
             if slot.material is None or slot.material.name in seen:
                 continue
             seen.add(slot.material.name)
-            rows.append(_material_row(slot.material, fresh))
+            row = _material_row(slot.material, fresh)
+            declared = _declared_row(slot.material)
+            if declared is not None:
+                row["properties"] = declared["parameters"]
+            else:
+                properties = {}
+                for key in slot.material.keys():
+                    if key == IDENTITY_PROPERTY:
+                        continue
+                    value = slot.material[key]
+                    if hasattr(value, "keys"):
+                        continue
+                    properties[key] = _plain(value)
+                if properties:
+                    row["properties"] = properties
+            rows.append(row)
     return rows
 
 

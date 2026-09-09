@@ -261,7 +261,7 @@ def push_shader_parameters(context, scope="SELECTED"):
     """
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
-    values, vocabulary, named = _offer(mesh_publish.collect_material_rows(
+    values, vocabulary, named = _offer(mesh_publish.parameter_rows(
         objects_in_scope(context, scope)))
     if not values:
         raise RuntimeError(
@@ -290,7 +290,7 @@ def watched_objects(settings):
 
 def material_offer(settings):
     """The data rows live sync watches, and whose vocabulary they are in."""
-    return _offer(mesh_publish.collect_material_rows(watched_objects(settings)))
+    return _offer(mesh_publish.parameter_rows(watched_objects(settings)))
 
 
 def material_values(settings):
