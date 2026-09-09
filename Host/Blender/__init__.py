@@ -16,16 +16,22 @@ import importlib
 import bpy
 
 from ...Kernel import arena as arena_module
-from ...Kernel import channel as channel_module
+from ...Kernel import host as host_port
 from ...Kernel import log as log_module
 from ...Kernel import painter_host
+from ...Kernel import peers as peers_module
 from ...Kernel import record as record_module
+from ...Kernel import session as session_module
 from ...Kernel import sync as sync_module
+from ...Kernel import topic as topic_module
 
 from . import mesh_publish, texture_ingest
 
-for _module in (arena_module, channel_module, record_module, sync_module,
-                mesh_publish, texture_ingest):
+# Kernel.host is deliberately absent: it holds the bound driver, and reloading it
+# would clear the binding while everything that already imported it kept the old
+# module object -- "no application is bound", from the next call on.
+for _module in (arena_module, record_module, sync_module, topic_module,
+                session_module, mesh_publish, texture_ingest):
     importlib.reload(_module)
 
 LOG = log_module.logger("blender")
@@ -35,45 +41,78 @@ SHADER_QUIET_SECONDS = 0.35
 MESH_QUIET_SECONDS = 1.2
 
 
+PEER = peers_module.BLENDER
+
+
+class BlenderHost(host_port.Host):
+    """This application, as the bridge uses it."""
+
+    @property
+    def name(self):
+        return PEER.name
+
+    @property
+    def capabilities(self):
+        return PEER.capabilities
+
+    def log(self, level, message):
+        getattr(LOG, level if level != host_port.WARNING else "warning")(message)
+
+    def schedule(self, seconds, function):
+        bpy.app.timers.register(function, first_interval=seconds)
+
+    def redraw(self):
+        _tag_redraw()
+
+    def receive(self, topic, generation):
+        return _receive(topic, generation)
+
+    def collect(self, topic):
+        if topic is topic_module.SHADING:
+            settings = _settings_or_none()
+            return material_values(settings) if settings else {}
+        return None
+
+
+HOST = host_port.bind(BlenderHost())
+
+
 class _Connection:
     """The one live attachment this Blender process holds."""
 
     def __init__(self):
-        self.arena = None
-        self.publisher = None
-        self.subscriber = None
-        self.state_writer = None
-        self.state_reader = None
+        self.session = None
         self.last_state = {}
         self.has_published = False
 
     @property
     def is_open(self):
-        return self.arena is not None
+        return self.session is not None
+
+    @property
+    def arena(self):
+        return self.session.arena if self.session is not None else None
 
     def open(self, session, root=None):
         self.close()
-        self.arena = arena_module.Arena.open_session(
-            record_module.CHANNELS, session=session, root=root)
-        self.publisher = channel_module.Publisher(self.arena, record_module.CHANNEL_TO_PAINTER)
-        self.subscriber = channel_module.Subscriber(self.arena, record_module.CHANNEL_TO_BLENDER)
-        self.subscriber.skip_to_latest()
-        self.state_writer = channel_module.StateWriter(
-            self.arena, record_module.CHANNEL_STATE_TO_PAINTER)
-        self.state_reader = channel_module.StateReader(
-            self.arena, record_module.CHANNEL_STATE_TO_BLENDER)
-        self.state_reader.skip_to_latest()
-        LOG.info("attached to session %s at %s", session, self.arena.directory)
-        return self.arena
+        self.session = session_module.Session.open(
+            HOST.name, HOST.capabilities, session=session, root=root)
+        for one in topic_module.TOPICS:
+            for endpoint in self.session.sources(one):
+                endpoint.reader.skip_to_latest()
+        LOG.info("attached to session %s at %s", session, self.session.arena.directory)
+        return self.session.arena
+
+    def publisher(self, topic):
+        return self.session.publisher(topic)
+
+    def writer(self, topic):
+        return self.session.writer(topic)
 
     def close(self):
-        if self.arena is not None:
-            self.arena.close()
-        self.arena = None
-        self.publisher = None
-        self.subscriber = None
-        self.state_writer = None
-        self.state_reader = None
+        if self.session is not None:
+            self.session.close()
+        self.session = None
 
 
 CONNECTION = _Connection()
@@ -116,7 +155,7 @@ def publish_mesh(context, scope="SELECTED", intent=record_module.INTENT_AUTO,
     adopt_painter_identities(chosen)
     depsgraph = context.evaluated_depsgraph_get()
     generation = mesh_publish.publish(
-        CONNECTION.arena, CONNECTION.publisher, chosen, depsgraph, intent,
+        CONNECTION.arena, CONNECTION.publisher(topic_module.MESH), chosen, depsgraph, intent,
         context.scene.unit_settings.scale_length, include_colors,
         binding=scene_binding(context, chosen))
     CONNECTION.has_published = True
@@ -140,7 +179,7 @@ def adopt_painter_identities(objects):
     different number of vertices is a different model, and matching names across
     two models would be worse than starting clean, so that case mints as before.
     """
-    state = CONNECTION.last_state.get(record_module.KIND_PROJECT_STATE) or {}
+    state = CONNECTION.last_state.get(peers_module.SUBSTANCE.name) or {}
     if not state.get("is_open"):
         return {}
     mine = mesh_publish.vertex_count_of(objects)
@@ -193,8 +232,10 @@ def scene_binding(context, objects):
 def request_export(preset_name, resolution_log2=None):
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
-    payload = record_module.export_request("blender", preset_name, resolution_log2)
-    return CONNECTION.publisher.publish_record(payload)
+    payload = record_module.request(
+        HOST.name, record_module.ASK_FOR_TEXTURES,
+        preset_name=preset_name, resolution_log2=resolution_log2, texture_sets=None)
+    return CONNECTION.publisher(topic_module.REQUEST).publish_record(payload)
 
 
 def push_shader_parameters(context, scope="SELECTED"):
@@ -213,7 +254,8 @@ def push_shader_parameters(context, scope="SELECTED"):
         raise RuntimeError(
             "no material in scope {0} carries any custom property to offer".format(scope))
     SHADER_GATE.prime(values)
-    return CONNECTION.state_writer.write(record_module.shader_values("blender", values))
+    return CONNECTION.writer(topic_module.SHADING).write(
+        record_module.shading(HOST.name, values))
 
 
 def watched_objects(settings):
@@ -234,7 +276,8 @@ def live_sync(settings):
     if settings.live_shader_values:
         values = material_values(settings)
         if SHADER_GATE.should_publish(values):
-            CONNECTION.state_writer.write(record_module.shader_values("blender", values))
+            CONNECTION.writer(topic_module.SHADING).write(
+                record_module.shading(HOST.name, values))
             return "sent {0} shader value(s)".format(
                 sum(len(entry) for entry in values.values()))
     if settings.live_mesh and bpy.context.mode == "OBJECT":
@@ -275,22 +318,32 @@ def ingest_latest_textures(bind=True):
     """Take whatever Painter last exported, even if it predates this session."""
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
-    generation = CONNECTION.subscriber.latest(record_module.KIND_TEXTURES)
-    if generation is None:
-        raise RuntimeError("Painter has not published any textures on this session")
-    report = texture_ingest.ingest(generation, bind=bind)
-    CONNECTION.subscriber.acknowledge(generation)
-    return generation, report
+    newest, source = None, None
+    for endpoint in CONNECTION.session.sources(topic_module.TEXTURES):
+        candidate = endpoint.reader.latest()
+        if candidate is not None and (newest is None or candidate.number > newest.number):
+            newest, source = candidate, endpoint
+    if newest is None:
+        raise RuntimeError("nobody has published any textures on this session")
+    report = texture_ingest.ingest(newest, bind=bind)
+    source.reader.acknowledge(newest)
+    return newest, report
 
 
 def take_shader_values(bind=True):
     """Mirror Painter's live values back, straight out of the control block."""
     if not CONNECTION.is_open or not bind:
         return None
-    payload = CONNECTION.state_reader.take()
-    if payload is None:
-        return None
-    return apply_values(payload.get("by_texture_set", {}))
+    written = 0
+    for endpoint, payload in CONNECTION.session.changed_state():
+        if endpoint.topic is topic_module.SHADING:
+            SHADER_GATE.suppress(payload.get("by_texture_set", {}))
+            written += apply_values(payload.get("by_texture_set", {})) or 0
+        elif endpoint.topic is topic_module.PRESENCE:
+            CONNECTION.last_state[endpoint.peer] = payload
+            remember_painter_executable(payload.get("host_executable"))
+            remember_painter_project(payload.get("project_path"))
+    return written or None
 
 
 def apply_values(values_by_texture_set):
@@ -339,36 +392,41 @@ def pump(bind=True):
     if not CONNECTION.is_open:
         return []
     handled = []
-    for generation in CONNECTION.subscriber.pending():
+    for endpoint, generation in CONNECTION.session.incoming():
         try:
-            if generation.kind == record_module.KIND_TEXTURES:
-                handled.append((generation.number, generation.kind,
-                                texture_ingest.ingest(generation, bind=bind)))
-            elif generation.kind == record_module.KIND_SHADER_STATE:
-                CONNECTION.last_state[generation.kind] = generation.record
-                handled.append((generation.number, generation.kind,
-                                len(generation.record.get("instances", []))))
-            elif generation.kind == record_module.KIND_PROJECT_STATE:
-                CONNECTION.last_state[generation.kind] = generation.record
-                remember_painter_executable(generation.record.get("host_executable"))
-                remember_painter_project(generation.record.get("project_path"))
-                handled.append((generation.number, generation.kind, generation.record))
-            elif generation.kind == record_module.KIND_MESH_REQUEST:
-                published = publish_mesh(bpy.context, settings_scope(),
-                                         record_module.INTENT_AUTO, True)
-                handled.append((generation.number, generation.kind, published.number))
-            else:
-                LOG.warning("ignoring generation %d of unknown kind %r",
-                            generation.number, generation.kind)
+            handled.append((generation.number, endpoint.topic.key,
+                            _receive(endpoint.topic, generation, bind)))
         except Exception as error:
-            LOG.error("generation %d (%s) failed and is being skipped: %s",
-                      generation.number, generation.kind, error)
+            LOG.error("%s generation %d from %s failed and is being skipped: %s",
+                      endpoint.topic.key, generation.number, endpoint.peer, error)
             handled.append((generation.number, "failed", str(error)))
-        CONNECTION.subscriber.acknowledge(generation)
+        endpoint.reader.acknowledge(generation)
     written = take_shader_values(bind)
     if written:
-        handled.append((0, record_module.KIND_SHADER_VALUES, written))
+        handled.append((0, topic_module.SHADING.key, written))
     return handled
+
+
+def _receive(topic, generation, bind=True):
+    """One arrival, dispatched on the topic it arrived on.
+
+    No ladder over what a record calls itself: the channel already decided that,
+    and re-deriving it from the payload would be a second answer to a question
+    the transport had answered before the payload was read.
+    """
+    if topic is topic_module.TEXTURES:
+        return texture_ingest.ingest(generation, bind=bind)
+    if topic is topic_module.REQUEST:
+        asked = generation.record.get("for")
+        if asked == record_module.ASK_FOR_MESH:
+            return publish_mesh(bpy.context, settings_scope(),
+                                record_module.INTENT_AUTO, True).number
+        raise RuntimeError(
+            "{0} asked for {1!r}, which this application does not answer".format(
+                generation.record.get("source"), asked))
+    raise RuntimeError(
+        "nothing here receives {0!r} yet, and the topic says this application "
+        "hears it".format(topic.key))
 
 
 class RuriBridgeSettings(bpy.types.PropertyGroup):
@@ -449,10 +507,10 @@ def _timer():
         LOG.error("pump failed: %s", error)
         settings.status = "pump failed: {0}".format(error)
         return settings.poll_seconds
-    CONNECTION.arena.touch(record_module.CHANNEL_TO_PAINTER)
+    CONNECTION.session.touch()
     if handled:
         homeless = sorted({entry["texture_set"] for _number, kind, report in handled
-                           if kind == record_module.KIND_TEXTURES
+                           if kind == topic_module.TEXTURES.key
                            for entry in report if entry.get("homeless")})
         if homeless:
             settings.status = ("{0} has no material of that name here, so its paint is "
@@ -569,7 +627,7 @@ def painter_is_attached():
     """
     if not CONNECTION.is_open:
         return False
-    return CONNECTION.arena.read_slot(record_module.CHANNEL_TO_BLENDER).writer_is_live
+    return CONNECTION.session.present(peers_module.SUBSTANCE.name)
 
 
 class RURIBRIDGE_OT_locate_painter(bpy.types.Operator):

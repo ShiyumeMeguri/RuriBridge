@@ -31,7 +31,9 @@ from . import channel as channel_module
 from . import glb as glb_module
 from . import log as log_module
 from . import painter_host
+from . import peers as peers_module
 from . import record as record_module
+from . import topic as topic_module
 
 LOG = log_module.logger("cli")
 
@@ -40,13 +42,27 @@ INSTALLED_NAME = "RuriBridge"
 DEFAULT_EXPORT_PRESET = "Document channels + Normal + AO (No Alpha)"
 
 
+def _roster_index(name):
+    """An application's acknowledgement word, by roster position."""
+    return [one.name for one in peers_module.PEERS].index(name)
+
+
+def _kind_of(channel):
+    """Whether a channel carries a queue or a slot, asked of the topic."""
+    return topic_module.by_key(channel.split("@", 1)[0]).kind
+
+
+def _channels_of_kind(kind):
+    return tuple(name for name in topic_module.channels() if _kind_of(name) == kind)
+
+
 def _repository_root():
     return Path(__file__).resolve().parent.parent
 
 
 def _open(arguments):
     return arena_module.Arena.open_session(
-        record_module.CHANNELS, session=arguments.session, root=arguments.root)
+        topic_module.channels(), session=arguments.session, root=arguments.root)
 
 
 def command_launch(arguments):
@@ -79,7 +95,7 @@ def command_status(arguments):
         print("directory {0}".format(arena.directory))
         print("epoch     {0}".format(arena.epoch))
         for state in arena.describe():
-            if state.channel in record_module.STATE_CHANNELS:
+            if _kind_of(state.channel) == topic_module.STATE:
                 payload, generation = arena.read_state(state.channel)
                 print("  {0:<17} revision={1} inline={2} bytes writer={3}".format(
                     state.channel, generation,
@@ -97,7 +113,7 @@ def command_status(arguments):
 def command_values(arguments):
     """Read the inline state slots, which carry no files at all."""
     with _open(arguments) as arena:
-        for name in record_module.STATE_CHANNELS:
+        for name in _channels_of_kind(topic_module.STATE):
             payload, generation = arena.read_state(name)
             if payload is None:
                 print("{0}: nothing written".format(name))
@@ -114,7 +130,7 @@ def command_values(arguments):
 def command_inspect(arguments):
     with _open(arguments) as arena:
         channels = [arguments.channel] if arguments.channel else list(
-            record_module.QUEUED_CHANNELS)
+            _channels_of_kind(topic_module.QUEUED))
         for name in channels:
             state = arena.read_slot(name)
             if state.generation == 0:
@@ -134,13 +150,13 @@ def command_remove(arguments):
 
 
 def _newest_mesh(arena):
-    state = arena.read_slot(record_module.CHANNEL_TO_PAINTER)
-    for number in reversed(arena.existing_generations(record_module.CHANNEL_TO_PAINTER)):
+    state = arena.read_slot(topic_module.MESH.channel(peers_module.BLENDER.name))
+    for number in reversed(arena.existing_generations(topic_module.MESH.channel(peers_module.BLENDER.name))):
         if number > state.generation:
             continue
-        directory = arena.generation_directory(record_module.CHANNEL_TO_PAINTER, number)
+        directory = arena.generation_directory(topic_module.MESH.channel(peers_module.BLENDER.name), number)
         payload = record_module.read(directory)
-        if payload.get("kind") == record_module.KIND_MESH:
+        if payload.get("kind") == "mesh":
             return number, directory, payload
     return None, None, None
 
@@ -149,7 +165,7 @@ def command_verify_mesh(arguments):
     with _open(arguments) as arena:
         number, directory, payload = _newest_mesh(arena)
         if number is None:
-            print("no mesh has been published on {0}".format(record_module.CHANNEL_TO_PAINTER))
+            print("no mesh has been published on {0}".format(topic_module.MESH.channel(peers_module.BLENDER.name)))
             return 1
         path = directory / payload.get("scene_file", record_module.SCENE_FILE_NAME)
         failures = verify_glb(path)
@@ -229,13 +245,13 @@ def verify_glb(path):
 
 def command_textures(arguments):
     with _open(arguments) as arena:
-        state = arena.read_slot(record_module.CHANNEL_TO_BLENDER)
+        state = arena.read_slot(topic_module.TEXTURES.channel(peers_module.SUBSTANCE.name))
         if state.generation == 0:
             print("Painter has published nothing")
             return 1
-        directory = arena.generation_directory(record_module.CHANNEL_TO_BLENDER, state.generation)
+        directory = arena.generation_directory(topic_module.TEXTURES.channel(peers_module.SUBSTANCE.name), state.generation)
         payload = record_module.read(directory)
-        if payload.get("kind") != record_module.KIND_TEXTURES:
+        if payload.get("kind") != "tex":
             print("newest generation is {0}, not textures".format(payload.get("kind")))
             return 1
         maps_directory = directory / payload["directory"]
@@ -340,8 +356,10 @@ def command_push_shader_values(arguments):
 def command_shaders(arguments):
     """What Painter last said about its shaders, from outside both hosts."""
     with _open(arguments) as arena:
-        subscriber = channel_module.Subscriber(arena, record_module.CHANNEL_TO_BLENDER)
-        generation = subscriber.latest(record_module.KIND_SHADER_STATE)
+        subscriber = channel_module.Subscriber(
+            arena, topic_module.TEXTURES.channel(peers_module.SUBSTANCE.name),
+            _roster_index(peers_module.BLENDER.name))
+        generation = subscriber.latest("shade")
         if generation is None:
             print("Painter has not published a shader state")
             return 1
@@ -492,7 +510,7 @@ def build_parser():
 
     inspect = subparsers.add_parser("inspect")
     inspect.add_argument("--channel", default=None,
-                         choices=list(record_module.QUEUED_CHANNELS))
+                         choices=list(_channels_of_kind(topic_module.QUEUED)))
     inspect.set_defaults(handler=command_inspect)
 
     subparsers.add_parser("remove").set_defaults(handler=command_remove)

@@ -326,7 +326,7 @@ def publish(arena, publisher, preset_name=DEFAULT_PRESET_NAME, selected_texture_
             })
 
         return staging.publish(record_module.textures(
-            source="painter",
+            source="Substance",
             project_path=substance_painter.project.file_path(),
             mesh_path=substance_painter.project.last_imported_mesh_path(),
             texture_sets=texture_sets))
@@ -361,7 +361,7 @@ def apply_display_names(names_by_identity):
 def current_project_state():
     """What Painter has open, for the panel and for Blender's status line."""
     if not substance_painter.project.is_open():
-        return record_module.project_state("painter", False, None, None, [], {})
+        return record_module.presence("Substance", False, None, None, [], {})
     texture_sets = []
     for texture_set in substance_painter.textureset.all_texture_sets():
         resolution = texture_set.get_resolution()
@@ -378,8 +378,8 @@ def current_project_state():
             "resolution": [resolution.width, resolution.height],
             "stacks": stacks,
         })
-    return record_module.project_state(
-        "painter", True,
+    return record_module.presence(
+        "Substance", True,
         substance_painter.project.file_path(),
         substance_painter.project.last_imported_mesh_path(),
         texture_sets, mesh_ingest.stored_binding())

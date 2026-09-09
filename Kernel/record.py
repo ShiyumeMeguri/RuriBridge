@@ -20,22 +20,11 @@ from pathlib import Path
 
 FORMAT_VERSION = 1
 
-CHANNEL_TO_PAINTER = "to_painter"
-CHANNEL_TO_BLENDER = "to_blender"
-CHANNEL_STATE_TO_PAINTER = "state_to_painter"
-CHANNEL_STATE_TO_BLENDER = "state_to_blender"
-CHANNELS = (CHANNEL_TO_PAINTER, CHANNEL_TO_BLENDER,
-            CHANNEL_STATE_TO_PAINTER, CHANNEL_STATE_TO_BLENDER)
-QUEUED_CHANNELS = (CHANNEL_TO_PAINTER, CHANNEL_TO_BLENDER)
-STATE_CHANNELS = (CHANNEL_STATE_TO_PAINTER, CHANNEL_STATE_TO_BLENDER)
-
-KIND_MESH = "mesh"
-KIND_MESH_REQUEST = "mesh_request"
-KIND_EXPORT_REQUEST = "export_request"
-KIND_TEXTURES = "textures"
-KIND_PROJECT_STATE = "project_state"
-KIND_SHADER_STATE = "shader_state"
-KIND_SHADER_VALUES = "shader_values"
+#: What a request is asking for. The only "kind" left, because it is the only
+#: one that distinguishes something WITHIN a topic -- every other distinction the
+#: old kinds carried is now the channel a record arrived on.
+ASK_FOR_MESH = "mesh"
+ASK_FOR_TEXTURES = "textures"
 
 INTENT_AUTO = "auto"
 INTENT_CREATE_PROJECT = "create_project"
@@ -82,6 +71,12 @@ def read(generation_directory):
 
 
 def _base(kind, source):
+    """Every record says who published it and what shape it is.
+
+    ``kind`` is the shape, not the destination: where it goes was decided by the
+    channel it was published on, and a record that also named its destination
+    would be a second statement of the same thing.
+    """
     return {
         "format_version": FORMAT_VERSION,
         "kind": kind,
@@ -115,7 +110,7 @@ def mesh(source, intent, scene, materials, unit_scale, up_axis, binding_record=N
     the bounds) so the consumer can report and verify without parsing it.
     ``materials`` are the producing side's material rows, carried verbatim.
     """
-    record = _base(KIND_MESH, source)
+    record = _base("mesh", source)
     record.update({
         "intent": intent,
         "scene_file": SCENE_FILE_NAME,
@@ -128,24 +123,17 @@ def mesh(source, intent, scene, materials, unit_scale, up_axis, binding_record=N
     return record
 
 
-def mesh_request(source):
-    """Painter -> Blender: send me the scene as it stands.
+def request(source, asked_for, **details):
+    """Ask another application to do a thing.
 
-    The symmetric counterpart of an export request. Painter cannot read a
-    Blender scene, so asking is the only move it has, and having it is what lets
-    the two panels offer the same actions from either side.
+    One builder, not one per errand. An application that cannot read another's
+    document has asking as its only move, and what it is asking for is a field
+    rather than a channel -- so the third application asks for a model without a
+    line of new plumbing anywhere.
     """
-    return _base(KIND_MESH_REQUEST, source)
-
-
-def export_request(source, preset_name, resolution_log2=None, texture_sets=None):
-    """Blender -> Painter: render the channels out into the arena now."""
-    record = _base(KIND_EXPORT_REQUEST, source)
-    record.update({
-        "preset_name": preset_name,
-        "resolution_log2": resolution_log2,
-        "texture_sets": texture_sets,
-    })
+    record = _base("ask", source)
+    record["for"] = asked_for
+    record.update(details)
     return record
 
 
@@ -156,7 +144,7 @@ def textures(source, project_path, mesh_path, texture_sets):
     texture, decided by the side that knows the channel's format. A consumer
     that re-derives it from a file name or a slot will eventually be wrong.
     """
-    record = _base(KIND_TEXTURES, source)
+    record = _base("tex", source)
     record.update({
         "project_path": project_path,
         "mesh_path": mesh_path,
@@ -166,10 +154,14 @@ def textures(source, project_path, mesh_path, texture_sets):
     return record
 
 
-def project_state(source, is_open, project_path, mesh_path, texture_sets,
-                  binding_record=None):
-    """Painter -> Blender: what Painter currently has open."""
-    record = _base(KIND_PROJECT_STATE, source)
+def presence(source, is_open, project_path, mesh_path, texture_sets,
+             binding_record=None):
+    """What this application currently has open, and what it is bound to.
+
+    Everybody publishes it and everybody reads everybody else's, which is how a
+    side stops guessing whether the other one is there and what it is holding.
+    """
+    record = _base("here", source)
     record.update({
         "is_open": is_open,
         "project_path": project_path,
@@ -180,7 +172,27 @@ def project_state(source, is_open, project_path, mesh_path, texture_sets,
     return record
 
 
-def shader_values(source, values_by_texture_set, shader_url_by_texture_set=None):
+def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
+            instances=(), parameters=None, assignment=None):
+    """The shading stack: what it IS and what its values ARE, in one record.
+
+    These were two publications on two channels with two lifetimes -- the shape
+    queued, the values latest-wins -- for one subject. Anything that reads the
+    values needs the shape to make sense of them, and anything that reads the
+    shape without values has nothing to do with it. Latest-wins is right for
+    both: a shader instance list replaced before the other side looked was never
+    news either.
+    """
+    record = _values(source, values_by_texture_set, shader_url_by_texture_set)
+    record.update({
+        "instances": list(instances),
+        "parameters": parameters or {},
+        "assignment": assignment or {},
+    })
+    return record
+
+
+def _values(source, values_by_texture_set, shader_url_by_texture_set=None):
     """Either way: the current value of every watched uniform, and nothing else.
 
     This is the record that rides in the control block rather than in a
@@ -196,21 +208,10 @@ def shader_values(source, values_by_texture_set, shader_url_by_texture_set=None)
     Which shader each Texture Set runs travels in the same record because it is
     state too: assigning the shader an instance already runs is nothing.
     """
-    record = _base(KIND_SHADER_VALUES, source)
+    record = _base("shade", source)
     record.update({
         "by_texture_set": values_by_texture_set,
         "shader_url_by_texture_set": shader_url_by_texture_set or {},
-    })
-    return record
-
-
-def shader_state(source, instances, parameters, assignment):
-    """Painter -> Blender: which shaders run where, and what they expose."""
-    record = _base(KIND_SHADER_STATE, source)
-    record.update({
-        "instances": instances,
-        "parameters": parameters,
-        "assignment": assignment,
     })
     return record
 

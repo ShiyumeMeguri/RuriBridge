@@ -463,7 +463,7 @@ def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
         scene_description = write_glb(
             arena, staging.path(record_module.SCENE_FILE_NAME), gathered)
         return staging.publish(record_module.mesh(
-            source="blender",
+            source="Blender",
             intent=intent,
             scene=scene_description,
             materials=collect_material_rows(objects_to_send, fresh),

@@ -28,10 +28,13 @@ import substance_painter.textureset
 import substance_painter.ui
 
 from ...Kernel import arena as arena_module
-from ...Kernel import channel as channel_module
+from ...Kernel import host as host_port
 from ...Kernel import log as log_module
+from ...Kernel import peers as peers_module
 from ...Kernel import record as record_module
+from ...Kernel import session as session_module
 from ...Kernel import sync as sync_module
+from ...Kernel import topic as topic_module
 
 from . import mesh_ingest, shader_state, texture_publish
 
@@ -71,33 +74,73 @@ def _emit_to_painter(level_name, category, message):
         "RuriBridge/" + category, message)
 
 
+PEER = peers_module.SUBSTANCE
+
+
+class SubstanceHost(host_port.Host):
+    """This application, as the bridge uses it."""
+
+    @property
+    def name(self):
+        return PEER.name
+
+    @property
+    def capabilities(self):
+        return PEER.capabilities
+
+    def log(self, level, message):
+        getattr(LOG, level if level != host_port.WARNING else "warning")(message)
+
+    def schedule(self, seconds, function):
+        QtCore.QTimer.singleShot(int(seconds * 1000.0), function)
+
+    def redraw(self):
+        if _panel is not None:
+            _panel.refresh_slots()
+
+    def receive(self, topic, generation):
+        return _handle(topic, generation)
+
+    def collect(self, topic):
+        if topic is topic_module.SHADING and substance_painter.project.is_open():
+            return _values_by_texture_set(shader_state.parameter_values())
+        return None
+
+
+HOST = host_port.bind(SubstanceHost())
+
+
 class _Connection:
     """The one live attachment this Painter process holds."""
 
     def __init__(self):
-        self.arena = None
-        self.publisher = None
-        self.subscriber = None
-        self.state_writer = None
-        self.state_reader = None
+        self.session = None
 
     @property
     def is_open(self):
-        return self.arena is not None
+        return self.session is not None
+
+    @property
+    def arena(self):
+        return self.session.arena if self.session is not None else None
 
     def open(self, session):
         self.close()
-        self.arena = arena_module.Arena.open_session(record_module.CHANNELS, session=session)
-        self.publisher = channel_module.Publisher(self.arena, record_module.CHANNEL_TO_BLENDER)
-        self.subscriber = channel_module.Subscriber(self.arena, record_module.CHANNEL_TO_PAINTER)
+        self.session = session_module.Session.open(
+            HOST.name, HOST.capabilities, session=session)
         self._adopt_pending_work()
-        self.state_writer = channel_module.StateWriter(
-            self.arena, record_module.CHANNEL_STATE_TO_BLENDER)
-        self.state_reader = channel_module.StateReader(
-            self.arena, record_module.CHANNEL_STATE_TO_PAINTER)
-        self.state_reader.skip_to_latest()
-        LOG.info("attached to session %s at %s", session, self.arena.directory)
-        return self.arena
+        for endpoint in self.session.sources(topic_module.SHADING):
+            endpoint.reader.skip_to_latest()
+        for endpoint in self.session.sources(topic_module.PRESENCE):
+            endpoint.reader.skip_to_latest()
+        LOG.info("attached to session %s at %s", session, self.session.arena.directory)
+        return self.session.arena
+
+    def publisher(self, topic):
+        return self.session.publisher(topic)
+
+    def writer(self, topic):
+        return self.session.writer(topic)
 
     def _adopt_pending_work(self):
         """Decide what a fresh attachment owes the other side.
@@ -112,19 +155,19 @@ class _Connection:
             busy = substance_painter.project.is_open()
         except Exception:
             busy = False
-        if busy:
-            self.subscriber.skip_to_latest()
-        else:
-            self.subscriber.catch_up(record_module.KIND_MESH)
+        for one in topic_module.TOPICS:
+            for endpoint in self.session.sources(one):
+                if one.kind != topic_module.QUEUED:
+                    continue
+                if busy or one is not topic_module.MESH:
+                    endpoint.reader.skip_to_latest()
+                else:
+                    endpoint.reader.catch_up(None)
 
     def close(self):
-        if self.arena is not None:
-            self.arena.close()
-        self.arena = None
-        self.publisher = None
-        self.subscriber = None
-        self.state_writer = None
-        self.state_reader = None
+        if self.session is not None:
+            self.session.close()
+        self.session = None
 
 
 CONNECTION = _Connection()
@@ -150,22 +193,29 @@ def publish_project_state():
         return None
     state = texture_publish.current_project_state()
     state["host_executable"] = executable_path()
-    return CONNECTION.publisher.publish_record(state)
+    return CONNECTION.writer(topic_module.PRESENCE).write(state)
 
 
 def publish_shader_state():
-    """Tell Blender which shaders this project runs and what they expose."""
+    """Tell the others which shaders this project runs and what they expose.
+
+    The shape and the values are one record on one state topic: anything reading
+    the values needs the shape to make sense of them.
+    """
     if not CONNECTION.is_open or not substance_painter.project.is_open():
         return None
     state = shader_state.read_state()
-    return CONNECTION.publisher.publish_record(record_module.shader_state(
-        "painter", state["instances"], state["parameters"], state["assignment"]))
+    return CONNECTION.writer(topic_module.SHADING).write(record_module.shading(
+        HOST.name, _values_by_texture_set(shader_state.parameter_values()),
+        instances=state["instances"], parameters=state["parameters"],
+        assignment=state["assignment"]))
 
 
 def publish_textures(preset_name):
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
-    return texture_publish.publish(CONNECTION.arena, CONNECTION.publisher, preset_name)
+    return texture_publish.publish(
+        CONNECTION.arena, CONNECTION.publisher(topic_module.TEXTURES), preset_name)
 
 
 def _panel_icon():
@@ -317,7 +367,8 @@ class RuriBridgePanel(QtWidgets.QWidget):
         try:
             values = _values_by_texture_set(shader_state.parameter_values())
             _shader_gate.prime(shader_state.parameter_values())
-            CONNECTION.state_writer.write(record_module.shader_values("painter", values))
+            CONNECTION.writer(topic_module.SHADING).write(
+                record_module.shading(HOST.name, values))
         except Exception as error:
             LOG.error("could not send shader values: %s", error)
             self.set_status("send failed: {0}".format(error))
@@ -329,8 +380,8 @@ class RuriBridgePanel(QtWidgets.QWidget):
         if not CONNECTION.is_open:
             self.set_status("not attached")
             return
-        generation = CONNECTION.publisher.publish_record(
-            record_module.mesh_request("painter"))
+        generation = CONNECTION.publisher(topic_module.REQUEST).publish_record(
+            record_module.request(HOST.name, record_module.ASK_FOR_MESH))
         self.set_status("asked Blender for the scene, generation {0}".format(
             generation.number))
 
@@ -341,9 +392,9 @@ class RuriBridgePanel(QtWidgets.QWidget):
         if not CONNECTION.is_open:
             self.slot_label.setText("")
             return
-        blender = CONNECTION.arena.read_slot(record_module.CHANNEL_TO_PAINTER)
-        self.link_label.setText(
-            "Blender is attached" if blender.writer_is_live else "Blender is not attached")
+        self.link_label.setText(", ".join(
+            "{0} {1}".format(name, "attached" if here else "away")
+            for name, here in CONNECTION.session.attendance() if name != HOST.name))
         self.binding_label.setText(self._describe_binding())
         self.slot_label.setText("\n".join(
             "{0}: gen {1} ack {2} drop {3}".format(
@@ -448,8 +499,8 @@ def _publish_dirty_textures():
     if not dirty:
         return None
     generation = texture_publish.publish(
-        CONNECTION.arena, CONNECTION.publisher, _panel.preset_box.currentText(),
-        sorted(dirty), dirty)
+        CONNECTION.arena, CONNECTION.publisher(topic_module.TEXTURES),
+        _panel.preset_box.currentText(), sorted(dirty), dirty)
     _panel.set_status("live: sent {0} of {1}".format(
         ", ".join(sorted({channel for names in dirty.values() for channel in names})),
         ", ".join(sorted(dirty))))
@@ -511,15 +562,15 @@ def live_sync():
         LOG.info("watching shader values costs %.0f ms; asking again in %.1f s",
                  cost * 1000.0, cost * SHADER_POLL_DUTY)
     if _shader_gate.should_publish(values):
-        CONNECTION.state_writer.write(record_module.shader_values(
-            "painter", _values_by_texture_set(values)))
+        CONNECTION.writer(topic_module.SHADING).write(record_module.shading(
+            HOST.name, _values_by_texture_set(values)))
         _panel.set_status("live: sent shader values")
 
 
-def _handle(generation):
-    """Apply one generation. Returns True when Painter is now busy with it."""
+def _handle(topic, generation):
+    """Apply one arrival. Returns True when Painter is now busy with it."""
     global _mesh_deadline
-    if generation.kind == record_module.KIND_MESH:
+    if topic is topic_module.MESH:
         _pending_display_names.clear()
         _pending_display_names.update(
             {row["identity"]: row["name"] for row in generation.record.get("materials", [])
@@ -534,24 +585,32 @@ def _handle(generation):
         _panel.set_status("mesh generation {0}: {1} ({2})".format(
             generation.number, intent, mesh_ingest.describe_scene(generation)))
         return True
-    if generation.kind == record_module.KIND_EXPORT_REQUEST:
+    if topic is topic_module.REQUEST:
+        asked = generation.record.get("for")
+        if asked != record_module.ASK_FOR_TEXTURES:
+            raise RuntimeError(
+                "{0} asked for {1!r}, which this application does not answer".format(
+                    generation.record.get("source"), asked))
         preset = generation.record.get("preset_name") or _panel.preset_box.currentText()
         published = texture_publish.publish(
-            CONNECTION.arena, CONNECTION.publisher, preset,
+            CONNECTION.arena, CONNECTION.publisher(topic_module.TEXTURES), preset,
             generation.record.get("texture_sets"))
-        _panel.set_status("export request {0} answered with generation {1}".format(
+        _panel.set_status("texture request {0} answered with generation {1}".format(
             generation.number, published.number))
         return False
-    LOG.warning("ignoring generation %d of unknown kind %r",
-                generation.number, generation.kind)
-    return False
+    raise RuntimeError(
+        "nothing here receives {0!r} yet, and the topic says this application "
+        "hears it".format(topic.key))
 
 
 def take_shader_values():
     """Apply values arriving in the control block, and never echo them back."""
     if not CONNECTION.is_open or not substance_painter.project.is_open():
         return None
-    payload = CONNECTION.state_reader.take()
+    payload = None
+    for endpoint, arrived in CONNECTION.session.changed_state():
+        if endpoint.topic is topic_module.SHADING:
+            payload = arrived
     if payload is None:
         return None
     report = shader_state.apply_by_texture_set(
@@ -564,8 +623,8 @@ def take_shader_values():
     values = shader_state.parameter_values()
     _shader_gate.suppress(values)
     if refused:
-        CONNECTION.state_writer.write(record_module.shader_values(
-            "painter", _values_by_texture_set(values)))
+        CONNECTION.writer(topic_module.SHADING).write(record_module.shading(
+            HOST.name, _values_by_texture_set(values)))
         LOG.info("wrote back what actually stuck, because %s", ", ".join(refused))
     if _panel is not None:
         _panel.set_status("applied shader values: {0}".format(report["applied"] or "nothing"))
@@ -600,19 +659,19 @@ def pump():
         LOG.warning("mesh load never signalled ProjectEditionEntered within %.0fs; "
                     "resuming the channel", MESH_LOAD_DEADLINE_SECONDS)
         _mesh_deadline = None
-    CONNECTION.arena.touch(record_module.CHANNEL_TO_BLENDER)
+    CONNECTION.session.touch()
     if substance_painter.project.is_busy():
         return
     take_shader_values()
-    for generation in CONNECTION.subscriber.pending():
+    for endpoint, generation in CONNECTION.session.incoming():
         try:
-            became_busy = _handle(generation)
+            became_busy = _handle(endpoint.topic, generation)
         except Exception as error:
-            LOG.error("generation %d (%s) failed and is being skipped: %s",
-                      generation.number, generation.kind, error)
+            LOG.error("%s generation %d from %s failed and is being skipped: %s",
+                      endpoint.topic.key, generation.number, endpoint.peer, error)
             _panel.set_status("generation {0} failed: {1}".format(generation.number, error))
             became_busy = False
-        CONNECTION.subscriber.acknowledge(generation)
+        endpoint.reader.acknowledge(generation)
         if became_busy:
             break
     _panel.refresh_slots()
@@ -680,7 +739,8 @@ def _ask_blender_for_names():
     global _mesh_deadline
     _mesh_deadline = None
     publish_project_state()
-    CONNECTION.publisher.publish_record(record_module.mesh_request("painter"))
+    CONNECTION.publisher(topic_module.REQUEST).publish_record(
+        record_module.request(HOST.name, record_module.ASK_FOR_MESH))
 
 
 def _on_project_closed(_event):

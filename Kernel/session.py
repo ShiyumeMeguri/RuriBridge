@@ -30,6 +30,25 @@ from .log import logger
 LOG = logger("session")
 
 
+def _index_of(name):
+    """An application's roster position, which is its acknowledgement word.
+
+    Stable because the roster is part of the session's identity: a session built
+    from a different roster is rebuilt, so an index can never come to mean a
+    different application than the one that wrote it.
+    """
+    for index, peer in enumerate(peers_module.PEERS):
+        if peer.name == name:
+            return index
+    raise KeyError(name)
+
+
+def _listeners(topic, speaker):
+    """Who actually hears that speaker on that topic, as roster indices."""
+    return tuple(index for index, peer in enumerate(peers_module.PEERS)
+                 if peer.name != speaker and topic.heard_by(peer.capabilities))
+
+
 class Endpoint:
     """One application's end of one topic."""
 
@@ -56,14 +75,16 @@ class Session:
         self._publishers = {}
         self._writers = {}
         self._sources = {}
+        mine = _index_of(name)
         for one, own in topic_module.publications(name, self.capabilities):
             if one.kind == topic_module.QUEUED:
-                self._publishers[one.key] = channel_module.Publisher(arena, own)
+                self._publishers[one.key] = channel_module.Publisher(
+                    arena, own, listeners=_listeners(one, name))
             else:
                 self._writers[one.key] = channel_module.StateWriter(arena, own)
         for one, remote in topic_module.subscriptions(name, self.capabilities):
             speaker = remote.split("@", 1)[1]
-            reader = (channel_module.Subscriber(arena, remote)
+            reader = (channel_module.Subscriber(arena, remote, mine)
                       if one.kind == topic_module.QUEUED
                       else channel_module.StateReader(arena, remote))
             self._sources.setdefault(one.key, []).append(
@@ -72,6 +93,11 @@ class Session:
     # -- attaching ---------------------------------------------------------
     @classmethod
     def open(cls, name, capabilities, session=arena_module.DEFAULT_SESSION, root=None):
+        if len(peers_module.PEERS) > arena_module.MAX_LISTENERS:
+            raise arena_module.ArenaError(
+                "the roster has {0} applications and a slot holds {1} "
+                "acknowledgement words".format(
+                    len(peers_module.PEERS), arena_module.MAX_LISTENERS))
         arena = arena_module.Arena.open_session(
             topic_module.channels(), session=session, root=root)
         made = cls(arena, name, capabilities)

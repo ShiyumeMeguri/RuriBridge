@@ -65,6 +65,11 @@ SLOT_OFFSET_DROPPED = 64
 SLOT_OFFSET_WRITER_PROCESS = 72
 SLOT_OFFSET_INLINE_BYTES = 80
 SLOT_OFFSET_HEARTBEAT = 88
+#: One acknowledgement word per peer, in the tail of the slot. A slot is 128
+#: bytes and the fields above stop at 88, so four fit without the control block
+#: growing; the roster is checked against that when a session is built.
+SLOT_OFFSET_ACKNOWLEDGED_BY = 96
+MAX_LISTENERS = (SLOT_SIZE - SLOT_OFFSET_ACKNOWLEDGED_BY) // 8
 
 MAX_OUTSTANDING_GENERATIONS = 8
 SEQLOCK_READ_ATTEMPTS = 64
@@ -116,11 +121,11 @@ class SlotState:
 
     __slots__ = ("channel", "sequence", "generation", "payload_bytes",
                  "acknowledged_generation", "dropped_generations", "writer_process_id",
-                 "heartbeat")
+                 "heartbeat", "acknowledged_by")
 
     def __init__(self, channel, sequence, generation, payload_bytes,
                  acknowledged_generation, dropped_generations, writer_process_id,
-                 heartbeat=0):
+                 heartbeat=0, acknowledged_by=()):
         self.channel = channel
         self.sequence = sequence
         self.generation = generation
@@ -129,6 +134,22 @@ class SlotState:
         self.dropped_generations = dropped_generations
         self.writer_process_id = writer_process_id
         self.heartbeat = heartbeat
+        #: What each listener has taken, by roster index. The single
+        #: ``acknowledged_generation`` above is the oldest of them, which is what
+        #: retention has to respect.
+        self.acknowledged_by = tuple(acknowledged_by)
+
+    def taken_by(self, listeners):
+        """The oldest generation every one of those listeners has taken.
+
+        Zero when any of them has taken nothing: a payload is owed until the last
+        listener has it, and "nobody has read this yet" must not read as "all
+        caught up".
+        """
+        if not listeners:
+            return self.generation
+        return min(self.acknowledged_by[index] if index < len(self.acknowledged_by)
+                   else 0 for index in listeners)
 
     @property
     def writer_is_live(self):
@@ -355,9 +376,12 @@ class Arena:
             dropped = self._read_unsigned_64(base + SLOT_OFFSET_DROPPED)
             writer = _UNSIGNED_32.unpack_from(self._control, base + SLOT_OFFSET_WRITER_PROCESS)[0]
             heartbeat = self._read_unsigned_64(base + SLOT_OFFSET_HEARTBEAT)
+            taken = tuple(
+                self._read_unsigned_64(base + SLOT_OFFSET_ACKNOWLEDGED_BY + index * 8)
+                for index in range(MAX_LISTENERS))
             if self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE) == first:
                 return SlotState(channel, first, generation, payload_bytes,
-                                 acknowledged, dropped, writer, heartbeat)
+                                 acknowledged, dropped, writer, heartbeat, taken)
         raise ArenaError(
             "slot {0!r} never settled in {1} attempts; a writer is wedged mid-publish".format(
                 channel, SEQLOCK_READ_ATTEMPTS))
@@ -386,10 +410,23 @@ class Arena:
         self._write_unsigned_64(base + SLOT_OFFSET_HEARTBEAT, time.time_ns())
         _UNSIGNED_32.pack_into(self._control, base + SLOT_OFFSET_WRITER_PROCESS, os.getpid())
 
-    def acknowledge(self, channel, generation):
-        """Record how far the reader has consumed. One aligned store, no lock."""
+    def acknowledge(self, channel, generation, listener):
+        """Record how far ONE listener has consumed. One aligned store, no lock.
+
+        Its own word, so two listeners on the same channel cannot retire each
+        other's payload. The shared word beside them is kept as the high-water
+        mark any listener has reached -- it is what the diagnostics print, and it
+        must never be what retention trusts.
+        """
+        if not 0 <= listener < MAX_LISTENERS:
+            raise ArenaError(
+                "listener index {0} does not fit the {1} acknowledgement words a "
+                "slot holds".format(listener, MAX_LISTENERS))
         base = self._slot_base(channel)
-        self._write_unsigned_64(base + SLOT_OFFSET_ACKNOWLEDGED, generation)
+        self._write_unsigned_64(
+            base + SLOT_OFFSET_ACKNOWLEDGED_BY + listener * 8, generation)
+        if generation > self._read_unsigned_64(base + SLOT_OFFSET_ACKNOWLEDGED):
+            self._write_unsigned_64(base + SLOT_OFFSET_ACKNOWLEDGED, generation)
 
     def write_state(self, channel, payload):
         """Publish a small record entirely inside the mapped control block.

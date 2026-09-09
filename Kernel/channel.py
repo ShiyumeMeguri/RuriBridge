@@ -68,11 +68,18 @@ class Staging:
 
 
 class Publisher:
-    """The writing end of one channel."""
+    """The writing end of one channel.
 
-    def __init__(self, arena, channel):
+    ``listeners`` are the roster indices of everyone who hears this channel. A
+    payload is owed until every one of them has taken it, so retirement is a
+    minimum over exactly that set -- not over the roster, which would let an
+    application that never listens hold payloads forever.
+    """
+
+    def __init__(self, arena, channel, listeners=()):
         self.arena = arena
         self.channel = channel
+        self.listeners = tuple(listeners)
 
     def next_generation_number(self):
         state = self.arena.read_slot(self.channel)
@@ -133,7 +140,7 @@ class Publisher:
         leave that image dangling. Two survivors is the whole cost.
         """
         state = self.arena.read_slot(self.channel)
-        acknowledged = state.acknowledged_generation
+        acknowledged = state.taken_by(self.listeners)
         dropped = state.dropped_generations
         outstanding = []
         for number in self.arena.existing_generations(self.channel):
@@ -162,10 +169,17 @@ class Subscriber:
     generation published since, in order, rather than only the newest.
     """
 
-    def __init__(self, arena, channel):
+    def __init__(self, arena, channel, listener):
         self.arena = arena
         self.channel = channel
-        self._acknowledged = arena.read_slot(channel).acknowledged_generation
+        #: This consumer's own roster index. Its acknowledgement lives in its own
+        #: word, so two applications reading one channel cannot retire each
+        #: other's payloads -- which is what happened the first time a third
+        #: application attached.
+        self.listener = listener
+        state = arena.read_slot(channel)
+        self._acknowledged = (state.acknowledged_by[listener]
+                              if listener < len(state.acknowledged_by) else 0)
 
     @property
     def acknowledged_generation(self):
@@ -175,7 +189,7 @@ class Subscriber:
         """Treat everything already published as seen. Used when attaching."""
         state = self.arena.read_slot(self.channel)
         self._acknowledged = state.generation
-        self.arena.acknowledge(self.channel, self._acknowledged)
+        self.arena.acknowledge(self.channel, self._acknowledged, self.listener)
         return self._acknowledged
 
     def latest(self, kind=None):
@@ -214,7 +228,7 @@ class Subscriber:
         if newest is None:
             return self.skip_to_latest()
         self._acknowledged = max(self._acknowledged, newest.number - 1)
-        self.arena.acknowledge(self.channel, self._acknowledged)
+        self.arena.acknowledge(self.channel, self._acknowledged, self.listener)
         return self._acknowledged
 
     def pending(self):
@@ -247,7 +261,7 @@ class Subscriber:
         """
         self._acknowledged = max(self._acknowledged, generation.number
                                  if isinstance(generation, Generation) else generation)
-        self.arena.acknowledge(self.channel, self._acknowledged)
+        self.arena.acknowledge(self.channel, self._acknowledged, self.listener)
 
 
 class StateWriter:
