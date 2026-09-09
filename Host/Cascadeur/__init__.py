@@ -128,12 +128,11 @@ def _receive(topic, generation):
             generation.record.get("source"))
     if topic is topic_module.REQUEST:
         asked = generation.record.get("for")
+        if not topic_module.can_answer(asked, HOST.capabilities):
+            return None
         if asked == record_module.ASK_FOR_ANIMATION:
             return "published {0}".format(
                 publish(topic_module.ANIMATION).number)
-        raise RuntimeError(
-            "{0} asked for {1!r}, which this application does not answer".format(
-                generation.record.get("source"), asked))
     raise RuntimeError(
         "nothing here receives {0!r} yet, and the topic says this application "
         "hears it".format(topic.key))

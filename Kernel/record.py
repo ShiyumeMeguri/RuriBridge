@@ -182,29 +182,7 @@ def presence(source, is_open, project_path, mesh_path, texture_sets,
 
 
 def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
-            instances=(), parameters=None, assignment=None,
-            vocabulary_by_texture_set=None):
-    """The shading stack: what it IS and what its values ARE, in one record.
-
-    These were two publications on two channels with two lifetimes -- the shape
-    queued, the values latest-wins -- for one subject. Anything that reads the
-    values needs the shape to make sense of them, and anything that reads the
-    shape without values has nothing to do with it. Latest-wins is right for
-    both: a shader instance list replaced before the other side looked was never
-    news either.
-    """
-    record = _values(source, values_by_texture_set, shader_url_by_texture_set,
-                     vocabulary_by_texture_set)
-    record.update({
-        "instances": list(instances),
-        "parameters": parameters or {},
-        "assignment": assignment or {},
-    })
-    return record
-
-
-def _values(source, values_by_texture_set, shader_url_by_texture_set=None,
-            vocabulary_by_texture_set=None):
+            vocabulary_by_texture_set=None, shader_name_by_texture_set=None):
     """Either way: the current value of every watched uniform, and nothing else.
 
     This is the record that rides in the control block rather than in a
@@ -226,12 +204,20 @@ def _values(source, values_by_texture_set, shader_url_by_texture_set=None,
     between "your shader does not expose these hundred and thirty six names" and
     "these values are for a shader nobody here is running", and only one of those
     two sentences tells somebody what to do about it.
+
+    The shader's own declaration -- every parameter's label, widget and help text
+    -- is deliberately NOT here. Nothing ever read it, and on a character with a
+    generated shader on every Texture Set it is two megabytes against a control
+    block that holds half of one: the publish raised, and the state that mattered
+    never crossed at all. A name per Texture Set is the whole of the shape a
+    receiver needs.
     """
     record = _base("shade", source)
     record.update({
         "by_texture_set": values_by_texture_set,
         "shader_url_by_texture_set": shader_url_by_texture_set or {},
         "vocabulary_by_texture_set": vocabulary_by_texture_set or {},
+        "shader_name_by_texture_set": shader_name_by_texture_set or {},
     })
     return record
 

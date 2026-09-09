@@ -227,6 +227,7 @@ def _declared_row(material):
         for key in group.keys():
             row[spelling.format(key)] = _plain(group[key])
     return {"shader": str(declaration.get("shader") or ""),
+            "name": str(declaration.get("name") or ""),
             "variant": str(declaration.get("variant") or ""),
             "parameters": row}
 
@@ -243,7 +244,8 @@ def _material_row(material, fresh=()):
            "identity_is_new": material.name in fresh}
     declared = _declared_row(material)
     if declared is not None:
-        row["shading"] = {"shader": declared["shader"], "variant": declared["variant"]}
+        row["shading"] = {"shader": declared["shader"], "name": declared["name"],
+                          "variant": declared["variant"]}
         properties = declared["parameters"]
     else:
         properties = {}
@@ -550,14 +552,26 @@ def write_glb(arena, path, objects):
     return scene_description
 
 
-def _materials_of(objects):
-    """Every distinct material in scope, in a stable order."""
-    seen = {}
+def materials_in(objects, gathered):
+    """The materials the payload actually contains, in a stable order.
+
+    A slot no triangle uses does not reach the other side: the GLB has no
+    primitive for it, so the consumer builds nothing for it, and a row describing
+    it is a row about something that was not sent. Worse than useless -- the
+    consumer reports it as a material it has no place for, which reads as the two
+    sides disagreeing about the model when nothing is wrong at all.
+    """
+    wanted = {identity for entry in gathered for identity, _indices in entry.primitives}
+    found = {}
     for object_reference in objects:
         for slot in object_reference.material_slots:
-            if slot.material is not None:
-                seen.setdefault(slot.material.name, slot.material)
-    return [seen[name] for name in sorted(seen)]
+            material = slot.material
+            if material is None:
+                continue
+            identity = identity_of(material)
+            if identity in wanted:
+                found.setdefault(identity, material)
+    return [found[identity] for identity in sorted(found)]
 
 
 def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
@@ -580,15 +594,16 @@ def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
     with publisher.staging() as staging:
         scene_description = write_glb(
             arena, staging.path(record_module.SCENE_FILE_NAME), gathered)
+        sent = materials_in(objects_to_send, gathered)
         # A live tick names what changed; a manual send names nothing. Only the
         # second one is somebody asking for everything, and the textures are the
         # expensive half of everything.
-        materials = _materials_of(objects_to_send) if changed is None else ()
+        materials = sent if changed is None else ()
         return staging.publish(record_module.mesh(
             source="Blender",
             intent=intent,
             scene=scene_description,
-            materials=collect_material_rows(objects_to_send, fresh),
+            materials=[_material_row(material, fresh) for material in sent],
             unit_scale=unit_scale,
             up_axis="Z",
             binding_record=binding,

@@ -357,26 +357,19 @@ def command_push_shader_values(arguments):
 def command_shaders(arguments):
     """What Painter last said about its shaders, from outside both hosts."""
     with _open(arguments) as arena:
-        subscriber = channel_module.Subscriber(
-            arena, topic_module.TEXTURES.channel(peers_module.SUBSTANCE.name),
-            _roster_index(peers_module.BLENDER.name))
-        generation = subscriber.latest("shade")
-        if generation is None:
+        payload, generation = arena.read_state(
+            topic_module.SHADING.channel(peers_module.SUBSTANCE.name))
+        if payload is None:
             print("Painter has not published a shader state")
             return 1
-        payload = generation.record
-        print("generation {0}".format(generation.number))
-        for entry in payload["instances"]:
-            print("instance {0}  {1}  ({2})".format(entry["id"], entry["label"], entry["shader"]))
-            for texture_set, body in sorted(
-                    payload["assignment"].get("texturesets", {}).items()):
-                if body.get("shader") == entry["label"]:
-                    print("  texture set {0}".format(texture_set))
-            for name, item in sorted(payload["parameters"].get(str(entry["id"]), {}).items()):
+        print("generation {0}".format(generation))
+        running = payload.get("shader_name_by_texture_set") or {}
+        for texture_set, values in sorted((payload.get("by_texture_set") or {}).items()):
+            print("{0}  ({1})".format(texture_set, running.get(texture_set) or "?"))
+            for name, value in sorted(values.items()):
                 if arguments.name and arguments.name not in name:
                     continue
-                print("  {0:<32} {1:<8} {2}".format(
-                    name, item["description"]["dataType"], item.get("value")))
+                print("  {0:<32} {1}".format(name, value))
     return 0
 
 

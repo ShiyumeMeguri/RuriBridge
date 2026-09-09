@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from . import host as host_port
 from . import peers as peers_module
+from . import record as record_module
 
 #: Every publication is kept until the consumer acknowledges it: a model nobody
 #: has taken yet is still owed.
@@ -124,6 +125,30 @@ REQUEST = Topic(
     description="A request aimed at another application")
 
 TOPICS = (MESH, TEXTURES, ANIMATION, SHADING, PRESENCE, REQUEST)
+
+#: What answering each errand takes. A request is published to the room and every
+#: application hears it, so an application seeing one it cannot answer is the
+#: ordinary case rather than a failure -- there is no addressee field precisely
+#: so that whoever CAN answer does, and a fourth application answers the ones it
+#: has the capability for without anybody editing a list of names.
+ANSWERED_WITH = {
+    record_module.ASK_FOR_MESH: host_port.SCENE_GRAPH,
+    record_module.ASK_FOR_TEXTURES: host_port.TEXTURE_SETS,
+    record_module.ASK_FOR_ANIMATION: host_port.ANIMATION,
+}
+
+
+def can_answer(asked_for, capabilities):
+    """Whether an application with these capabilities is the one being asked.
+
+    An errand nobody declared is a different matter: it is a record this build
+    does not understand, and saying so is the point of raising.
+    """
+    if asked_for not in ANSWERED_WITH:
+        raise KeyError(
+            "no capability answers a request for {0!r}; this build knows {1}".format(
+                asked_for, ", ".join(sorted(ANSWERED_WITH))))
+    return ANSWERED_WITH[asked_for] in capabilities
 
 
 def by_key(key):

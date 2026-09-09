@@ -261,7 +261,7 @@ def push_shader_parameters(context, scope="SELECTED"):
     """
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
-    values, vocabulary = _offer(mesh_publish.collect_material_rows(
+    values, vocabulary, named = _offer(mesh_publish.collect_material_rows(
         objects_in_scope(context, scope)))
     if not values:
         raise RuntimeError(
@@ -269,15 +269,18 @@ def push_shader_parameters(context, scope="SELECTED"):
     SHADER_GATE.prime(values)
     return CONNECTION.writer(topic_module.SHADING).write(
         record_module.shading(HOST.name, values,
-                              vocabulary_by_texture_set=vocabulary))
+                              vocabulary_by_texture_set=vocabulary,
+                              shader_name_by_texture_set=named))
 
 
 def _offer(rows):
-    """What to send, and whose vocabulary it is in."""
+    """What to send, whose vocabulary it is in, and what that shader is called."""
     values = {row["identity"]: row["properties"] for row in rows if row.get("properties")}
     vocabulary = {row["identity"]: row["shading"]["shader"] for row in rows
                   if row.get("shading", {}).get("shader")}
-    return values, vocabulary
+    named = {row["identity"]: row["shading"]["name"] for row in rows
+             if row.get("shading", {}).get("name")}
+    return values, vocabulary, named
 
 
 def watched_objects(settings):
@@ -300,11 +303,12 @@ def live_sync(settings):
     if not CONNECTION.is_open or not settings.live_sync or not CONNECTION.has_published:
         return None
     if settings.live_shader_values:
-        values, vocabulary = material_offer(settings)
+        values, vocabulary, named = material_offer(settings)
         if SHADER_GATE.should_publish(values):
             CONNECTION.writer(topic_module.SHADING).write(
                 record_module.shading(HOST.name, values,
-                                      vocabulary_by_texture_set=vocabulary))
+                                      vocabulary_by_texture_set=vocabulary,
+                                      shader_name_by_texture_set=named))
             return "sent {0} shader value(s)".format(
                 sum(len(entry) for entry in values.values()))
     if settings.live_mesh and bpy.context.mode == "OBJECT":
@@ -478,12 +482,11 @@ def _receive(topic, generation, bind=True):
                                   generation.number))
     if topic is topic_module.REQUEST:
         asked = generation.record.get("for")
+        if not topic_module.can_answer(asked, HOST.capabilities):
+            return None
         if asked == record_module.ASK_FOR_MESH:
             return publish_mesh(bpy.context, settings_scope(),
                                 record_module.INTENT_AUTO, True).number
-        raise RuntimeError(
-            "{0} asked for {1!r}, which this application does not answer".format(
-                generation.record.get("source"), asked))
     raise RuntimeError(
         "nothing here receives {0!r} yet, and the topic says this application "
         "hears it".format(topic.key))
@@ -495,6 +498,18 @@ def publish_animation(context, scope="SELECTED"):
     Blender's own exporter writes it, for the same reason its importer reads the
     way back: a second writer for a format the application already writes is a
     second set of rounding.
+
+    **The performance is the one on the rig**, not every action the document
+    happens to contain. Exporting all of them re-bakes clips nobody asked to
+    send: a character file keeps the takes it has been given, and one 950-frame
+    take across five hundred bones took two minutes off every send while the
+    thing actually being handed over was four keyframes. It also put those takes
+    in front of the other application, which was never the intent.
+
+    Sampling stays on. A bone moved by a constraint has no curve at all -- the
+    whole point of a rig is that most bones are driven rather than keyed -- so
+    the keys alone are not the performance, and a payload built from them arrives
+    with the cloth and the limbs standing still.
     """
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
@@ -504,7 +519,7 @@ def publish_animation(context, scope="SELECTED"):
         bpy.ops.export_scene.gltf(
             filepath=str(target), export_format="GLB",
             use_selection=scope == "SELECTED", export_animations=True,
-            export_animation_mode="ACTIONS", export_skins=True,
+            export_animation_mode="ACTIVE_ACTIONS", export_skins=True,
             export_yup=True, export_apply=False)
         if not target.exists():
             raise RuntimeError("the glTF exporter wrote nothing to {0}".format(target))

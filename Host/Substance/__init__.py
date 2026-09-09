@@ -22,6 +22,7 @@ import time
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import substance_painter.event
+import substance_painter.exception
 import substance_painter.logging
 import substance_painter.project
 import substance_painter.textureset
@@ -42,6 +43,19 @@ LOG = log_module.logger("painter")
 
 SESSION_ENVIRONMENT_VARIABLE = "RURI_BRIDGE_SESSION"
 
+#: Painter holds a lock on the project while it writes it out, and answers
+#: nothing at all while it does. An autosave to the recovery folder takes that
+#: lock like any other save, so it lands on an ordinary timer tick with no
+#: warning. There is nothing to ask: ``is_busy`` is a different state and stays
+#: False right through it, and the lock has no query of its own -- the only way
+#: to learn is to be told, by name, in the exception.
+PROJECT_LOCKED_PHRASE = "locked"
+
+
+def project_is_locked(error):
+    return (isinstance(error, substance_painter.exception.ProjectError)
+            and PROJECT_LOCKED_PHRASE in str(error).lower())
+
 
 def package_root():
     """Where the package this leg came from actually is.
@@ -52,16 +66,27 @@ def package_root():
     """
     here = os.path.dirname(os.path.realpath(__file__))
     return os.path.dirname(os.path.dirname(here))
-POLL_MILLISECONDS = 250
+
+
+#: How often the bridge looks at the mapped control block. This is the grain of
+#: everything it notices, so it wants to be shorter than somebody can perceive --
+#: an edit over there should be here before they look up. An idle tick reads a
+#: dozen integers out of pages this process already has mapped and asks the
+#: application two questions about itself: measured at 0.05 ms, which at this
+#: interval is under a tenth of a percent of one core. Everything expensive is
+#: behind a change gate, so a shorter interval buys latency and not work.
+POLL_MILLISECONDS = 60
 DEFAULT_TEXTURE_RESOLUTION = 2048
 MESH_LOAD_DEADLINE_SECONDS = 600.0
 SHADER_QUIET_SECONDS = 0.35
 TEXTURE_QUIET_SECONDS = 0.9
 SHADER_POLL_DUTY = 20.0
-#: However cheap the answer is, never ask more often than the pump that would
-#: carry it: a poll whose result cannot leave before the next one is work with
-#: nowhere to go.
-SHADER_POLL_FLOOR_TICKS = 1.0
+#: However cheap the answer is, never ask more often than this many pump ticks.
+#: A poll whose result cannot leave before the next one is work with nowhere to
+#: go, and the pump's own period is short enough now that "one tick" would let a
+#: cheap project poll sixteen times a second for an answer that changes when
+#: somebody drags a slider.
+SHADER_POLL_FLOOR_TICKS = 4.0
 #: A cost has to move by this much, in milliseconds, before it is worth saying so.
 #: The old test was a ratio, and one millisecond against three is a 200% change
 #: every single time.
@@ -111,7 +136,7 @@ class SubstanceHost(host_port.Host):
 
     def collect(self, topic):
         if topic is topic_module.SHADING and substance_painter.project.is_open():
-            return _values_by_texture_set(shader_state.parameter_values())
+            return shader_state.values_by_texture_set()
         return None
 
 
@@ -205,18 +230,17 @@ def publish_project_state():
 
 
 def publish_shader_state():
-    """Tell the others which shaders this project runs and what they expose.
+    """Tell the others what this project's shaders are set to, and which they are.
 
     The shape and the values are one record on one state topic: anything reading
-    the values needs the shape to make sense of them.
+    the values needs the shape to make sense of them -- and the shape is a shader
+    name per Texture Set, not the shader's whole declaration.
     """
     if not CONNECTION.is_open or not substance_painter.project.is_open():
         return None
-    state = shader_state.read_state()
     return CONNECTION.writer(topic_module.SHADING).write(record_module.shading(
-        HOST.name, _values_by_texture_set(shader_state.parameter_values()),
-        instances=state["instances"], parameters=state["parameters"],
-        assignment=state["assignment"]))
+        HOST.name, shader_state.values_by_texture_set(),
+        shader_name_by_texture_set=shader_state.shader_by_texture_set()))
 
 
 def publish_textures(preset_name):
@@ -373,8 +397,8 @@ class RuriBridgePanel(QtWidgets.QWidget):
             self.set_status("no project open")
             return
         try:
-            values = _values_by_texture_set(shader_state.parameter_values())
-            _shader_gate.prime(shader_state.parameter_values())
+            values = shader_state.values_by_texture_set()
+            _shader_gate.prime(values)
             CONNECTION.writer(topic_module.SHADING).write(
                 record_module.shading(HOST.name, values))
         except Exception as error:
@@ -472,6 +496,10 @@ _dirty_textures = set()
 _texture_serial = 0
 _shader_poll_cost = None
 _shader_poll_due = 0.0
+#: Something happened that changes what this project is -- a save, most of the
+#: time -- and it happened at a moment the project could not be asked about it.
+#: The pump says it on the first tick that can.
+_project_state_due = False
 _pending_display_names = {}
 #: The generation whose textures still have to be put in, once the project holds
 #: the mesh they came with. Cleared when they are applied, so a reload that
@@ -519,28 +547,6 @@ def _publish_dirty_textures():
     return generation
 
 
-def _values_by_texture_set(values_by_label):
-    """Re-key the shader instances' values by the Texture Sets that run them.
-
-    Keyed by identity, which is what the other side addresses materials with;
-    instance labels mean nothing over there, and several Texture Sets can share
-    one instance.
-    """
-    identity_by_display = {
-        texture_set.name: texture_set.original_name
-        for texture_set in substance_painter.textureset.all_texture_sets()}
-    by_texture_set = {}
-    for display, body in shader_state.assignment().get("texturesets", {}).items():
-        groups = values_by_label.get(body.get("shader"))
-        if not groups:
-            continue
-        flattened = {}
-        for members in groups.values():
-            flattened.update(members)
-        by_texture_set[identity_by_display.get(display, display)] = flattened
-    return by_texture_set
-
-
 def live_sync():
     """Publish what changed on this side, once it has stopped changing.
 
@@ -566,7 +572,7 @@ def live_sync():
     if not _panel.live_values_enabled() or time.monotonic() < _shader_poll_due:
         return
     started = time.monotonic()
-    values = shader_state.parameter_values()
+    values = shader_state.values_by_texture_set()
     cost = time.monotonic() - started
     interval = max(cost * SHADER_POLL_DUTY,
                    POLL_MILLISECONDS / 1000.0 * SHADER_POLL_FLOOR_TICKS)
@@ -579,8 +585,8 @@ def live_sync():
         LOG.info("watching shader values costs %.0f ms; asking again in %.1f s",
                  cost * 1000.0, interval)
     if _shader_gate.should_publish(values):
-        CONNECTION.writer(topic_module.SHADING).write(record_module.shading(
-            HOST.name, _values_by_texture_set(values)))
+        CONNECTION.writer(topic_module.SHADING).write(
+            record_module.shading(HOST.name, values))
         _panel.set_status("live: sent shader values")
 
 
@@ -605,10 +611,8 @@ def _handle(topic, generation):
         return True
     if topic is topic_module.REQUEST:
         asked = generation.record.get("for")
-        if asked != record_module.ASK_FOR_TEXTURES:
-            raise RuntimeError(
-                "{0} asked for {1!r}, which this application does not answer".format(
-                    generation.record.get("source"), asked))
+        if not topic_module.can_answer(asked, HOST.capabilities):
+            return False
         preset = generation.record.get("preset_name") or _panel.preset_box.currentText()
         published = texture_publish.publish(
             CONNECTION.arena, CONNECTION.publisher(topic_module.TEXTURES), preset,
@@ -619,6 +623,23 @@ def _handle(topic, generation):
     raise RuntimeError(
         "nothing here receives {0!r} yet, and the topic says this application "
         "hears it".format(topic.key))
+
+
+#: How many refused names to name. A material sheet accumulates every property
+#: anybody ever set on it, so most of an offer is history the shader never had --
+#: hundreds of names per Texture Set, times a scene's worth of them. The count is
+#: the fact; a handful of names says which kind they are.
+REFUSED_NAMES_SHOWN = 6
+
+
+def _say_what_was_refused(label, by_texture_set):
+    """One line for a whole category, not one line per name per material."""
+    if not by_texture_set:
+        return
+    names = sorted({name for entry in by_texture_set.values() for name in entry})
+    LOG.warning("shader values %s: %d name(s) across %d material(s), e.g. %s",
+                label, len(names), len(by_texture_set),
+                ", ".join(names[:REFUSED_NAMES_SHOWN]))
 
 
 def take_shader_values():
@@ -634,22 +655,29 @@ def take_shader_values():
     report = shader_state.apply_by_texture_set(
         payload.get("by_texture_set", {}),
         payload.get("shader_url_by_texture_set"),
-        payload.get("vocabulary_by_texture_set"))
+        payload.get("vocabulary_by_texture_set"),
+        payload.get("shader_name_by_texture_set"))
     for texture_set, wanted in sorted(report["wrong_shader"].items()):
         LOG.warning("%s speaks %r and the shader it runs exposes none of it; give that "
                     "Texture Set the shader for %s and the values land",
                     texture_set, wanted, wanted)
+    for name, why in sorted(report["no_shader"].items()):
+        LOG.warning("a material asks for the shader %r and %s; put it in a shelf and "
+                    "the values land on the next send", name, why)
     refused = [label for label in ("unknown", "mismatched", "conflicting", "unmapped",
-                                   "wrong_shader")
+                                   "wrong_shader", "no_shader")
                if report[label]]
-    for label in refused:
-        if label != "wrong_shader":
-            LOG.warning("shader values %s: %s", label, report[label])
-    values = shader_state.parameter_values()
+    for label in ("unknown", "mismatched", "conflicting"):
+        _say_what_was_refused(label, report[label])
+    if report["unmapped"]:
+        LOG.warning("shader values for %d material(s) this project has no Texture Set "
+                    "for: %s", len(report["unmapped"]),
+                    ", ".join(report["unmapped"][:4]))
+    values = shader_state.values_by_texture_set()
     _shader_gate.suppress(values)
     if refused:
-        CONNECTION.writer(topic_module.SHADING).write(record_module.shading(
-            HOST.name, _values_by_texture_set(values)))
+        CONNECTION.writer(topic_module.SHADING).write(
+            record_module.shading(HOST.name, values))
         LOG.info("wrote back what actually stuck, because %s", ", ".join(refused))
     if _panel is not None:
         _panel.set_status("applied shader values: {0}".format(report["applied"] or "nothing"))
@@ -703,10 +731,16 @@ def pump():
 
 
 def _on_timer():
+    global _project_state_due
     try:
+        if _project_state_due and not substance_painter.project.is_busy():
+            publish_project_state()
+            _project_state_due = False
         pump()
         live_sync()
     except Exception as error:
+        if project_is_locked(error):
+            return
         LOG.error("pump failed: %s", error)
         if _panel is not None:
             _panel.set_status("pump failed: {0}".format(error))
@@ -738,7 +772,7 @@ def _on_project_settled():
     global _mesh_deadline
     _mesh_deadline = None
     try:
-        _shader_gate.prime(shader_state.parameter_values())
+        _shader_gate.prime(shader_state.values_by_texture_set())
     except shader_state.ShaderStateError as error:
         LOG.error("could not adopt the shader values: %s", error)
     if _pending_display_names:
@@ -784,13 +818,20 @@ def _on_project_closed(_event):
 
 
 def _on_project_saved(_event):
-    """Tell Blender where the project now lives, so the scene can bind to it.
+    """The project may have acquired a path. Say so as soon as it can be asked.
 
     Saving is the only moment a project acquires a path, and it is somebody
     pressing a key in Painter, not anything the bridge drives. Publishing the
-    state here is how the other side learns a path it never chose.
+    state is how the other side learns a path it never chose.
+
+    Not from here, though: this fires while Painter still holds the save lock, so
+    reading the project raises -- and an autosave fires it too, four times an
+    hour, on a project whose path did not change at all. Nothing about a path is
+    urgent and the pump runs four times a second, so the read waits for a tick
+    where the project is answering.
     """
-    publish_project_state()
+    global _project_state_due
+    _project_state_due = True
 
 
 def show_panel():
