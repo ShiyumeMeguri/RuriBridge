@@ -100,7 +100,10 @@ class _Connection:
             HOST.name, HOST.capabilities, session=session, root=root)
         for one in topic_module.TOPICS:
             for endpoint in self.session.sources(one):
-                endpoint.reader.skip_to_latest()
+                if one.kind == topic_module.QUEUED:
+                    endpoint.reader.catch_up(None)
+                else:
+                    endpoint.reader.skip_to_latest()
         LOG.info("attached to session %s at %s", session, self.session.arena.directory)
         return self.session.arena
 
@@ -725,30 +728,12 @@ class RURIBRIDGE_OT_locate_cascadeur(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class RURIBRIDGE_OT_send_rig(bpy.types.Operator):
-    bl_idname = "ruri_bridge.send_rig"
-    bl_label = "Send Rig to Cascadeur"
-    bl_description = ("Publish the selected objects as the model, then summon "
-                      "Cascadeur to take it. The model is authored here and only "
-                      "here; what comes back is the performance")
-
-    def execute(self, context):
-        try:
-            generation = publish_mesh(context, settings_scope(),
-                                      record_module.INTENT_AUTO, True)
-        except Exception as error:
-            self.report({"ERROR"}, str(error))
-            return {"CANCELLED"}
-        knocked = _summon_cascadeur()
-        self.report({"INFO"}, "sent the rig, generation {0}{1}".format(
-            generation.number, "; summoned Cascadeur" if knocked else ""))
-        return {"FINISHED"}
-
-
 class RURIBRIDGE_OT_send_animation(bpy.types.Operator):
     bl_idname = "ruri_bridge.send_animation"
-    bl_label = "Send Animation to Cascadeur"
-    bl_description = "Publish the performance on the selection, then summon Cascadeur"
+    bl_label = "Send Rig and Animation to Cascadeur"
+    bl_description = ("Publish the selected rig and what it is doing, then summon\n"
+                      "Cascadeur. The skeleton travels with the performance: a\n"
+                      "performance without the bones it is keyed to is not one")
 
     def execute(self, context):
         try:
@@ -757,7 +742,7 @@ class RURIBRIDGE_OT_send_animation(bpy.types.Operator):
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
         knocked = _summon_cascadeur()
-        self.report({"INFO"}, "sent the performance, generation {0}{1}".format(
+        self.report({"INFO"}, "sent the rig and its animation, generation {0}{1}".format(
             generation.number, "; summoned Cascadeur" if knocked else ""))
         return {"FINISHED"}
 
@@ -1017,7 +1002,6 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         animation = layout.column(align=True)
         animation.enabled = CONNECTION.is_open
         animation.label(text="Animation", icon="ARMATURE_DATA")
-        animation.operator(RURIBRIDGE_OT_send_rig.bl_idname, icon="OUTLINER_OB_ARMATURE")
         animation.operator(RURIBRIDGE_OT_send_animation.bl_idname, icon="ACTION")
         animation.operator(RURIBRIDGE_OT_fetch_animation.bl_idname, icon="IMPORT")
         if not _cascadeur_hint() and not summon_module.locate(peers_module.CASCADEUR):
@@ -1054,8 +1038,8 @@ class RURIBRIDGE_PT_diagnostics(bpy.types.Panel):
 
 
 _CLASSES = (RuriBridgeSettings, RURIBRIDGE_OT_locate_painter,
-            RURIBRIDGE_OT_locate_cascadeur, RURIBRIDGE_OT_send_rig,
-            RURIBRIDGE_OT_send_animation, RURIBRIDGE_OT_fetch_animation,
+            RURIBRIDGE_OT_locate_cascadeur, RURIBRIDGE_OT_send_animation,
+            RURIBRIDGE_OT_fetch_animation,
             RuriBridgePreferences,
             RURIBRIDGE_OT_launch_painter, RURIBRIDGE_OT_reconnect,
             RURIBRIDGE_OT_publish_mesh, RURIBRIDGE_OT_request_export,

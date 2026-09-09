@@ -20,11 +20,10 @@ a first-class door (measured on the real installation: ``process_import`` and
 intermediate format and no temporary file: the path handed to it is inside the
 session, so the bytes it reads are pages the publisher already wrote.
 
-A performance arrives as **channels against names**, applied onto the rig that is
-already here (``is_update_mode``), never as a skeleton to rebuild. Rebuilding one
-would hand this application a second, differently-oriented copy of the bones it
-is already animating, and every round trip would rotate the axes a little
-further.
+The rig arrives WITH the performance -- a performance without the skeleton it is
+keyed to is not one -- and what goes back is the performance on that same rig.
+Which of it the authoring application uses is its business: it has the rig
+already, so it takes the channels by name and leaves the bones alone.
 """
 
 from __future__ import annotations
@@ -97,11 +96,12 @@ def domain_scene():
 # ---------------------------------------------------------------------------
 # Receiving
 # ---------------------------------------------------------------------------
-def _import_options(with_animation, with_objects, onto_what_is_here):
+def _import_options(with_animation, with_objects):
+    """The rig and its performance together: the skeleton is what the curves are
+    keyed to, so taking one without the other leaves nothing that can move."""
     options = csc.glb.ImportOptions()
     options.include_animation = with_animation
     options.include_objects = with_objects
-    options.is_update_mode = onto_what_is_here
     options.throw_exception = True
     options.scale_factor = CENTIMETRES_PER_METRE
     return options
@@ -119,20 +119,12 @@ def _payload_path(generation):
 
 
 def _receive(topic, generation):
-    if topic is topic_module.MESH:
-        path = _payload_path(generation)
-        csc.glb.process_import(
-            domain_scene(), path,
-            _import_options(with_animation=False, with_objects=True,
-                            onto_what_is_here=False))
-        return "imported the model from {0}".format(generation.record.get("source"))
     if topic is topic_module.ANIMATION:
         path = _payload_path(generation)
         csc.glb.process_import(
             domain_scene(), path,
-            _import_options(with_animation=True, with_objects=False,
-                            onto_what_is_here=True))
-        return "applied the performance from {0} onto what is already here".format(
+            _import_options(with_animation=True, with_objects=True))
+        return "took the rig and its performance from {0}".format(
             generation.record.get("source"))
     if topic is topic_module.REQUEST:
         asked = generation.record.get("for")

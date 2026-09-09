@@ -87,17 +87,20 @@ TEXTURES = Topic(
     "tex", QUEUED, speaks=host_port.TEXTURE_SETS, hears=host_port.NODE_MATERIALS,
     description="Baked texture channels, per material")
 
-#: An authored performance. Both ends need an animation surface, and a texturing
-#: tool has none -- it says so rather than being special-cased.
+#: The rig and what it is doing. Both ends need an animation surface, and a
+#: texturing tool has none -- it says so rather than being special-cased.
 #:
-#: What crosses is CHANNELS AGAINST NAMES, never a skeleton to rebuild. The
-#: receiving side already has the rig; re-importing one would hand it a second,
-#: differently-oriented copy of the bones it is already animating, and every
-#: round trip would rotate the axes a little further. Applying curves onto the
-#: rig that is already there is also what makes one payload format enough.
+#: The skeleton travels WITH the performance because a performance without the
+#: bones it is keyed to is not one, and the model channel next door carries
+#: geometry and materials for a texturing tool -- no skeleton in it at all.
+#:
+#: Coming back, what is USED is the channels against the names: the authoring
+#: side already has the rig, and rebuilding one from the payload would leave a
+#: second, differently-oriented copy of those bones beside the first, with every
+#: round trip rotating the axes a little further.
 ANIMATION = Topic(
     "anim", QUEUED, speaks=host_port.ANIMATION, hears=host_port.ANIMATION,
-    description="A performance, as channels keyed by the names both sides share")
+    description="A rig and what it is doing, keyed by the names both sides share")
 
 #: The knobs of the shading stack, both ways. Latest-wins: a slider drag is one
 #: value that keeps changing, not a queue of values owed.

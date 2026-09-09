@@ -100,13 +100,14 @@ SUBSTANCE = Peer(
     plugin_subpath=("python", "plugins"),
     executable_name="Adobe Substance 3D Painter.exe")
 
-#: An animation tool. It TAKES the rig -- it has to have one to animate -- and
-#: what it has to say back is the performance and nothing else. The model has one
-#: author, and it is not this application: it cannot change a mesh, so a mesh
-#: leaving here could only be a worse copy of the one that arrived.
+#: An animation tool. The rig it needs arrives WITH the performance -- a
+#: performance without the skeleton it is keyed to is not one -- so it has no use
+#: for the model channel, whose payload is geometry and materials for a texturing
+#: tool. And nothing goes back but the performance: the model has one author and
+#: it is not this application.
 CASCADEUR = Peer(
     "Cascadeur", "Cascadeur",
-    capabilities=(host_port.ANIMATION, host_port.MODEL_INTAKE),
+    capabilities=(host_port.ANIMATION,),
     resident=False,
     attach=ATTACH_COPY,
     plugin_subpath=("resources", "scripts", "python", "commands", "ruri"),
