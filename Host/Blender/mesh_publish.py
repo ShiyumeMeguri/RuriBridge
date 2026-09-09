@@ -243,8 +243,14 @@ def _declared_row(material):
         group = material.get(group_name)
         if group is None:
             continue
-        for key in group.keys():
-            row[spelling.format(key)] = _plain(group[key])
+        # One conversion of the whole group, not a lookup per name: asking for
+        # the keys and then for each key's value walks the property tree once
+        # per name, and a character's worth of materials is five thousand of
+        # them on every live tick. The plain spelling is the common one and is
+        # the key itself, so it skips the formatting too.
+        plain = spelling == "{0}"
+        for key, value in dict(group).items():
+            row[key if plain else spelling.format(key)] = _plain(value)
     # Values the material has for its shader that are not in any of its property
     # groups, because on this side they are not parameters at all. The part a
     # material belongs to is the one that matters: this application compiles a
@@ -302,14 +308,23 @@ def _worn_by_triangles(objects):
     worn = set()
     for object_reference in objects:
         data = getattr(object_reference, "data", None)
-        polygons = getattr(data, "polygons", None)
+        attributes = getattr(data, "attributes", None)
         slots = object_reference.material_slots
-        if polygons is None:
+        if attributes is None:
             worn.update(slot.material.name for slot in slots if slot.material)
             continue
-        used = set()
-        for polygon in polygons:
-            used.add(polygon.material_index)
+        # Read the attribute, not the polygons. Both answer the same question and
+        # one of them is free: asking each polygon costs 133 ms on a character
+        # here -- on EVERY live tick -- while the attribute is one buffer copy.
+        # An absent attribute is itself the answer: this application only stores
+        # it once some face leaves slot zero.
+        attribute = attributes.get("material_index")
+        if attribute is None:
+            used = (0,)
+        else:
+            indices = numpy.empty(len(attribute.data), dtype=numpy.int32)
+            attribute.data.foreach_get("value", indices)
+            used = numpy.unique(indices)
         for index in used:
             if index < len(slots) and slots[index].material is not None:
                 worn.add(slots[index].material.name)
