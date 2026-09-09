@@ -29,7 +29,6 @@ import substance_painter.layerstack
 import substance_painter.resource
 import substance_painter.textureset
 
-from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
 LOG = logger("painter.textures")
@@ -42,16 +41,24 @@ LOG = logger("painter.textures")
 #: The names on the left are the surface semantics the whole toolchain declares
 #: its textures in, so a generated material and a hand-built one arrive spelled
 #: the same way and only one column here ever has to change.
+#: More than one spelling per row because this application renames its own enum
+#: between versions -- ambient occlusion has been AO, AmbientOcclusion and Ao --
+#: and a single spelling turns a version bump into "no textures arrived", with
+#: the reason buried one line deep in a log nobody reads.
+#: Each row is (what the record calls it, what this build might call it, how wide
+#: it has to be). The width is a property of the CHANNEL, not of the image: a
+#: normal is three numbers and putting it in a one-channel format loses two of
+#: them, quietly, and the model just looks flat.
 CHANNELS = (
-    ("BaseColor", "BaseColor"),
-    ("Metallic", "Metallic"),
-    ("Roughness", "Roughness"),
-    ("TangentNormal", "Normal"),
-    ("Emission", "Emissive"),
-    ("Opacity", "Opacity"),
-    ("SpecularLevel", "Specular"),
-    ("Height", "Height"),
-    ("Occlusion", "AmbientOcclusion"),
+    ("BaseColor", ("BaseColor",), ("sRGB8",)),
+    ("Metallic", ("Metallic",), ("L8",)),
+    ("Roughness", ("Roughness",), ("L8",)),
+    ("TangentNormal", ("Normal",), ("RGB16F", "RGB8")),
+    ("Emission", ("Emissive",), ("sRGB8",)),
+    ("Opacity", ("Opacity",), ("L8",)),
+    ("SpecularLevel", ("SpecularLevel", "Specularlevel", "Specular"), ("L8",)),
+    ("Height", ("Height",), ("L8",)),
+    ("Occlusion", ("AO", "AmbientOcclusion", "Ao"), ("L8",)),
 )
 
 #: What a layer this made is called, and how it is found again.
@@ -62,22 +69,24 @@ class TextureIngestError(RuntimeError):
     """Textures that arrived and could not be put anywhere."""
 
 
-def _channel_type(name):
-    found = getattr(substance_painter.textureset.ChannelType, name, None)
-    if found is None:
-        raise TextureIngestError("this build has no {0} channel".format(name))
-    return found
+def _channel_type(spellings):
+    """This build's enum member for one neutral channel, or None when it has
+    none. None is an answer about ONE channel and is handled where it is asked;
+    it is not a reason to abandon the other eight and every other material."""
+    for name in spellings:
+        found = getattr(substance_painter.textureset.ChannelType, name, None)
+        if found is not None:
+            return found
+    return None
 
 
-def _format_for(color_space):
-    """A channel wide enough for what is going into it.
-
-    Colour goes in an sRGB channel and data goes in a linear one, and the record
-    says which this is -- the image did.
-    """
-    formats = substance_painter.textureset.ChannelFormat
-    return (formats.sRGB8 if color_space == record_module.COLOR_SPACE_SRGB
-            else formats.L8)
+def _format_for(spellings):
+    """This build's channel format for one channel, or None when it has none."""
+    for name in spellings:
+        found = getattr(substance_painter.textureset.ChannelFormat, name, None)
+        if found is not None:
+            return found
+    return None
 
 
 def _texture_sets_by_name():
@@ -184,6 +193,7 @@ def apply(generation):
     touched = []
     homeless = []
     lookups = {}
+    unspeakable = set()
 
     def payload_file(identity, detail):
         path = directory / detail["file"]
@@ -202,17 +212,20 @@ def apply(generation):
             channels = sections.get("channels") or {}
             stack = texture_set.get_stack()
             layer = None
-            for neutral, painter_name in CHANNELS:
+            for neutral, spellings, widths in CHANNELS:
                 detail = channels.get(neutral)
                 if detail is None:
                     continue
                 path = payload_file(identity, detail)
                 if path is None:
                     continue
-                channel_type = _channel_type(painter_name)
+                channel_type = _channel_type(spellings)
+                channel_format = _format_for(widths)
+                if channel_type is None or channel_format is None:
+                    unspeakable.add(neutral)
+                    continue
                 if not stack.has_channel(channel_type):
-                    stack.add_channel(channel_type,
-                                      _format_for(detail.get("color_space")))
+                    stack.add_channel(channel_type, channel_format)
                 resource, _url = _imported(path)
                 if layer is None:
                     layer = _fill_layer(stack)
@@ -230,6 +243,9 @@ def apply(generation):
     if homeless:
         LOG.warning("%d material(s) in the payload have no Texture Set here: %s",
                     len(homeless), ", ".join(homeless[:4]))
+    if unspeakable:
+        LOG.warning("this build names no channel for %s; those images arrived and "
+                    "stayed out", ", ".join(sorted(unspeakable)))
     LOG.info("put %d texture(s) into %d Texture Set(s), %d of them lookups the "
              "shader samples by name", applied, len(touched),
              sum(len(entries) for entries in lookups.values()))
