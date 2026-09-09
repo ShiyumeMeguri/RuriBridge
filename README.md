@@ -1,24 +1,43 @@
 # RuriBridge
 
-Blender 5.x ⇄ Adobe Substance 3D Painter 的共享内存桥。网格从 Blender 直接写进
-Painter 会映射的**同一批物理页**,通道贴图从 Painter 原样回到 Blender。
+> ## 🟧 Blender 在中间,另外两个补它的短板
+>
+> **建模在 Blender**,它是模型唯一的作者。另外两个软件不改模型,各自把自己那半交回来:
+>
+> | | 拿走 | 交回来 |
+> |---|---|---|
+> | **Substance 3D Painter** | 网格 + 材质 | 烤好的通道贴图 |
+> | **Cascadeur** | 绑定 + 当前动作 | 做完的表演 |
+>
+> 目的只有一个:**让 Blender 变成顶级软件** —— 贴图交给 Painter、动作交给 Cascadeur,
+> 而你从头到尾待在 Blender 里。
 
-**检出就住在 Blender 的 addons 目录里**,仓库根即 Blender 插件;Painter 用目录联接指回来。
-一份共享核心,不复制、不分叉。
+跨进程的载荷全部落在**同一批物理页**上:Win32 的文件映射就是 section 对象,两个进程映射同一份
+就是同一批页,而且每个文件都带 `FILE_ATTRIBUTE_TEMPORARY`(求缓存管理器只要有内存就别写回)。
+所以路径是**共享内存页的名字**,不是磁盘往返 —— 跨进程共享本来就需要一个名字。
+
+**检出就住在 Blender 的 addons 目录里**,仓库根即插件;Painter 用目录联接指回来,
+Cascadeur 收一份生成的入口脚本。一份代码,不复制、不分叉。
 
 ```
-<Blender scripts>/addons/RuriBridge/     ← 检出本体,也是 Blender 插件
-  __init__.py        bl_info / 面板 / 算子 / 定时器泵
-  mesh_publish.py    网格 → 映射页
-  texture_ingest.py  通道 → 图像数据块
-  ruri_bridge/       共享核心。不 import bpy,不 import substance_painter,纯标准库
-    arena.py         会话竞技场:控制块(seqlock 槽) + 不可变 generation 目录
-    channel.py       单写者发布/订阅,append-only,未确认的不丢
-    record.py        线格式:通道、记录种类、色彩空间判据
+<Blender scripts>/addons/RuriBridge/    ← 检出本体,三个应用装的都是它
+  __init__.py        宿主检测 + 分派,别的什么都不做
+  Kernel/            宿主中立。不 import bpy / substance_painter / csc,纯标准库
+    host.py          端口:桥对应用的全部要求 + 能力常量
+    peers.py         花名册:三个应用各能答什么、驻不驻留、代码怎么进去
+    topic.py         什么东西过桥,谁能说谁能听 —— 通道名从这里算出来
+    session.py       一次附着:按主题发端点,不按通道
+    arena.py         竞技场:控制块(seqlock 槽) + 不可变 generation 目录
+    channel.py       单写者发布/订阅,确认位按听众分开
+    record.py        线格式:记录形状与色彩空间判据
     glb.py           就地 GLB:先按计数排好版再映射,生产者一次写入即成品
-    cli.py           无宿主的命令行:观测、验证、驱动
-  painter_plugin/    ← Painter 的 plugins 目录联接到这里
-    shader_state.py  经 substance_painter.js 读写视口着色器实例
+    summon.py        把不驻留的应用叫来看一眼
+    counterpart.py   写进 Cascadeur 命令目录的那扇门
+    cli.py           无宿主的命令行:安装、观测、验证、驱动
+  Host/
+    Blender/         唯一允许 import bpy 的地方
+    Substance/       唯一允许 import substance_painter / PySide 的地方
+    Cascadeur/       唯一允许 import csc 的地方
 ```
 
 ## 怎么用
@@ -36,7 +55,9 @@ Painter 会映射的**同一批物理页**,通道贴图从 Painter 原样回到 
 Painter 那侧的停靠面板同理:写着 Blender 有没有接上,一个 **Live sync to Blender** 开关,
 一个手动 **Send Textures To Blender**。
 
-**唯一需要理解的概念是「会话」**:两侧用同一个会话名(默认 `default`)就在同一块共享内存上。
+**唯一需要理解的概念是「会话」**:所有应用用同一个会话名(默认 `default`)就在同一块共享内存上。
+会话目录名里带一个形状指纹(格式版本 + 通道表),所以换了构建就是**另一个目录**,
+而不是去重建一个别的进程正映射着的文件 —— 那件事在 Windows 上做不到,以前的报错就是它。
 面板里 `Channels` 那个折叠区能看到会话名、目录、和每条通道的实时代次 —— 平时不用管它。
 
 一个人先开谁都行:先开 Blender 发网格再开 Painter、先开 Painter 再开 Blender、两边都开着,
@@ -80,13 +101,44 @@ read 这一轮。竞技场创建的每个文件都带 `FILE_ATTRIBUTE_TEMPORARY`
 的原始 32 位字。点域数据完全不进键(顶点索引已经蕴含它),写的时候把两个索引数组复合起来,
 所以它也只有一次 gather。
 
-## 装进两个宿主
+## 动作:送去 Cascadeur,做完拿回来
 
-Blender 侧不用装 —— 检出就在 addons 里。只需要把 Painter 指过来:
+Blender 的动画确实不好用,这条腿就是补它的。面板上 **Animation** 那一段三个按钮:
+
+1. **Send Rig and Animation to Cascadeur** —— 把选中的绑定和它当前的动作一起发过去,
+   然后把 Cascadeur 叫起来。**骨架跟着表演一起走**:没有骨架的表演不是表演。
+2. 在 Cascadeur 里做动作。
+3. **Fetch Animation from Cascadeur** —— 要一份回来。回来的东西**按骨名落到你已有的那副绑定上**,
+   临时导入的骨架当场删掉。所以来回多少次,你的骨轴都不会被转歪一点点。
+
+Cascadeur **不驻留**:它跑一条命令就退出,所以桥是"召唤一次、造访一次"——
+不是缺陷,是这个应用本来的样子,花名册里写着 `resident=False`,别处一行分支都没有。
+
+实测(真装机,一次完整往返):
+
+```
+Blender 发   anim@Blender     4 node / 1 skin / 1 animation
+Cascadeur    收下、做动作、导出并退出
+Blender 收   matched=['Root','Wave']  missing=[]   30 条曲线落到已有绑定上
+             objects left behind: ['RuriRig']      ← 临时导入物全部清掉
+```
+
+**只有 GLB,没有 FBX。** Cascadeur 自带 `csc.glb.process_import` / `process_export`
+两个方向的一等门,所以中间不需要第二种格式 —— 第二种格式意味着同一份模型存在两份编码、
+两套舍入。
+
+## 装进三个宿主
+
+Blender 侧不用装 —— 检出就在 addons 里。另外两个各走各的路,一条命令都办了:
 
 ```bash
-python -m ruri_bridge.cli install --painter-plugins "<Painter 用户 python>/plugins" --enable-painter-plugin
+python -m RuriBridge.Kernel.cli install ^
+    --painter-plugins "<Painter 用户 python>/plugins" --enable-painter-plugin ^
+    --cascadeur "<Cascadeur>/cascadeur.exe"
 ```
+
+安装器不认识"哪个应用要怎么装" —— 它走一遍花名册,每一行自己说:检出本体(Blender)、
+目录联接(Painter)、往它自己的命令目录写一扇门(Cascadeur)。加第四个应用是加一行,不是加分支。
 
 建的是目录联接(`mklink /J`,不需要管理员)。`--enable-painter-plugin` 直接把
 `launch_at_start` 写进 QSettings(Windows 上就是注册表),**Painter 必须关着**——它在启动时读。
@@ -108,23 +160,23 @@ python -m ruri_bridge.cli install --painter-plugins "<Painter 用户 python>/plu
 ## 命令行
 
 ```bash
-python -m ruri_bridge.cli status                 # 控制块:每个通道的代次/确认/丢弃/载荷字节
-python -m ruri_bridge.cli inspect --channel to_painter
-python -m ruri_bridge.cli verify-mesh            # 重读发布的 GLB 并逐项判定
-python -m ruri_bridge.cli textures --into <目录>  # 列出 Painter 最新一批贴图,可另存
-python -m ruri_bridge.cli values                 # 内联状态槽:双向的 shader 值,不落任何文件
-python -m ruri_bridge.cli shaders --name intensity
-python -m ruri_bridge.cli sessions / remove
-python -m ruri_bridge.cli publish-mesh   --blender <blender.exe> --blend <场景> --scope VISIBLE
-python -m ruri_bridge.cli request-export --blender <blender.exe> --blend <场景>
-python -m ruri_bridge.cli pull-textures  --blender <blender.exe> --blend <场景> --bind --save
+python -m RuriBridge.Kernel.cli status                 # 控制块:每个通道的代次/确认/丢弃/载荷字节
+python -m RuriBridge.Kernel.cli inspect --channel mesh@Blender
+python -m RuriBridge.Kernel.cli verify-mesh            # 重读发布的 GLB 并逐项判定
+python -m RuriBridge.Kernel.cli textures --into <目录>  # 列出 Painter 最新一批贴图,可另存
+python -m RuriBridge.Kernel.cli values                 # 内联状态槽:双向的 shader 值,不落任何文件
+python -m RuriBridge.Kernel.cli shaders --name intensity
+python -m RuriBridge.Kernel.cli sessions / remove
+python -m RuriBridge.Kernel.cli publish-mesh   --blender <blender.exe> --blend <场景> --scope VISIBLE
+python -m RuriBridge.Kernel.cli request-export --blender <blender.exe> --blend <场景>
+python -m RuriBridge.Kernel.cli pull-textures  --blender <blender.exe> --blend <场景> --bind --save
 ```
 
 `pull-textures` 默认取**最新一批**(不管它是不是在本进程附着之前发布的);`--wait` 才是等新的。
 两者是两个不同的问题:插件附着时故意不重放历史(否则打开 Blender 就会莫名其妙吞下一小时前的贴图),
 而"把 Painter 现在有的拿过来"是显式动作,面板上是 Pull Latest Textures 按钮。
 
-三个驱动动作都是**让 Blender 去发**,而不是命令行自己发:`to_painter` 按设计只有一个写者,
+三个驱动动作都是**让 Blender 去发**,而不是命令行自己发:每条通道按设计只有一个写者,
 命令行悄悄变成第二个写者就会和插件抢代次号。
 
 `verify-mesh` 是真判据,不是打印:它重新读回发布的 GLB,核对文件头声明的字节数与实际大小、
@@ -235,18 +287,28 @@ Blender 里根本没有那个材质 —— 贴图**确实到了**(图像数据�
 
 ## 通道与记录
 
-两个通道,各只有一个写者,所以除了槽本身的 seqlock 之外没有任何锁。
+通道名**不写在任何地方**,是算出来的:`<主题>@<说话的人>`,由「有哪些主题」乘以
+「谁能说」得出。一条通道只有一个写者,所以除了槽本身的 seqlock 之外没有任何锁。
 
-| 通道 | 写者 | 记录种类 |
-|---|---|---|
-| `to_painter` | Blender | `mesh`(GLB + 材质数据行 + 意图)、`export_request` |
-| `to_blender` | Painter | `textures`(位深/格式/色彩空间)、`project_state`、`shader_state` |
-| `state_to_painter` | Blender | `shader_values` —— **内联在控制块里,零文件** |
-| `state_to_blender` | Painter | `shader_values` —— 同上 |
+| 主题 | 谁能说 | 谁能听 | 语义 |
+|---|---|---|---|
+| `mesh` | Blender | Painter | 队列 |
+| `tex` | Painter | Blender | 队列 |
+| `anim` | Blender、Cascadeur | Blender、Cascadeur | 队列 |
+| `shade` | Blender、Painter | Blender、Painter | 状态 |
+| `here` | 三个都能 | 三个都能 | 状态 |
+| `ask` | 三个都能 | 三个都能 | 队列 |
 
-前两条是**队列**:不可变 generation 目录,未确认的不丢,顺序有意义。后两条是**状态**:一个槽,
-后写覆盖前写,因为一个已被取代的值没有任何意义 —— 为它造目录和文件是错的形状。两种语义分在
-不同通道上,不混在一条里。
+**谁能说谁能听不是表,是能力的连接。** 主题问一条能力,应用答一条能力,剩下的自己长出来:
+Painter 没有动画面,所以它永远收不到 `anim`;Cascadeur 不是模型的作者,所以它永远发不出 `mesh`。
+加第四个应用只是花名册里多一行,通道随之出现。
+
+**队列**是不可变 generation 目录,未确认的不丢,顺序有意义;**状态**是一个槽,后写覆盖前写 ——
+一个已被取代的值没有任何意义,为它造目录和文件是错的形状。
+
+确认位**按听众分开**:一条通道现在可能有两个听众(`mesh@Blender` 谁都能听),共用一个确认位
+会让先读的那个把载荷从后读的那个眼皮底下回收掉。每个应用在自己的那一格里确认,发布者回收时
+取「所有真正在听的人」的最小值。
 
 `mesh` 记录里的 `materials` 是**原样搬运**的:名字 + Blender 材质的自定义属性 + 用到的节点组名。
 桥不解释它们 —— 着色器生成器改词汇,这里一行都不用动。
@@ -325,8 +387,8 @@ Blender 侧**不按名字过滤**:它不可能知道对面的 shader 暴露了�
 静默取一个会让视口显示一个谁都没要求过的数。
 
 ```bash
-python -m ruri_bridge.cli shaders --name intensity          # Painter 现在暴露什么、值多少
-python -m ruri_bridge.cli push-shader-values --blender <blender.exe> --blend <场景>
+python -m RuriBridge.Kernel.cli shaders --name intensity          # Painter 现在暴露什么、值多少
+python -m RuriBridge.Kernel.cli push-shader-values --blender <blender.exe> --blend <场景>
 ```
 
 ## 已知边界
