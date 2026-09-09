@@ -74,52 +74,108 @@ def _column_major(matrix):
 
 
 def mint_identity(datablock):
-    """The identity, and whether it had to be minted just now.
+    """The name the other side knows this by, and whether it was just settled on.
 
-    Whether it is new is worth carrying: an identity only becomes durable once
-    the file holding it is saved, so a caller that has just minted one is
-    admitting it has no memory of previous sessions. The receiving side can then
-    adopt rather than compare, instead of reading a fresh identity as proof that
-    this is somebody else's work.
+    It is the datablock's own name, taken once and then held still. Painter
+    matches a Texture Set to the mesh material it came from by name, so what
+    travels has to stay put across a rename here -- but it has to stay a *name*,
+    because it is what somebody reads in Painter's Texture Set list. An
+    identifier minted out of nothing satisfies the first half and fails the
+    second: the list fills with hex.
+
+    Whether it was just settled on is worth carrying. It only becomes durable
+    when the file holding it is saved, so a caller that has just taken one is
+    admitting it has no memory of previous sessions, and the receiving side can
+    adopt rather than read it as proof that this is somebody else's work.
     """
     existing = datablock.get(IDENTITY_PROPERTY)
     if existing:
         return existing, False
+    datablock[IDENTITY_PROPERTY] = datablock.name
+    return datablock.name, True
+
+
+def mint_scene_identity(scene):
+    """The scene's identity, which nobody ever reads, so it is minted.
+
+    Unlike a material, this never crosses into a name anyone sees: it lives in
+    the Painter project's metadata and answers one question, whether this project
+    belongs to this scene. Names cannot answer that -- two files both called
+    Scene are the common case, and binding them together would be worse than
+    having no binding at all.
+    """
+    existing = scene.get(IDENTITY_PROPERTY)
+    if existing:
+        return existing, False
     minted = uuid.uuid4().hex
-    datablock[IDENTITY_PROPERTY] = minted
+    scene[IDENTITY_PROPERTY] = minted
     return minted, True
 
 
 def identity_of(datablock):
-    """A name the other side can rely on, which renaming here cannot move.
-
-    Names are what people read, so people change them -- and Painter matches a
-    Texture Set to the mesh material it came from by name, which means a rename
-    in Blender would have arrived there as a *different* material and taken the
-    paint with it. So the name Painter is told is this identity, minted once and
-    stored on the datablock; the readable name travels beside it, as a label.
-    """
+    """The name Painter knows this by, which renaming here cannot move."""
     return mint_identity(datablock)[0]
+
+
+def vertex_count_of(objects):
+    """How big this scene is, as one number both sides can compare.
+
+    Cheap enough to take on every send and specific enough to answer the only
+    question a name match needs answered: is the project on the other side built
+    from this model at all. Read from the stored meshes rather than the evaluated
+    ones so the number does not move when a modifier is toggled.
+    """
+    total = 0
+    for object_reference in objects:
+        vertices = getattr(object_reference.data, "vertices", None)
+        if vertices is not None:
+            total += len(vertices)
+    return total
 
 
 def adopt_identities(objects):
     """Give every material its identity now, and name the ones that had none.
 
     An identity lives in the .blend, so a file that has not been saved since the
-    bridge first touched it mints a fresh set every session -- and Painter, which
+    bridge first touched it takes a fresh set every session -- and Painter, which
     matches Texture Sets by exactly that, then reads every material as new and
     builds a second set of Texture Sets beside the painted ones. Doing it in one
     pass before anything is written is what makes that visible while it can still
     be prevented, instead of after the paint is stranded.
+
+    Two materials can want the same identity, because an identity is a name that
+    stopped moving while the names around it did not: rename A to B and call the
+    next material A, and both now answer to A. Painter would read one material and
+    merge the paint, so the collision is broken here, the second one taking the
+    next free suffix the way Blender numbers its own duplicates.
     """
     fresh = set()
+    claimed = {}
     for object_reference in objects:
         for slot in object_reference.material_slots:
-            if slot.material is None:
+            material = slot.material
+            if material is None:
                 continue
-            if mint_identity(slot.material)[1]:
-                fresh.add(slot.material.name)
+            identity, is_new = mint_identity(material)
+            other = claimed.get(identity)
+            if other is not None and other is not material:
+                identity = _next_free_identity(identity, claimed)
+                LOG.warning("%r and %r both answer to %r over the bridge; %r takes %r",
+                            other.name, material.name, material[IDENTITY_PROPERTY],
+                            material.name, identity)
+                material[IDENTITY_PROPERTY] = identity
+                is_new = True
+            claimed[identity] = material
+            if is_new:
+                fresh.add(material.name)
     return fresh
+
+
+def _next_free_identity(identity, claimed):
+    suffix = 1
+    while "{0}.{1:03d}".format(identity, suffix) in claimed:
+        suffix += 1
+    return "{0}.{1:03d}".format(identity, suffix)
 
 
 def _material_row(material, fresh=()):

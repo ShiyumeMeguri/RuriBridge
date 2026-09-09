@@ -261,6 +261,12 @@ class RuriBridgePanel(QtWidgets.QWidget):
 
         self.link_label = QtWidgets.QLabel("")
         layout.addWidget(self.link_label)
+        self.binding_label = QtWidgets.QLabel("")
+        self.binding_label.setWordWrap(True)
+        self.binding_label.setToolTip(
+            "The scene this project paints, read from the project's own metadata. It "
+            "is saved with the project, so reopening it later still says this")
+        layout.addWidget(self.binding_label)
 
         self.status_label = QtWidgets.QLabel("detached")
         self.status_label.setWordWrap(True)
@@ -347,11 +353,24 @@ class RuriBridgePanel(QtWidgets.QWidget):
         blender = CONNECTION.arena.read_slot(record_module.CHANNEL_TO_PAINTER)
         self.link_label.setText(
             "Blender is attached" if blender.writer_is_live else "Blender is not attached")
+        self.binding_label.setText(self._describe_binding())
         self.slot_label.setText("\n".join(
             "{0}: gen {1} ack {2} drop {3}".format(
                 state.channel, state.generation, state.acknowledged_generation,
                 state.dropped_generations)
             for state in CONNECTION.arena.describe()))
+
+    def _describe_binding(self):
+        """Which scene this project paints, in the words of the project itself."""
+        if not substance_painter.project.is_open():
+            return ""
+        binding = mesh_ingest.stored_binding()
+        document = binding.get("document")
+        if document:
+            return "painting {0}".format(document)
+        if binding.get("scene_identity"):
+            return "painting an unsaved Blender file"
+        return "not bound to a scene yet"
 
     def refresh_presets(self):
         if not substance_painter.project.is_open():
@@ -516,7 +535,8 @@ def _handle(generation):
              if row.get("identity")})
         _mesh_deadline = time.monotonic() + MESH_LOAD_DEADLINE_SECONDS
         try:
-            intent = mesh_ingest.apply(generation, _panel.texture_resolution)
+            intent = mesh_ingest.apply(generation, _panel.texture_resolution,
+                                       ask_for_names=_ask_blender_for_names)
         except Exception:
             _mesh_deadline = None
             raise
@@ -634,12 +654,7 @@ def _on_project_ready(_event):
 
 
 def _on_project_settled():
-    """The project now holds the mesh that was sent. Show the panel, adopt values.
-
-    The dock belongs to Painter's project modes, so on the home screen it exists
-    but is not shown -- which looks exactly like a plugin that failed. Opening a
-    project is the moment it can be seen, so that is the moment to make sure it
-    is, rather than leaving it to whatever the saved layout happened to hold.
+    """The project now holds the mesh that was sent. Adopt its values.
 
     Priming rather than publishing is what stops a freshly created project's
     defaults from overwriting values the other side authored: on connect neither
@@ -647,17 +662,13 @@ def _on_project_settled():
     """
     global _mesh_deadline
     _mesh_deadline = None
-    if _dock is not None and not _dock.isVisible():
-        _dock.setVisible(True)
-        _dock.raise_()
-    if _dock is not None:
-        LOG.info("panel visible: %s", _dock.isVisible())
     try:
         _shader_gate.prime(shader_state.parameter_values())
     except shader_state.ShaderStateError as error:
         LOG.error("could not adopt the shader values: %s", error)
     if _pending_display_names:
         texture_publish.apply_display_names(_pending_display_names)
+    mesh_ingest.save_where_the_scene_asked()
     if _panel is not None:
         _panel.refresh_presets()
     publish_project_state()
@@ -667,7 +678,22 @@ def _on_project_settled():
         LOG.error("could not read the shader state: %s", error)
 
 
+def _ask_blender_for_names():
+    """Say what this project already has, then ask for the scene again.
+
+    The order is the whole point: Blender can only take these Texture Set names
+    as identities if it has them, so the state goes first and the request second.
+    Clearing the deadline says the mesh is no longer on its way in -- it is being
+    sent again, addressed properly this time.
+    """
+    global _mesh_deadline
+    _mesh_deadline = None
+    publish_project_state()
+    CONNECTION.publisher.publish_record(record_module.mesh_request("painter"))
+
+
 def _on_project_closed(_event):
+    mesh_ingest.forget_asking()
     publish_project_state()
 
 
@@ -697,6 +723,33 @@ def show_panel():
     LOG.info("panel visible: %s, floating: %s", _dock.isVisible(), _dock.isFloating())
 
 
+def _rest_in_the_strip(_event=None):
+    """Leave the panel folded into the right-hand strip, not spread down a column.
+
+    A dock that is closed lives in that strip as its icon and costs no room; one
+    that is open takes a slice of the column the layer stack is in. Forcing it
+    open on every launch would take that choice away for good, so it is folded
+    away exactly once -- the first run that knows to -- and after that whatever it
+    was left as is what comes back. The way in is the 'RB' button in the strip, or
+    Window > RuriBridge.
+
+    Folding waits for the interface to come up, because Painter restores its saved
+    layout after the plugins have started: a dock closed any earlier is reopened a
+    moment later by the layout that remembers it open, which is exactly what this
+    is here to stop.
+    """
+    if _dock is None:
+        return
+    settings = QtCore.QSettings()
+    key = "python_plugins/RuriBridge/dock_folded_once"
+    if not settings.value(key):
+        settings.setValue(key, True)
+        _dock.setVisible(False)
+    LOG.info("panel is %s; the 'RB' button in the right-hand strip and "
+             "Window > RuriBridge both open it",
+             "open" if _dock.isVisible() else "folded into the strip")
+
+
 def start_plugin():
     global _panel, _dock, _timer, _log_handler, _menu_action
     _log_handler = log_module.install_callable_sink(_emit_to_painter)
@@ -705,8 +758,6 @@ def start_plugin():
         _panel, substance_painter.ui.UIMode.Edition
         | substance_painter.ui.UIMode.Visualisation
         | substance_painter.ui.UIMode.Baking)
-    _dock.setVisible(True)
-    _dock.raise_()
     _menu_action = QtGui.QAction("RuriBridge")
     _menu_action.triggered.connect(show_panel)
     substance_painter.ui.add_action(
@@ -717,6 +768,10 @@ def start_plugin():
         substance_painter.event.ProjectClosed, _on_project_closed)
     substance_painter.event.DISPATCHER.connect_strong(
         substance_painter.event.ProjectSaved, _on_project_saved)
+    substance_painter.event.DISPATCHER.connect_strong(
+        substance_painter.event.GraphicalUserInterfaceStarted, _rest_in_the_strip)
+    if substance_painter.ui.get_main_window().isVisible():
+        _rest_in_the_strip()
     substance_painter.event.DISPATCHER.connect_strong(
         substance_painter.event.TextureStateEvent, _on_texture_state)
     _timer = QtCore.QTimer(_panel)
@@ -731,10 +786,6 @@ def start_plugin():
     except Exception as error:
         LOG.error("could not attach on start: %s", error)
         _panel.set_status("attach failed: {0}".format(error))
-    LOG.info("panel added (visible: %s); Window > RuriBridge reopens it, and the "
-             "'RB' button in the right-hand strip does too. It belongs to the "
-             "project modes, so it shows once a project is open.",
-             _dock.isVisible())
     LOG.info("plugin started from %s", REPOSITORY_ROOT)
 
 
@@ -749,6 +800,8 @@ def close_plugin():
         substance_painter.event.ProjectClosed, _on_project_closed)
     substance_painter.event.DISPATCHER.disconnect(
         substance_painter.event.ProjectSaved, _on_project_saved)
+    substance_painter.event.DISPATCHER.disconnect(
+        substance_painter.event.GraphicalUserInterfaceStarted, _rest_in_the_strip)
     substance_painter.event.DISPATCHER.disconnect(
         substance_painter.event.TextureStateEvent, _on_texture_state)
     CONNECTION.close()

@@ -28,6 +28,8 @@ import substance_painter.textureset
 from ruri_bridge import record as record_module
 from ruri_bridge.log import logger
 
+from . import mesh_ingest
+
 LOG = logger("painter.textures")
 
 DEFAULT_PRESET_NAME = "Document channels + Normal + AO (No Alpha)"
@@ -359,7 +361,7 @@ def apply_display_names(names_by_identity):
 def current_project_state():
     """What Painter has open, for the panel and for Blender's status line."""
     if not substance_painter.project.is_open():
-        return record_module.project_state("painter", False, None, None, [])
+        return record_module.project_state("painter", False, None, None, [], {})
     texture_sets = []
     for texture_set in substance_painter.textureset.all_texture_sets():
         resolution = texture_set.get_resolution()
@@ -380,4 +382,4 @@ def current_project_state():
         "painter", True,
         substance_painter.project.file_path(),
         substance_painter.project.last_imported_mesh_path(),
-        texture_sets)
+        texture_sets, mesh_ingest.stored_binding())

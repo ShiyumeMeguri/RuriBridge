@@ -90,7 +90,8 @@ def _base(kind, source):
     }
 
 
-def binding(scene_identity, scene_identity_is_new, document, project_path):
+def binding(scene_identity, scene_identity_is_new, document, project_path,
+            vertex_count=0):
     """Which document on the sending side a Painter project belongs to.
 
     This travels into the Painter project's own metadata, where saving carries
@@ -103,6 +104,7 @@ def binding(scene_identity, scene_identity_is_new, document, project_path):
         "scene_identity_is_new": scene_identity_is_new,
         "document": document,
         "project_path": project_path,
+        "vertex_count": vertex_count,
     }
 
 
@@ -164,7 +166,8 @@ def textures(source, project_path, mesh_path, texture_sets):
     return record
 
 
-def project_state(source, is_open, project_path, mesh_path, texture_sets):
+def project_state(source, is_open, project_path, mesh_path, texture_sets,
+                  binding_record=None):
     """Painter -> Blender: what Painter currently has open."""
     record = _base(KIND_PROJECT_STATE, source)
     record.update({
@@ -172,6 +175,7 @@ def project_state(source, is_open, project_path, mesh_path, texture_sets):
         "project_path": project_path,
         "mesh_path": mesh_path,
         "texture_sets": texture_sets,
+        "binding": binding_record or {},
     })
     return record
 

@@ -149,18 +149,67 @@ def publish_mesh(context, scope="SELECTED", intent=record_module.INTENT_AUTO,
     chosen = objects_in_scope(context, scope)
     if not chosen:
         raise RuntimeError("no mesh object in scope {0}".format(scope))
+    adopt_painter_identities(chosen)
     depsgraph = context.evaluated_depsgraph_get()
     generation = mesh_publish.publish(
         CONNECTION.arena, CONNECTION.publisher, chosen, depsgraph, intent,
         context.scene.unit_settings.scale_length, include_colors,
-        binding=scene_binding(context))
+        binding=scene_binding(context, chosen))
     CONNECTION.has_published = True
     MESH_GATE.prime({"serial": _mesh_serial})
     SHADER_GATE.prime(material_values(context.scene.ruri_bridge))
     return generation
 
 
-def scene_binding(context):
+def adopt_painter_identities(objects):
+    """Take the names Painter already uses, before any new identity is minted.
+
+    A project somebody made by hand, or a scene whose file was never saved, has
+    no identity to match on -- and minting one would build a second set of
+    Texture Sets beside the painted ones. Painter reports what it has, so a
+    material whose name is a Texture Set over there simply takes that Texture
+    Set's name as its identity. Nothing is typed and nothing is guessed: the two
+    are bound by the one thing both sides already agree on, and from then on the
+    identity carries the pairing so renaming either is free.
+
+    The vertex count is the check. A project that remembers being built from a
+    different number of vertices is a different model, and matching names across
+    two models would be worse than starting clean, so that case mints as before.
+    """
+    state = CONNECTION.last_state.get(record_module.KIND_PROJECT_STATE) or {}
+    if not state.get("is_open"):
+        return {}
+    mine = mesh_publish.vertex_count_of(objects)
+    remembered = (state.get("binding") or {}).get("vertex_count")
+    if remembered and mine and remembered != mine:
+        LOG.info("the open project was built from %d vertices and this scene has %d, "
+                 "so its Texture Set names are not read as identities",
+                 remembered, mine)
+        return {}
+    known = {}
+    for entry in state.get("texture_sets") or []:
+        identity = entry.get("identity")
+        if identity:
+            known.setdefault(entry.get("name") or identity, identity)
+            known.setdefault(identity, identity)
+    adopted = {}
+    for object_reference in objects:
+        for slot in object_reference.material_slots:
+            material = slot.material
+            if material is None or material.get(mesh_publish.IDENTITY_PROPERTY):
+                continue
+            identity = known.get(material.name)
+            if identity is None:
+                continue
+            material[mesh_publish.IDENTITY_PROPERTY] = identity
+            adopted[material.name] = identity
+    if adopted:
+        LOG.info("%d material(s) took the name Painter already uses as their identity",
+                 len(adopted))
+    return adopted
+
+
+def scene_binding(context, objects):
     """The durable answer to "which project does this scene paint into".
 
     The scene identity is minted the same way a material's is, so it survives
@@ -170,10 +219,11 @@ def scene_binding(context):
     """
     scene = context.scene
     stored = scene.ruri_bridge.painter_project
-    identity, is_new = mesh_publish.mint_identity(scene)
+    identity, is_new = mesh_publish.mint_scene_identity(scene)
     return record_module.binding(
         identity, is_new, bpy.data.filepath,
-        bpy.path.abspath(stored) if stored else "")
+        bpy.path.abspath(stored) if stored else "",
+        mesh_publish.vertex_count_of(objects))
 
 
 def request_export(preset_name, resolution_log2=None):

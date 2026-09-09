@@ -34,6 +34,8 @@ BINDING_KEY = "binding"
 
 _pending_binding = {}
 _pending_reload = {}
+_pending_save = {}
+_asked_for_names = False
 
 
 class MeshIngestError(RuntimeError):
@@ -64,6 +66,39 @@ def remember_binding(binding):
     substance_painter.project.Metadata(METADATA_CONTEXT).set(BINDING_KEY, binding)
     LOG.info("this project paints scene %s from %s", binding.get("scene_identity"),
              binding.get("document") or "an unsaved file")
+
+
+def names_would_be_stranded(record):
+    """Whether reloading this mesh would build Texture Sets beside the painted ones.
+
+    True in one shape only: the sender says its identities are freshly minted --
+    an unsaved file, or a project nobody has bridged before -- the project is
+    plainly built from the same model, and not one incoming material answers to a
+    Texture Set that is already here. Reloading then paints nothing and strands
+    everything, so the better move is to let the sender take the names this
+    project already uses and send again.
+
+    The vertex count is the check when there is one to check against. A project
+    made by hand has never recorded one, and there names are all either side has
+    -- which is the case this exists to serve.
+    """
+    binding = record.get("binding") or {}
+    if not binding.get("scene_identity_is_new"):
+        return False
+    remembered = stored_binding().get("vertex_count")
+    theirs = binding.get("vertex_count")
+    if remembered and theirs and remembered != theirs:
+        return False
+    existing = {texture_set.original_name
+                for texture_set in substance_painter.textureset.all_texture_sets()}
+    incoming = {row.get("identity") for row in record.get("materials", [])}
+    return bool(existing) and not (existing & incoming)
+
+
+def forget_asking():
+    """A closed project has no names to offer, so the next one may ask again."""
+    global _asked_for_names
+    _asked_for_names = False
 
 
 def belongs_to_another_scene(binding):
@@ -116,7 +151,7 @@ def plan(record):
     return record_module.INTENT_CREATE_PROJECT, None
 
 
-def apply(generation, texture_resolution, on_finished=None):
+def apply(generation, texture_resolution, ask_for_names=None, on_finished=None):
     """Queue this generation's GLB into the project. Returns the intent used."""
     global _pending_binding
     scene_path = generation.path(generation.record.get(
@@ -147,6 +182,15 @@ def apply(generation, texture_resolution, on_finished=None):
                 "looks like from here", len(stranded), ", ".join(stranded[:4]))
 
     def reload_now(after=None):
+        global _asked_for_names
+        if ask_for_names is not None and not _asked_for_names                 and names_would_be_stranded(generation.record):
+            _asked_for_names = True
+            LOG.info("none of the %d incoming material(s) answers to a Texture Set here, "
+                     "and the sender has no memory of earlier sessions; asking it to "
+                     "take the names this project already uses and send again",
+                     len(generation.record.get("materials", [])))
+            ask_for_names()
+            return False
         warn_about_stranded()
         def finished(status):
             report(status)
@@ -155,6 +199,7 @@ def apply(generation, texture_resolution, on_finished=None):
         settings = substance_painter.project.MeshReloadingSettings(
             import_cameras=False, preserve_strokes=True)
         substance_painter.project.reload_mesh(str(scene_path), settings, finished)
+        return True
 
     def run():
         if intent == record_module.INTENT_CREATE_PROJECT:
@@ -183,8 +228,15 @@ def resume_after_open(on_settled):
 
     Three things need an open project: the binding metadata, the mesh that asked
     for a project to be reopened, and the first save of a project the scene named
-    but that is not on disk yet. Returns True when a reload was queued, which
-    tells the caller the project is not settled and to wait for ``on_settled``.
+    but that is not on disk yet. Returns True when a reload really is in flight,
+    which tells the caller the project is not settled and to wait for
+    ``on_settled``.
+
+    Whether it is in flight is read from the reload itself rather than assumed,
+    because ``execute_when_not_busy`` runs its callback on the spot when Painter
+    is idle. A reload that decides to ask for the mesh again instead of loading it
+    would otherwise be reported as in flight, and the caller would go on holding
+    the channel shut for a load that is never coming.
     """
     global _pending_binding
     binding, _pending_binding = _pending_binding, {}
@@ -198,22 +250,33 @@ def resume_after_open(on_settled):
                   "nothing was reloaded into it", *wrong)
         return False
     remember_binding(binding)
-    _save_where_the_scene_asked(binding)
+    _pending_save.update(binding=binding)
     resume = _pending_reload.pop("run", None)
     if resume is None:
         return False
-    substance_painter.project.execute_when_not_busy(lambda: resume(on_settled))
-    return True
+    in_flight = {"reloading": True}
+
+    def run_resume():
+        in_flight["reloading"] = resume(on_settled)
+
+    substance_painter.project.execute_when_not_busy(run_resume)
+    return bool(in_flight["reloading"])
 
 
-def _save_where_the_scene_asked(binding):
+def save_where_the_scene_asked():
     """Write out a project the scene named but that was not there yet.
 
     Without this the binding only forms when somebody remembers to save by hand,
     and a session closed before that takes its paint with it. The path is the one
     the sending side asked for, so nothing is ever written somewhere the user did
     not name, and an existing file is left alone rather than overwritten.
+
+    Called once the project has settled rather than the moment it opens, because
+    a project saved before the Texture Sets are named after Blender's materials
+    keeps the identities as its display names -- and a reader coming back to that
+    file later has nothing legible to match on.
     """
+    binding = _pending_save.pop("binding", None)
     wanted = (binding or {}).get("project_path")
     if not wanted or substance_painter.project.file_path() or os.path.exists(wanted):
         return
