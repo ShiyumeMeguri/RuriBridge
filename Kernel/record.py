@@ -104,12 +104,19 @@ def binding(scene_identity, scene_identity_is_new, document, project_path,
     }
 
 
-def mesh(source, intent, scene, materials, unit_scale, up_axis, binding_record=None):
-    """Blender -> Painter: geometry lives in the GLB, everything else here.
+def mesh(source, intent, scene, materials, unit_scale, up_axis, binding_record=None,
+         textures=None):
+    """The model: geometry lives in the GLB, everything else here.
 
     ``scene`` describes what went into the GLB (object names, primitive counts,
     the bounds) so the consumer can report and verify without parsing it.
     ``materials`` are the producing side's material rows, carried verbatim.
+
+    ``textures`` is what the sending side ALREADY has on those materials -- the
+    ground a texturing tool paints on top of. Each entry names a file beside the
+    GLB, the channel it belongs in, and the colour space the image itself
+    declares. Absent when the scene renders with no images, which is a real
+    answer rather than a missing one.
     """
     record = _base("mesh", source)
     record.update({
@@ -120,6 +127,7 @@ def mesh(source, intent, scene, materials, unit_scale, up_axis, binding_record=N
         "unit_scale": unit_scale,
         "up_axis": up_axis,
         "binding": binding_record or {},
+        "textures": textures or {},
     })
     return record
 

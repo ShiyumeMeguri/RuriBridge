@@ -31,6 +31,7 @@ from ...Kernel.glb import (AttributeLayout, GlbWriter, MeshLayout, PrimitiveLayo
                              SceneLayout, SEMANTIC_COLOR_0, SEMANTIC_NORMAL,
                              SEMANTIC_POSITION, TEXCOORD_PREFIX)
 from ...Kernel.log import logger
+from . import texture_publish
 
 LOG = logger("blender.mesh")
 
@@ -496,6 +497,16 @@ def write_glb(arena, path, objects):
     return scene_description
 
 
+def _materials_of(objects):
+    """Every distinct material in scope, in a stable order."""
+    seen = {}
+    for object_reference in objects:
+        for slot in object_reference.material_slots:
+            if slot.material is not None:
+                seen.setdefault(slot.material.name, slot.material)
+    return [seen[name] for name in sorted(seen)]
+
+
 def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
             include_colors=True, binding=None, changed=None):
     """Gather, write and publish one mesh generation. Returns the generation."""
@@ -516,6 +527,10 @@ def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
     with publisher.staging() as staging:
         scene_description = write_glb(
             arena, staging.path(record_module.SCENE_FILE_NAME), gathered)
+        # A live tick names what changed; a manual send names nothing. Only the
+        # second one is somebody asking for everything, and the textures are the
+        # expensive half of everything.
+        materials = _materials_of(objects_to_send) if changed is None else ()
         return staging.publish(record_module.mesh(
             source="Blender",
             intent=intent,
@@ -523,4 +538,5 @@ def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
             materials=collect_material_rows(objects_to_send, fresh),
             unit_scale=unit_scale,
             up_axis="Z",
-            binding_record=binding))
+            binding_record=binding,
+            textures=texture_publish.publish_into(staging, materials)))
