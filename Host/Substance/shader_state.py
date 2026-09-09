@@ -135,6 +135,7 @@ def shader_named(name):
     up differing.
     """
     usage = getattr(substance_painter.resource.Usage, "SHADER", None)
+    seen = []
     for query in ("u:shader {0}".format(name), name):
         try:
             found = substance_painter.resource.search(query)
@@ -146,13 +147,18 @@ def shader_named(name):
             identifier = _value_of(resource, "identifier")
             if identifier is None:
                 continue
-            if str(_value_of(identifier, "name") or "").lower() != name.lower():
+            candidate = str(_value_of(identifier, "name") or "")
+            usages = _value_of(resource, "usages") if usage is not None else None
+            seen.append("{0} ({1})".format(candidate, usages))
+            if candidate.lower() != name.lower():
                 continue
-            if usage is not None:
-                usages = _value_of(resource, "usages")
-                if usages is not None and usage not in usages:
-                    continue
+            if usages is not None and usage not in usages:
+                continue
             return _value_of(identifier, "url")
+    # What the search DID return, because "not found" and "found and rejected"
+    # want different things done about them and read the same in a log.
+    LOG.info("looked for a shader called %r and the shelves answered with %d "
+             "candidate(s): %s", name, len(seen), ", ".join(seen[:6]) or "nothing")
     return None
 
 
@@ -229,14 +235,33 @@ def values_by_texture_set():
     layout = Layout()
     by_instance = {}
     for label, body in (layout.object.get("shaders") or {}).items():
-        by_instance[label] = body.get("parameters") or {}
-    label_by_instance = {entry["id"]: entry["label"] for entry in instances()}
+        by_instance[label] = _flat(body.get("parameters") or {})
     found = {}
     for identity, identifier in layout.instance_by_texture_set.items():
-        values = by_instance.get(label_by_instance.get(identifier))
+        values = by_instance.get(layout.label_by_instance.get(identifier))
         if values:
-            found[identity] = dict(values)
+            found[identity] = values
     return found
+
+
+def _flat(by_group):
+    """Values as names, out of the groups the panel arranges them in.
+
+    This application keys an instance's values by the *group* each parameter was
+    declared in and only then by name -- so a shader that declares groups hands
+    back ``{"PBR basics": {"_Smoothness": 0.26}}``, and taking that as it comes
+    offers the other side a parameter called "PBR basics" whose value is a
+    dictionary. Nothing raises: the names simply never match, and every value
+    quietly fails to land.
+    """
+    flattened = {}
+    for group, members in by_group.items():
+        if not isinstance(members, dict):
+            raise ShaderStateError(
+                "this build groups shader values as {0!r} -> {1}, which is not the "
+                "{{group: {{name: value}}}} this reads".format(group, type(members).__name__))
+        flattened.update(members)
+    return flattened
 
 
 class Layout:
@@ -249,12 +274,14 @@ class Layout:
     while somebody is changing shaders in the interface.
     """
 
-    __slots__ = ("object", "instance_by_texture_set", "shader_by_instance")
+    __slots__ = ("object", "instance_by_texture_set", "shader_by_instance",
+                 "label_by_instance")
 
     def __init__(self):
         self.object = assignment()
         found = instances()
         identifier_by_label = {entry["label"]: entry["id"] for entry in found}
+        self.label_by_instance = {entry["id"]: entry["label"] for entry in found}
         shaders = self.object.get("shaders") or {}
         self.shader_by_instance = {}
         for entry in found:

@@ -505,6 +505,10 @@ _pending_display_names = {}
 #: the mesh they came with. Cleared when they are applied, so a reload that
 #: carries none does not re-apply the previous send's.
 _pending_textures = [None]
+#: An offer that named a shader this application did not have. Kept so it can be
+#: applied when the shelves finish discovering their resources -- the sending
+#: side publishes state once and has no reason to say it again.
+_offer_awaiting_a_shader = [None]
 
 
 def _on_texture_state(event):
@@ -651,7 +655,26 @@ def take_shader_values():
         if endpoint.topic is topic_module.SHADING:
             payload = arrived
     if payload is None:
+        payload = _offer_awaiting_a_shader[0]
+        _offer_awaiting_a_shader[0] = None
+    if payload is None:
         return None
+    return _apply_shader_values(payload)
+
+
+def _on_shelf_settled(_event):
+    """The shelves finished discovering resources. Anything waiting on one?"""
+    if _offer_awaiting_a_shader[0] is None or not substance_painter.project.is_open():
+        return
+    payload = _offer_awaiting_a_shader[0]
+    _offer_awaiting_a_shader[0] = None
+    try:
+        _apply_shader_values(payload)
+    except Exception as error:
+        LOG.error("could not apply the waiting shader values: %s", error)
+
+
+def _apply_shader_values(payload):
     report = shader_state.apply_by_texture_set(
         payload.get("by_texture_set", {}),
         payload.get("shader_url_by_texture_set"),
@@ -662,8 +685,9 @@ def take_shader_values():
                     "Texture Set the shader for %s and the values land",
                     texture_set, wanted, wanted)
     for name, why in sorted(report["no_shader"].items()):
-        LOG.warning("a material asks for the shader %r and %s; put it in a shelf and "
-                    "the values land on the next send", name, why)
+        LOG.warning("a material asks for the shader %r and %s; keeping the offer and "
+                    "trying again when the shelves settle", name, why)
+    _offer_awaiting_a_shader[0] = payload if report["no_shader"] else None
     refused = [label for label in ("unknown", "mismatched", "conflicting", "unmapped",
                                    "wrong_shader", "no_shader")
                if report[label]]
@@ -901,6 +925,8 @@ def start_plugin():
         _rest_in_the_strip()
     substance_painter.event.DISPATCHER.connect_strong(
         substance_painter.event.TextureStateEvent, _on_texture_state)
+    substance_painter.event.DISPATCHER.connect_strong(
+        substance_painter.event.ShelfCrawlingEnded, _on_shelf_settled)
     _timer = QtCore.QTimer(_panel)
     _timer.timeout.connect(_on_timer)
     _timer.start(POLL_MILLISECONDS)
@@ -931,6 +957,8 @@ def close_plugin():
         substance_painter.event.GraphicalUserInterfaceStarted, _rest_in_the_strip)
     substance_painter.event.DISPATCHER.disconnect(
         substance_painter.event.TextureStateEvent, _on_texture_state)
+    substance_painter.event.DISPATCHER.disconnect(
+        substance_painter.event.ShelfCrawlingEnded, _on_shelf_settled)
     CONNECTION.close()
     if _menu_action is not None:
         substance_painter.ui.delete_ui_element(_menu_action)
