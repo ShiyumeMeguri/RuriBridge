@@ -113,10 +113,13 @@ def mesh(source, intent, scene, materials, unit_scale, up_axis, binding_record=N
     ``materials`` are the producing side's material rows, carried verbatim.
 
     ``textures`` is what the sending side ALREADY has on those materials -- the
-    ground a texturing tool paints on top of. Each entry names a file beside the
-    GLB, the channel it belongs in, and the colour space the image itself
-    declares. Absent when the scene renders with no images, which is a real
-    answer rather than a missing one.
+    ground a texturing tool paints on top of. Each material has two sections:
+    ``channels`` are surface channels, the ground the painting goes on; and
+    ``lookups`` are images the shader samples directly through a parameter of
+    the slot's own name -- a ramp, a LUT, an SDF map -- which are not paintable
+    material and do not belong in a channel. Each entry names a file beside the
+    GLB and the colour space the image itself declares. Absent when the scene
+    renders with no images, which is a real answer rather than a missing one.
     """
     record = _base("mesh", source)
     record.update({

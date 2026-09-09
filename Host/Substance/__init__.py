@@ -693,6 +693,30 @@ def _on_shelf_settled(_event):
         LOG.error("could not apply the waiting shader values: %s", error)
 
 
+def _apply_lookup_textures(lookups):
+    """Point the shader's own texture parameters at the images that just landed.
+
+    These go through the same writer as every other parameter, because to the
+    shader they ARE parameters: the value of ``_DiffRampMap`` is the url of a
+    resource, the same way the value of ``_Metallic`` is a number. The gate is
+    primed with the result so this write does not read back as somebody else's
+    change and bounce straight out again."""
+    report = shader_state.apply_by_texture_set(lookups)
+    for label in ("unknown", "mismatched", "conflicting"):
+        _say_what_was_refused(label, report[label])
+    if report["unmapped"]:
+        LOG.warning("lookup textures for %d material(s) this project has no Texture "
+                    "Set for: %s", len(report["unmapped"]),
+                    ", ".join(report["unmapped"][:4]))
+    written = sum(len(names) for names in report["applied"].values())
+    LOG.info("pointed %d shader texture parameter(s) at the images that arrived", written)
+    try:
+        _shader_gate.suppress(shader_state.values_by_texture_set())
+    except shader_state.ShaderStateError as error:
+        LOG.error("could not re-read the shader values after the lookups: %s", error)
+    return report
+
+
 def _apply_shader_values(payload):
     report = shader_state.apply_by_texture_set(
         payload.get("by_texture_set", {}),
@@ -825,6 +849,8 @@ def _on_project_settled():
     if arrived is not None:
         try:
             report = texture_ingest.apply(arrived)
+            if report["lookups"]:
+                _apply_lookup_textures(report["lookups"])
             if _panel is not None and report["applied"]:
                 _panel.set_status("took {0} texture(s) into {1} Texture Set(s)".format(
                     report["applied"], len(report["sets"])))

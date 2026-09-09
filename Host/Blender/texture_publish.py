@@ -106,55 +106,66 @@ def _declared_images(material):
     the same channel packing declaration the shader on the other side was
     generated from.
 
-    Only lanes that are the whole image and need no arithmetic cross. A map with
-    roughness in red and metal in green is three pictures in one file, and a
-    two-channel normal has to be unpacked before it is a normal at all; sending
-    either one as it stands would put a wrong picture in a right-looking channel,
-    which is worse than not sending it. Those are named rather than dropped.
+    Three answers come back, because a texture is one of three things here:
+
+    * a SURFACE CHANNEL, when a whole-image lane needs no arithmetic -- base
+      colour, emission. Those land in the texturing tool's own channels;
+    * a LOOKUP the shader samples directly, when the slot declares no channel
+      lane at all: a diffuse ramp, a shadow LUT, an SDF lightmap, a matcap. The
+      whole file is what the shader wants and it wants it under the slot's own
+      name, so it crosses unchanged. Refusing these because "a ramp is not a
+      base colour" was the bug that left the generated shader sampling black --
+      it has 22 such samplers and they carry the entire stylised look;
+    * a PACKED map, when the lanes need arithmetic before they mean anything --
+      roughness in red and metal in green is three pictures in one file, and a
+      two-channel normal is not a normal until it is unpacked. Sending one of
+      those as it stands would put a wrong picture in a right-looking channel,
+      which is worse than not sending it. Those are named rather than dropped.
     """
     declaration = material.get(SHADING_DECLARATION)
     if declaration is None:
-        return None, ()
+        return None, None, ()
     section = dict(declaration).get("images") or {}
     group = material.get(str(section.get("group") or "")) or {}
     packing = dict(section.get("packing") or {})
     found = {}
+    raw = {}
     packed = []
     for slot in sorted(group.keys()):
         lanes = [tuple(lane) for lane in (packing.get(slot) or ())]
         whole = [lane for lane in lanes
                  if lane[0] in WHOLE_IMAGE_CHANNELS and not lane[2]]
-        if not lanes:
-            packed.append((slot, "declares no surface channel -- the whole image is a "
-                                 "lookup domain, and a ramp is not a base colour"))
-            continue
-        if not whole:
-            packed.append((slot, "packs {0} into single channels".format(
-                "/".join(lane[1] for lane in lanes))))
-            continue
         image = bpy.data.images.get(str(group[slot]))
         if image is None:
             packed.append((slot, "names {0!r}, and no image here answers to it".format(
                 str(group[slot]))))
             continue
+        if not lanes:
+            raw[slot] = image
+            continue
+        if not whole:
+            packed.append((slot, "packs {0} into single channels".format(
+                "/".join(lane[1] for lane in lanes))))
+            continue
         found.setdefault(whole[0][1], image)
-    return found, tuple(packed)
+    return found, raw, tuple(packed)
 
 
 def images_of(material):
-    """Every image this material renders with, by neutral channel name.
-
-    Returns what crosses and what could not, so a texture that stayed behind is
-    something said out loud rather than a channel that silently came up grey.
+    """Every image this material renders with: the ones that are surface
+    channels by neutral channel name, the ones the shader samples directly by
+    the slot name it samples them under, and what could not cross -- so a
+    texture that stayed behind is something said out loud rather than a channel
+    that silently came up grey.
     """
-    declared, packed = _declared_images(material)
+    declared, raw, packed = _declared_images(material)
     if declared is not None:
-        return declared, packed
+        return declared, raw, packed
     if not material.use_nodes or material.node_tree is None:
-        return {}, ()
+        return {}, {}, ()
     surface = _surface_node(material.node_tree)
     if surface is None:
-        return {}, ()
+        return {}, {}, ()
     found = {}
     for input_name, channel in SURFACE_INPUTS:
         if channel in found:
@@ -165,7 +176,9 @@ def images_of(material):
         image = _image_behind(socket)
         if image is not None:
             found[channel] = image
-    return found, ()
+    # An ordinary material has no slot vocabulary: everything it renders with
+    # reaches a surface input, which is the whole of what it can say.
+    return found, {}, ()
 
 
 #: What Blender calls a format, and what the file is called.
@@ -229,52 +242,64 @@ def _safe(name):
 def publish_into(staging, materials):
     """Write every material's textures into a staging generation.
 
-    Returns the record section: material identity -> channel -> file and colour
-    space. Empty when nothing in scope renders with an image, which is a real
-    answer and not a failure.
+    Returns the record section: material identity -> the channels it fills and
+    the lookups its shader samples, each naming a file beside the model and the
+    colour space the image itself declares. Empty when nothing in scope renders
+    with an image, which is a real answer and not a failure.
     """
     directory = os.path.join(str(staging.directory), TEXTURE_DIRECTORY_NAME)
     written = {}
     seen = {}
-    count = 0
-    total = 0
+    count = [0]
+    total = [0]
     left_behind = {}
+
+    def send(image, material, suffix):
+        """The file this image already is, written once however many materials
+        and slots point at it, described by what the image itself says."""
+        key = image.name
+        if key not in seen:
+            if not os.path.isdir(directory):
+                os.makedirs(directory, exist_ok=True)
+            try:
+                seen[key] = _write_image(image, directory, suffix)
+            except Exception as error:
+                LOG.warning("could not send %s for %s: %s", image.name,
+                            material.name, error)
+                return None
+            count[0] += 1
+            total[0] += seen[key][1]
+        return {
+            "file": seen[key][0],
+            # The image's own answer. Nothing here derives it from the channel
+            # or the file name; both are measured to be wrong.
+            "color_space": image.colorspace_settings.name,
+            "image": image.name,
+        }
+
     for material in materials:
-        found, packed = images_of(material)
+        found, raw, packed = images_of(material)
         for slot, why in packed:
             left_behind.setdefault("{0}: {1}".format(slot, why), 0)
             left_behind["{0}: {1}".format(slot, why)] += 1
-        if not found:
+        if not found and not raw:
             continue
         identity = material.get("ruri_bridge_identity") or material.name
         channels = {}
         for channel, image in sorted(found.items()):
-            key = image.name
-            if key not in seen:
-                if not os.path.isdir(directory):
-                    os.makedirs(directory, exist_ok=True)
-                try:
-                    seen[key] = _write_image(
-                        image, directory, "{0}_{1}".format(_safe(identity), channel))
-                except Exception as error:
-                    LOG.warning("could not send %s for %s: %s", image.name,
-                                material.name, error)
-                    continue
-                count += 1
-                total += seen[key][1]
-            file_name, _size = seen[key]
-            channels[channel] = {
-                "file": file_name,
-                # The image's own answer. Nothing here derives it from the channel
-                # or the file name; both are measured to be wrong.
-                "color_space": image.colorspace_settings.name,
-                "image": image.name,
-            }
-        if channels:
-            written[identity] = channels
-    if count:
+            entry = send(image, material, "{0}_{1}".format(_safe(identity), channel))
+            if entry is not None:
+                channels[channel] = entry
+        lookups = {}
+        for slot, image in sorted(raw.items()):
+            entry = send(image, material, "{0}_{1}".format(_safe(identity), _safe(slot)))
+            if entry is not None:
+                lookups[slot] = entry
+        if channels or lookups:
+            written[identity] = {"channels": channels, "lookups": lookups}
+    if count[0]:
         LOG.info("sent %d texture(s) for %d material(s), %.1f MB",
-                 count, len(written), total / 1e6)
+                 count[0], len(written), total[0] / 1e6)
     for reason, times in sorted(left_behind.items()):
         LOG.info("kept back, %dx: %s", times, reason)
     return {"directory": TEXTURE_DIRECTORY_NAME, "by_material": written} if written else {}

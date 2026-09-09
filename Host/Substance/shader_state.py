@@ -381,9 +381,11 @@ def _coerce(value, data_type):
             return False, value
         if kind == "Float":
             return isinstance(value, (bool, int, float)), float(value)
-        if kind == "String":
-            return isinstance(value, str), value
-        return False, value
+        # Anything not numeric is named rather than measured: a texture
+        # parameter's value is the url of an imported resource, and a string is
+        # the only shape that can be. Whether the url resolves is the
+        # application's own answer, given when it is set.
+        return isinstance(value, str), value
     if not isinstance(value, (list, tuple)) or len(value) != arity:
         return False, value
     if not all(isinstance(component, (bool, int, float)) for component in value):

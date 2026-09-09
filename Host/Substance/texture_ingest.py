@@ -127,53 +127,111 @@ def _set_channel(layer, channel_type, resource_id):
     layer.set_source(channel_type, resource_id)
 
 
+def _field(identifier, name):
+    """One field of a resource identifier, whether or not it is wrapped."""
+    attribute = getattr(identifier, name, None)
+    try:
+        return attribute() if callable(attribute) else attribute
+    except TypeError:
+        return attribute
+
+
+def _imported(path):
+    """One image in this project's own shelf, and the url that names it.
+
+    A live bridge sends the same ramp again on every push, so an import that
+    always imports would grow the shelf a copy at a time. Same name, same
+    project, same resource.
+    """
+    stem = path.stem
+    try:
+        for found in substance_painter.resource.search(stem):
+            identifier = found.identifier()
+            if _field(identifier, "name") == stem and _field(identifier, "context") == "project":
+                return found, _field(identifier, "url") or str(identifier)
+    except Exception:
+        pass
+    resource = substance_painter.resource.import_project_resource(
+        str(path), substance_painter.resource.Usage.TEXTURE)
+    identifier = resource.identifier()
+    return resource, _field(identifier, "url") or str(identifier)
+
+
 def apply(generation):
     """Put the payload's textures into the open project.
 
+    Two destinations, because the payload names two kinds of texture. A surface
+    channel becomes a fill layer's source, which is a thing the artist then
+    paints over. A LOOKUP -- a ramp, a LUT, an SDF map -- is not paintable
+    material: the shader samples it directly through a parameter of its own
+    name, so it lands as an imported resource whose url goes to that parameter.
+    Putting a ramp in a channel would be a wrong picture in a right-looking
+    place; leaving it out entirely leaves the shader sampling black.
+
     Returns what landed and what did not, by material, so a material this project
     has no Texture Set for is said out loud rather than dropped: it means the two
-    sides disagree about the model, and that is worth hearing.
+    sides disagree about the model, and that is worth hearing. ``lookups`` comes
+    back as Texture Set identity -> parameter name -> url, for the shader value
+    writer to push the same way it pushes every other parameter.
     """
     section = generation.record.get("textures") or {}
     by_material = section.get("by_material") or {}
     if not by_material:
-        return {"applied": 0, "sets": [], "homeless": []}
+        return {"applied": 0, "sets": [], "homeless": [], "lookups": {}}
     directory = generation.directory / section.get("directory", "")
     known = _texture_sets_by_name()
     applied = 0
     touched = []
     homeless = []
+    lookups = {}
+
+    def payload_file(identity, detail):
+        path = directory / detail["file"]
+        if not path.exists():
+            LOG.warning("%s names %s and the payload does not contain it",
+                        identity, detail["file"])
+            return None
+        return path
+
     with substance_painter.layerstack.ScopedModification("RuriBridge textures"):
-        for identity, channels in sorted(by_material.items()):
+        for identity, sections in sorted(by_material.items()):
             texture_set = known.get(identity)
             if texture_set is None:
                 homeless.append(identity)
                 continue
+            channels = sections.get("channels") or {}
             stack = texture_set.get_stack()
             layer = None
             for neutral, painter_name in CHANNELS:
                 detail = channels.get(neutral)
                 if detail is None:
                     continue
-                path = directory / detail["file"]
-                if not path.exists():
-                    LOG.warning("%s names %s and the payload does not contain it",
-                                identity, detail["file"])
+                path = payload_file(identity, detail)
+                if path is None:
                     continue
                 channel_type = _channel_type(painter_name)
                 if not stack.has_channel(channel_type):
                     stack.add_channel(channel_type,
                                       _format_for(detail.get("color_space")))
-                resource = substance_painter.resource.import_project_resource(
-                    str(path), substance_painter.resource.Usage.TEXTURE)
+                resource, _url = _imported(path)
                 if layer is None:
                     layer = _fill_layer(stack)
                 _set_channel(layer, channel_type, resource.identifier())
                 applied += 1
             if layer is not None:
                 touched.append(identity)
+            for slot, detail in sorted((sections.get("lookups") or {}).items()):
+                path = payload_file(identity, detail)
+                if path is None:
+                    continue
+                _resource, url = _imported(path)
+                lookups.setdefault(identity, {})[slot] = url
+                applied += 1
     if homeless:
         LOG.warning("%d material(s) in the payload have no Texture Set here: %s",
                     len(homeless), ", ".join(homeless[:4]))
-    LOG.info("put %d texture(s) into %d Texture Set(s)", applied, len(touched))
-    return {"applied": applied, "sets": touched, "homeless": homeless}
+    LOG.info("put %d texture(s) into %d Texture Set(s), %d of them lookups the "
+             "shader samples by name", applied, len(touched),
+             sum(len(entries) for entries in lookups.values()))
+    return {"applied": applied, "sets": touched, "homeless": homeless,
+            "lookups": lookups}
