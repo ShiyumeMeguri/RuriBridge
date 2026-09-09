@@ -25,6 +25,12 @@ SCENE_GRAPH = "scene_graph"
 #: There is an animation surface -- actions, curves, a playhead -- so a
 #: performance means something.
 ANIMATION = "animation"
+#: A model published elsewhere can be brought into this application's document.
+#: Not the same question as SCENE_GRAPH: a texturing tool has no scene graph and
+#: its whole document is built from a model, while an animation tool has a scene
+#: graph and animates the rig that is already in it -- the model does not arrive,
+#: it was already there.
+MODEL_INTAKE = "model_intake"
 #: Surfaces are grouped into texture sets that can be baked out. This is what
 #: makes a texture publication possible at all.
 TEXTURE_SETS = "texture_sets"

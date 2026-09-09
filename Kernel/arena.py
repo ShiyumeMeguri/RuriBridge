@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import json
 import mmap
 import os
@@ -98,6 +99,17 @@ def _mark_temporary(path):
     handle = ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_TEMPORARY)
     if not handle:
         LOG.debug("could not mark %s temporary: %s", path, ctypes.GetLastError())
+
+
+def keep_in_memory(path):
+    """Ask the cache manager to keep this file's pages resident.
+
+    For payloads another application wrote for itself. Everything produced
+    through :meth:`Arena.create_mapped_file` is already marked; this is the same
+    request, made after the fact, for bytes that arrived from outside.
+    """
+    _mark_temporary(Path(path))
+    return path
 
 
 def default_root():
@@ -185,6 +197,20 @@ class Arena:
         self.epoch = epoch
         self._index_by_channel = {name: index for index, name in enumerate(self.channels)}
 
+    @staticmethod
+    def shape_of(channels):
+        """A short, stable name for "this format, these channels".
+
+        Part of the directory name rather than a field to validate: a build that
+        computes a different shape wants different bytes, and going somewhere
+        else is the only move that works while another process has the old ones
+        mapped.
+        """
+        digest = hashlib.blake2b(
+            ("{0}\n{1}".format(FORMAT_VERSION, "\n".join(channels))).encode("ascii"),
+            digest_size=4)
+        return digest.hexdigest()
+
     @classmethod
     def open_session(cls, channels, session=DEFAULT_SESSION, root=None):
         """Attach to the named session, building it if nobody has yet.
@@ -194,58 +220,38 @@ class Arena:
         """
         _require_windows()
         root = Path(root) if root is not None else default_root()
-        directory = root / session
+        shaped = "{0}.{1}".format(session, cls.shape_of(channels))
+        directory = root / shaped
         directory.mkdir(parents=True, exist_ok=True)
         _mark_temporary(directory)
+        cls._sweep_other_shapes(root, session, shaped)
         control_path = directory / CONTROL_FILE_NAME
-        if control_path.exists() and not cls._speaks_this_format(control_path, channels):
-            cls._discard_stale(directory, control_path)
         if not control_path.exists():
             cls._materialise_control(control_path, channels)
-        return cls._attach(root, session, channels, control_path)
+        return cls._attach(root, shaped, channels, control_path)
 
     @classmethod
-    def _speaks_this_format(cls, control_path, channels):
-        """Magic, version, AND the exact channel list.
+    def _sweep_other_shapes(cls, root, session, keeping):
+        """Throw away this session's other shapes, once nobody holds them.
 
-        The channels are part of the format because they are not configuration:
-        they are computed from which applications this build knows about, so a
-        session carrying a different list was laid out by different software and
-        its slots do not mean what this build would read them as.
+        Best effort by construction: a directory that refuses to go is one
+        somebody still has mapped, and that is exactly the case this design
+        stopped needing to win. It is swept the next time nobody does.
         """
-        try:
-            with open(control_path, "rb") as handle:
-                magic, version, _count, _epoch = _HEADER.unpack_from(
-                    handle.read(HEADER_SIZE), 0)
-        except (OSError, struct.error):
-            return False
-        if magic != CONTROL_MAGIC or version != FORMAT_VERSION:
-            return False
-        try:
-            return cls._read_channel_names(control_path) == tuple(channels)
-        except ArenaError:
-            return False
-
-    @classmethod
-    def _discard_stale(cls, directory, control_path):
-        """Throw away a session written by a different build and start over.
-
-        A session is transport, not anybody's work: when the format moves, the
-        old one carries nothing worth migrating, and refusing to attach would
-        leave both applications staring at a session neither can open. It is
-        rebuilt rather than read.
-        """
-        try:
-            shutil.rmtree(directory)
-        except OSError as error:
-            raise ArenaError(
-                "session at {0} was written by a different build and cannot be "
-                "rebuilt while something still holds it open ({1}); close the other "
-                "Blender or Painter and try again".format(directory, error))
-        directory.mkdir(parents=True, exist_ok=True)
-        _mark_temporary(directory)
-        LOG.warning("discarded the session at %s: it was written by an older build",
-                    directory)
+        stale = list(root.glob(session + ".*"))
+        # And the shapeless directory an older build left: no build that names a
+        # shape can ever open it, and its pages are being kept resident for it.
+        bare = root / session
+        if bare.is_dir():
+            stale.append(bare)
+        for entry in stale:
+            if entry.name == keeping or not entry.is_dir():
+                continue
+            try:
+                shutil.rmtree(entry)
+                LOG.info("swept the session left by an earlier shape: %s", entry.name)
+            except OSError:
+                LOG.debug("%s is still held; leaving it for next time", entry.name)
 
     @classmethod
     def attach_existing(cls, session=DEFAULT_SESSION, root=None):
@@ -254,7 +260,9 @@ class Arena:
         root = Path(root) if root is not None else default_root()
         control_path = root / session / CONTROL_FILE_NAME
         if not control_path.exists():
-            raise ArenaError("no session at {0}".format(control_path))
+            raise ArenaError(
+                "no session at {0}; a session directory carries the shape it was "
+                "built for, so the bare name is not one".format(control_path))
         channels = cls._read_channel_names(control_path)
         return cls._attach(root, session, channels, control_path)
 
@@ -540,13 +548,22 @@ def list_sessions(root=None):
 
 
 def remove_session(session=DEFAULT_SESSION, root=None):
-    """Delete a session directory outright. Refuses while it is still mapped."""
+    """Delete a session outright, every shape of it. Refuses what is still mapped.
+
+    Every shape, because the name is what a person typed and the shapes are an
+    implementation detail of how a build addresses it -- being told "removed" and
+    finding one still there would be the wrong answer to the question asked.
+    """
     root = Path(root) if root is not None else default_root()
+    shapes = [entry for entry in root.glob(session + ".*") if entry.is_dir()]
     directory = root / session
-    if not directory.exists():
+    if directory.exists():
+        shapes.append(directory)
+    if not shapes:
         return False
     try:
-        shutil.rmtree(directory)
+        for entry in shapes:
+            shutil.rmtree(entry)
     except OSError as error:
         if error.errno in (errno.EACCES, errno.EBUSY):
             raise ArenaError(

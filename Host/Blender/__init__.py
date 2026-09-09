@@ -22,16 +22,17 @@ from ...Kernel import painter_host
 from ...Kernel import peers as peers_module
 from ...Kernel import record as record_module
 from ...Kernel import session as session_module
+from ...Kernel import summon as summon_module
 from ...Kernel import sync as sync_module
 from ...Kernel import topic as topic_module
 
-from . import mesh_publish, texture_ingest
+from . import glb_ingest, mesh_publish, texture_ingest
 
 # Kernel.host is deliberately absent: it holds the bound driver, and reloading it
 # would clear the binding while everything that already imported it kept the old
 # module object -- "no application is bound", from the next call on.
 for _module in (arena_module, record_module, sync_module, topic_module,
-                session_module, mesh_publish, texture_ingest):
+                session_module, glb_ingest, mesh_publish, texture_ingest):
     importlib.reload(_module)
 
 LOG = log_module.logger("blender")
@@ -416,6 +417,13 @@ def _receive(topic, generation, bind=True):
     """
     if topic is topic_module.TEXTURES:
         return texture_ingest.ingest(generation, bind=bind)
+    if topic is topic_module.ANIMATION:
+        path = generation.directory / generation.record.get(
+            "scene_file", record_module.SCENE_FILE_NAME)
+        return glb_ingest.apply_performance(
+            path, bpy.context.active_object,
+            name="{0}_{1}".format(generation.record.get("source", "bridge"),
+                                  generation.number))
     if topic is topic_module.REQUEST:
         asked = generation.record.get("for")
         if asked == record_module.ASK_FOR_MESH:
@@ -427,6 +435,56 @@ def _receive(topic, generation, bind=True):
     raise RuntimeError(
         "nothing here receives {0!r} yet, and the topic says this application "
         "hears it".format(topic.key))
+
+
+def publish_animation(context, scope="SELECTED"):
+    """Publish the performance on what is selected, as a GLB carrying only it.
+
+    Blender's own exporter writes it, for the same reason its importer reads the
+    way back: a second writer for a format the application already writes is a
+    second set of rounding.
+    """
+    if not CONNECTION.is_open:
+        raise RuntimeError("not attached to a bridge session")
+    publisher = CONNECTION.publisher(topic_module.ANIMATION)
+    with publisher.staging() as staging:
+        target = staging.path(record_module.SCENE_FILE_NAME)
+        bpy.ops.export_scene.gltf(
+            filepath=str(target), export_format="GLB",
+            use_selection=scope == "SELECTED", export_animations=True,
+            export_animation_mode="ACTIONS", export_skins=True,
+            export_yup=True, export_apply=False)
+        if not target.exists():
+            raise RuntimeError("the glTF exporter wrote nothing to {0}".format(target))
+        payload = record_module.mesh(
+            HOST.name, record_module.INTENT_AUTO,
+            {"name": context.scene.name}, [],
+            context.scene.unit_settings.scale_length, "Y")
+        payload["kind"] = topic_module.ANIMATION.key
+        payload["frame_start"] = context.scene.frame_start
+        payload["frame_end"] = context.scene.frame_end
+        payload["fps"] = context.scene.render.fps
+        return staging.publish(payload)
+
+
+def ask_for(peer_name, what, summon=True):
+    """Ask another application for something, and knock if it is not watching."""
+    if not CONNECTION.is_open:
+        raise RuntimeError("not attached to a bridge session")
+    generation = CONNECTION.publisher(topic_module.REQUEST).publish_record(
+        record_module.request(HOST.name, what))
+    knocked = summon and _knock(peer_name)
+    return generation, knocked
+
+
+def _knock(peer_name):
+    """Summon an application that does not watch. Silent for one that does."""
+    peer = peers_module.by_name(peer_name)
+    if peer.resident:
+        return ""
+    settings = _settings_or_none()
+    hint = getattr(settings, "cascadeur_executable", "") if settings else ""
+    return " ".join(summon_module.summon(peer_name, hint=hint))
 
 
 class RuriBridgeSettings(bpy.types.PropertyGroup):
@@ -568,6 +626,11 @@ class RuriBridgePreferences(bpy.types.AddonPreferences):
         name="Painter",
         description="Adobe Substance 3D Painter executable, used to start it on demand",
         subtype="FILE_PATH", default="")
+    cascadeur_executable: bpy.props.StringProperty(
+        name="Cascadeur",
+        description="Cascadeur executable. It does not keep a plugin running, so it "
+                    "has to be summoned to come and look at what was published",
+        subtype="FILE_PATH", default="")
     auto_launch: bpy.props.BoolProperty(
         name="Start Painter When Sending",
         description="If Painter is not attached when a mesh is sent, start it; the mesh "
@@ -628,6 +691,98 @@ def painter_is_attached():
     if not CONNECTION.is_open:
         return False
     return CONNECTION.session.present(peers_module.SUBSTANCE.name)
+
+
+def _cascadeur_hint():
+    stored = preferences()
+    return (bpy.path.abspath(stored.cascadeur_executable)
+            if stored is not None and stored.cascadeur_executable else "")
+
+
+def _summon_cascadeur():
+    """Knock, and say what was run. Empty when the application was not found."""
+    try:
+        return " ".join(summon_module.summon(
+            peers_module.CASCADEUR.name, hint=_cascadeur_hint()))
+    except summon_module.SummonError as error:
+        LOG.warning("could not summon Cascadeur: %s", error)
+        return ""
+
+
+class RURIBRIDGE_OT_locate_cascadeur(bpy.types.Operator):
+    bl_idname = "ruri_bridge.locate_cascadeur"
+    bl_label = "Find Cascadeur"
+    bl_description = "Read Cascadeur's install path out of the Windows registry"
+
+    def execute(self, context):
+        found = summon_module.locate(peers_module.CASCADEUR)
+        if not found:
+            self.report({"WARNING"},
+                        "Windows has no registration for cascadeur.exe; type the path")
+            return {"CANCELLED"}
+        preferences().cascadeur_executable = found
+        self.report({"INFO"}, found)
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_send_rig(bpy.types.Operator):
+    bl_idname = "ruri_bridge.send_rig"
+    bl_label = "Send Rig to Cascadeur"
+    bl_description = ("Publish the selected objects as the model, then summon "
+                      "Cascadeur to take it. The model is authored here and only "
+                      "here; what comes back is the performance")
+
+    def execute(self, context):
+        try:
+            generation = publish_mesh(context, settings_scope(),
+                                      record_module.INTENT_AUTO, True)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        knocked = _summon_cascadeur()
+        self.report({"INFO"}, "sent the rig, generation {0}{1}".format(
+            generation.number, "; summoned Cascadeur" if knocked else ""))
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_send_animation(bpy.types.Operator):
+    bl_idname = "ruri_bridge.send_animation"
+    bl_label = "Send Animation to Cascadeur"
+    bl_description = "Publish the performance on the selection, then summon Cascadeur"
+
+    def execute(self, context):
+        try:
+            generation = publish_animation(context, settings_scope())
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        knocked = _summon_cascadeur()
+        self.report({"INFO"}, "sent the performance, generation {0}{1}".format(
+            generation.number, "; summoned Cascadeur" if knocked else ""))
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_fetch_animation(bpy.types.Operator):
+    bl_idname = "ruri_bridge.fetch_animation"
+    bl_label = "Fetch Animation from Cascadeur"
+    bl_description = ("Ask Cascadeur for what it currently has and summon it to "
+                      "answer. What comes back lands on the active armature")
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.active_object.type == "ARMATURE"
+
+    def execute(self, context):
+        try:
+            generation, knocked = ask_for(peers_module.CASCADEUR.name,
+                                          record_module.ASK_FOR_ANIMATION)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "asked Cascadeur, generation {0}{1}".format(
+            generation.number,
+            "; summoned it" if knocked else "; could not summon it"))
+        return {"FINISHED"}
 
 
 class RURIBRIDGE_OT_locate_painter(bpy.types.Operator):
@@ -812,13 +967,25 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         if not CONNECTION.is_open:
             state.label(text="Not attached to a session", icon="UNLINKED")
             state.operator(RURIBRIDGE_OT_reconnect.bl_idname, icon="LINKED")
-        elif painter_is_attached():
-            state.label(text="Painter is attached", icon="LINKED")
         else:
-            state.label(text="Painter is not attached", icon="UNLINKED")
-            row = state.row(align=True)
-            row.operator(RURIBRIDGE_OT_launch_painter.bl_idname, icon="PLAY")
-            row.operator(RURIBRIDGE_OT_locate_painter.bl_idname, text="", icon="VIEWZOOM")
+            for name, here in CONNECTION.session.attendance():
+                if name == HOST.name:
+                    continue
+                peer = peers_module.by_name(name)
+                if here:
+                    state.label(text="{0} is attached".format(peer.label), icon="LINKED")
+                elif peer.resident:
+                    state.label(text="{0} is not attached".format(peer.label),
+                                icon="UNLINKED")
+                    row = state.row(align=True)
+                    row.operator(RURIBRIDGE_OT_launch_painter.bl_idname, icon="PLAY")
+                    row.operator(RURIBRIDGE_OT_locate_painter.bl_idname,
+                                 text="", icon="VIEWZOOM")
+                else:
+                    # Not a problem to report: this application is not supposed to
+                    # be sitting there watching. It is summoned when it is needed.
+                    state.label(text="{0} is summoned when needed".format(peer.label),
+                                icon="TIME")
 
         column = layout.column(align=True)
         column.enabled = CONNECTION.is_open
@@ -846,6 +1013,16 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         manual.operator(RURIBRIDGE_OT_request_export.bl_idname, icon="IMPORT")
         manual.operator(RURIBRIDGE_OT_pull_textures.bl_idname, icon="FILE_REFRESH")
         manual.operator(RURIBRIDGE_OT_push_shader_parameters.bl_idname, icon="NODE_MATERIAL")
+
+        animation = layout.column(align=True)
+        animation.enabled = CONNECTION.is_open
+        animation.label(text="Animation", icon="ARMATURE_DATA")
+        animation.operator(RURIBRIDGE_OT_send_rig.bl_idname, icon="OUTLINER_OB_ARMATURE")
+        animation.operator(RURIBRIDGE_OT_send_animation.bl_idname, icon="ACTION")
+        animation.operator(RURIBRIDGE_OT_fetch_animation.bl_idname, icon="IMPORT")
+        if not _cascadeur_hint() and not summon_module.locate(peers_module.CASCADEUR):
+            row = animation.row(align=True)
+            row.operator(RURIBRIDGE_OT_locate_cascadeur.bl_idname, icon="VIEWZOOM")
 
         if settings.status:
             layout.box().label(text=settings.status, icon="INFO")
@@ -876,7 +1053,10 @@ class RURIBRIDGE_PT_diagnostics(bpy.types.Panel):
                 state.dropped_generations))
 
 
-_CLASSES = (RuriBridgeSettings, RURIBRIDGE_OT_locate_painter, RuriBridgePreferences,
+_CLASSES = (RuriBridgeSettings, RURIBRIDGE_OT_locate_painter,
+            RURIBRIDGE_OT_locate_cascadeur, RURIBRIDGE_OT_send_rig,
+            RURIBRIDGE_OT_send_animation, RURIBRIDGE_OT_fetch_animation,
+            RuriBridgePreferences,
             RURIBRIDGE_OT_launch_painter, RURIBRIDGE_OT_reconnect,
             RURIBRIDGE_OT_publish_mesh, RURIBRIDGE_OT_request_export,
             RURIBRIDGE_OT_pull_textures, RURIBRIDGE_OT_push_shader_parameters,

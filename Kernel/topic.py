@@ -4,9 +4,10 @@
 A topic is declared the way a capability-gated feature is declared everywhere
 else: a key, and the capability a host must answer for. The difference is that a
 stream has two ends, so it names two -- speaking and hearing are not the same
-question. Painter HEARS a model (its whole project is one) and cannot SPEAK one;
-Blender does both; Cascadeur speaks and hears models and performances, and
-neither speaks nor hears a texture.
+question, and most streams have one author and several readers. The model is
+stated by the application it is authored in and taken by the two that cannot
+change it; the performance is stated and taken by the two that have an animation
+surface; the baked channels are stated by the one that bakes them.
 
 Nothing here is a table by application name. A host answers for capabilities, a
 topic asks for capabilities, and the join decides what that application is
@@ -72,10 +73,12 @@ class Topic:
 
 
 #: A model: geometry, its material rows, and the transform each piece sits at.
-#: Anything with a scene graph can state one; anything at all can receive one,
-#: because receiving a model is what a texturing tool's whole project is.
+#: ONE application states it -- the one the model is authored in -- and the
+#: others take it. A texturing tool and an animation tool both need it and
+#: neither can change it, so a model coming back from either could only be a
+#: worse copy of the one that went out.
 MESH = Topic(
-    "mesh", QUEUED, speaks=host_port.SCENE_GRAPH, hears=None,
+    "mesh", QUEUED, speaks=host_port.SCENE_GRAPH, hears=host_port.MODEL_INTAKE,
     description="A model and its materials, as the speaker has it now")
 
 #: Baked channels coming out of a texturing tool. Only a host whose materials are

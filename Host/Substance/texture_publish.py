@@ -25,6 +25,7 @@ import substance_painter.export
 import substance_painter.project
 import substance_painter.textureset
 
+from ...Kernel import arena as arena_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
@@ -290,6 +291,13 @@ def publish(arena, publisher, preset_name=DEFAULT_PRESET_NAME, selected_texture_
         result = substance_painter.export.export_project_textures(configuration)
         if result.status != substance_painter.export.ExportStatus.Success:
             LOG.warning("export finished as %s: %s", result.status, result.message)
+        # This application has no buffer-shaped exit -- rendering to a path is the
+        # only door there is -- so the files it just made are ordinary ones. Asking
+        # for them to stay resident is what keeps the leg at one write and one
+        # read: the reader on the other side maps these same pages.
+        for written in result.textures.values():
+            for entry in written:
+                arena_module.keep_in_memory(entry)
 
         texture_sets = []
         for identity, paths in result.textures.items():

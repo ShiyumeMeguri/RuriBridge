@@ -25,6 +25,7 @@ FORMAT_VERSION = 1
 #: old kinds carried is now the channel a record arrived on.
 ASK_FOR_MESH = "mesh"
 ASK_FOR_TEXTURES = "textures"
+ASK_FOR_ANIMATION = "anim"
 
 INTENT_AUTO = "auto"
 INTENT_CREATE_PROJECT = "create_project"

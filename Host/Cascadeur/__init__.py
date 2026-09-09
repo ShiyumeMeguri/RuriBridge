@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import csc
 
+from ...Kernel import arena as arena_module
 from ...Kernel import host as host_port
 from ...Kernel import log as log_module
 from ...Kernel import peers as peers_module
@@ -135,8 +136,9 @@ def _receive(topic, generation):
             generation.record.get("source"))
     if topic is topic_module.REQUEST:
         asked = generation.record.get("for")
-        if asked == record_module.ASK_FOR_MESH:
-            return publish(topic_module.MESH, selected_only=False)
+        if asked == record_module.ASK_FOR_ANIMATION:
+            return "published {0}".format(
+                publish(topic_module.ANIMATION).number)
         raise RuntimeError(
             "{0} asked for {1!r}, which this application does not answer".format(
                 generation.record.get("source"), asked))
@@ -149,6 +151,7 @@ def _receive(topic, generation):
 # Publishing
 # ---------------------------------------------------------------------------
 def _export_options(with_animation, selected_only):
+    """What leaves: the performance, at this application's own frame rate."""
     options = csc.glb.ExportOptions()
     options.include_animation = with_animation
     options.for_selected_objects = selected_only
@@ -160,7 +163,13 @@ def _export_options(with_animation, selected_only):
 
 
 def publish(topic, selected_only=False, connection=None):
-    """Write what this application currently has onto one of its topics."""
+    """Write the performance this application currently holds.
+
+    Only the performance: this is where a rig is animated, not where a model is
+    authored, and a model published from here could only be a worse copy of the
+    one that arrived. The roster says the same thing (no SCENE_GRAPH), so asking
+    for any other topic is refused by the session before it reaches here.
+    """
     live = connection or CONNECTION
     if not live.is_open:
         raise RuntimeError("not attached to a bridge session")
@@ -169,11 +178,13 @@ def publish(topic, selected_only=False, connection=None):
         path = staging.path(record_module.SCENE_FILE_NAME)
         csc.glb.process_export(
             domain_scene(), str(path),
-            _export_options(with_animation=topic is topic_module.ANIMATION,
-                            selected_only=selected_only))
+            _export_options(with_animation=True, selected_only=selected_only))
         if not path.exists():
             raise RuntimeError(
                 "csc.glb.process_export wrote nothing to {0}".format(path))
+        # It wrote the file itself, so it is an ordinary one until it is asked to
+        # stay resident -- and the reader on the other side maps these pages.
+        arena_module.keep_in_memory(path)
         payload = record_module.mesh(
             HOST.name, record_module.INTENT_AUTO,
             {"name": _scene_name()}, [], CENTIMETRES_PER_METRE, "Y")

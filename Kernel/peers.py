@@ -85,22 +85,28 @@ class Peer:
 BLENDER = Peer(
     "Blender", "Blender",
     capabilities=(host_port.SCENE_GRAPH, host_port.ANIMATION,
-                  host_port.NODE_MATERIALS, host_port.SHADING_PARAMETERS),
+                  host_port.MODEL_INTAKE, host_port.NODE_MATERIALS,
+                  host_port.SHADING_PARAMETERS),
     resident=True,
     attach=ATTACH_NATIVE,
     executable_name="blender.exe")
 
 SUBSTANCE = Peer(
     "Substance", "Substance 3D Painter",
-    capabilities=(host_port.TEXTURE_SETS, host_port.SHADING_PARAMETERS),
+    capabilities=(host_port.TEXTURE_SETS, host_port.MODEL_INTAKE,
+                  host_port.SHADING_PARAMETERS),
     resident=True,
     attach=ATTACH_JUNCTION,
     plugin_subpath=("python", "plugins"),
     executable_name="Adobe Substance 3D Painter.exe")
 
+#: An animation tool. It TAKES the rig -- it has to have one to animate -- and
+#: what it has to say back is the performance and nothing else. The model has one
+#: author, and it is not this application: it cannot change a mesh, so a mesh
+#: leaving here could only be a worse copy of the one that arrived.
 CASCADEUR = Peer(
     "Cascadeur", "Cascadeur",
-    capabilities=(host_port.SCENE_GRAPH, host_port.ANIMATION),
+    capabilities=(host_port.ANIMATION, host_port.MODEL_INTAKE),
     resident=False,
     attach=ATTACH_COPY,
     plugin_subpath=("resources", "scripts", "python", "commands", "ruri"),
