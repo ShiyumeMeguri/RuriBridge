@@ -31,6 +31,7 @@ from . import channel as channel_module
 from . import glb as glb_module
 from . import log as log_module
 from . import painter_host
+from . import counterpart as counterpart_module
 from . import peers as peers_module
 from . import record as record_module
 from . import topic as topic_module
@@ -477,24 +478,84 @@ def enable_painter_plugin(name=INSTALLED_NAME):
     return completed.stdout.strip()
 
 
-def command_install(arguments):
-    """Point Painter at this checkout. Blender already has it -- it lives there.
+def _attach_junction(peer, root, arguments):
+    """A directory junction from that application's plugin folder to the package.
 
-    The checkout *is* the Blender add-on, so there is nothing to install on that
-    side; only Painter needs a junction into the plugin folder inside it.
+    To the package root, not to a leg of it: every application loads the same
+    folder and the detection inside it decides which leg runs, so a junction that
+    pointed at one leg would be naming the answer before asking the question.
+    """
+    folder = getattr(arguments, "painter_plugins", None)
+    if not folder:
+        print("{0:<16} skipped (no --painter-plugins)".format(peer.name))
+        return 0
+    target = Path(folder) / INSTALLED_NAME
+    action = _link_or_copy(root, target, arguments.copy)
+    print("{0:<16} {1} {2}".format(peer.name, action, target))
+    if arguments.enable_painter_plugin:
+        print("{0:<16} launch_at_start = {1} (read at its next start)".format(
+            "", enable_painter_plugin()))
+    return 1
+
+
+def _attach_copy(peer, root, arguments):
+    """A generated doorway inside that application's own command folder.
+
+    Written rather than linked because the application loads commands by module
+    path out of its installation, and regenerated every time so a checkout that
+    moved cannot leave a doorway pointing at where it used to be.
+    """
+    executable = getattr(arguments, "cascadeur", None)
+    if not executable:
+        print("{0:<16} skipped (no --cascadeur)".format(peer.name))
+        return 0
+    install = Path(executable)
+    if install.is_file():
+        install = install.parent
+    folder = install.joinpath(*peer.plugin_subpath)
+    folder.mkdir(parents=True, exist_ok=True)
+    marker = folder / "__init__.py"
+    if not marker.exists():
+        marker.write_text("", encoding="utf-8")
+    doorway = folder / "link.py"
+    doorway.write_text(
+        counterpart_module.render(str(root), arguments.session), encoding="utf-8")
+    print("{0:<16} wrote {1}".format(peer.name, doorway))
+    print("{0:<16} summon: {1} {2}".format(
+        "", executable, " ".join(peer.summons("link"))))
+    return 1
+
+
+ATTACHERS = {
+    peers_module.ATTACH_JUNCTION: _attach_junction,
+    peers_module.ATTACH_COPY: _attach_copy,
+}
+
+
+def command_install(arguments):
+    """Put this checkout where every application in the roster can reach it.
+
+    One loop, no branch on which application: each row says how its own
+    application takes our code, and the one this checkout already IS says
+    "native" and is simply printed.
     """
     root = _repository_root()
-    print("blender add-on   {0}".format(root))
-    target = Path(arguments.painter_plugins) / INSTALLED_NAME
-    action = _link_or_copy(root / PAINTER_PLUGIN_DIRECTORY_NAME, target, arguments.copy)
-    print("painter plugin   {0} {1}".format(action, target))
-    if arguments.enable_painter_plugin:
-        print("painter launch_at_start = {0} (read at Painter's next start)".format(
-            enable_painter_plugin()))
+    done = 0
+    for peer in peers_module.PEERS:
+        if peer.attach == peers_module.ATTACH_NATIVE:
+            print("{0:<16} native {1}".format(peer.name, root))
+            done += 1
+            continue
+        attacher = ATTACHERS.get(peer.attach)
+        if attacher is None:
+            raise RuntimeError(
+                "{0} says it attaches by {1!r} and nothing here does that".format(
+                    peer.name, peer.attach))
+        done += attacher(peer, root, arguments)
     if arguments.copy:
         print("a copied plugin folder cannot find the shared core above it; "
               "junction unless the whole checkout was copied")
-    return 0
+    return 0 if done else 1
 
 
 def build_parser():
@@ -568,7 +629,9 @@ def build_parser():
     pull.set_defaults(handler=command_pull_textures)
 
     install = subparsers.add_parser("install")
-    install.add_argument("--painter-plugins", required=True,
+    install.add_argument("--cascadeur",
+                         help="path to cascadeur.exe, or its install folder")
+    install.add_argument("--painter-plugins",
                          help="Painter's user python/plugins folder")
     install.add_argument("--copy", action="store_true",
                          help="copy instead of creating a directory junction")
