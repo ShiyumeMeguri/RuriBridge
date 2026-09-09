@@ -169,7 +169,7 @@ def _imported(path):
 def _user_channel(entry):
     """The channel type and format one manifest entry asks for, or None when this
     build spells them differently."""
-    number = "".join(character for character in entry.get("channel", "") if character.isdigit())
+    number = "".join(character for character in entry.get("binding", "") if character.isdigit())
     if not number:
         return None, None
     channel_type = getattr(substance_painter.textureset.ChannelType, "User" + number, None)
@@ -263,14 +263,16 @@ def apply(generation, vocabulary=None):
                         unspeakable.add(slot)
                         continue
                     if not stack.has_channel(channel_type):
+                        # Labelled with what the shader calls it, so the channel list
+                        # reads as the maps it holds and not as a row of slot numbers.
                         stack.add_channel(channel_type, channel_format,
-                                          spoken.get("label") or slot)
+                                          spoken.get("name") or slot)
                     resource, _url = _imported(path)
                     if layer is None:
                         layer = _fill_layer(stack)
                         touched.append(identity)
                     _set_channel(layer, channel_type, resource.identifier())
-                    painted.setdefault(identity, {})[slot] = spoken.get("channel", "")
+                    painted.setdefault(identity, {})[slot] = spoken.get("name", "")
                     applied += 1
                     continue
                 _resource, url = _imported(path)

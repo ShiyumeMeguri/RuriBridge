@@ -167,10 +167,12 @@ def shader_vocabulary(name):
                 spelled = str(source.get("Source") or "")
                 if spelled:
                     found[spelled] = {
-                        "channel": str(entry.get("Id") or ""),
+                        # The binding is the application's numbered token; the id is
+                        # what the shader and the artist both call it.
+                        "binding": str(entry.get("Binding") or ""),
+                        "name": str(entry.get("Id") or ""),
                         "components": int(entry.get("Components") or 0),
                         "format": str(entry.get("Format") or ""),
-                        "label": str(entry.get("Label") or spelled),
                     }
         LOG.info("%s says %d of its textures are paintable channels", os.path.basename(path),
                  len(found))
