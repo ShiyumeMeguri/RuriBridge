@@ -290,18 +290,49 @@ def _material_row(material, fresh=()):
     return row
 
 
+def _worn_by_triangles(objects):
+    """The materials some triangle in scope is actually rendered with.
+
+    A model imported from a game arrives with slots nothing uses -- variant and
+    detail-level leftovers -- and a slot no triangle points at is not shading
+    anything. Offering its values means offering them for a material the other
+    side has no Texture Set for, because it was never sent one, which reads in
+    that application's log as the two sides disagreeing about the model.
+    """
+    worn = set()
+    for object_reference in objects:
+        data = getattr(object_reference, "data", None)
+        polygons = getattr(data, "polygons", None)
+        slots = object_reference.material_slots
+        if polygons is None:
+            worn.update(slot.material.name for slot in slots if slot.material)
+            continue
+        used = set()
+        for polygon in polygons:
+            used.add(polygon.material_index)
+        for index in used:
+            if index < len(slots) and slots[index].material is not None:
+                worn.add(slots[index].material.name)
+    return worn
+
+
 def parameter_rows(objects, fresh=()):
-    """Every distinct material in scope, with what it is set to.
+    """Every material in scope that some triangle renders with, and what it is
+    set to.
 
     Read off the slots rather than off a payload: this answers "what is the
     shading in scope", which is a question about the document and not about the
-    last thing that was sent.
+    last thing that was sent. Which slots count is the same question the mesh
+    payload answers with :func:`materials_in`, and it has the same answer.
     """
     rows = []
     seen = set()
+    worn = _worn_by_triangles(objects)
     for object_reference in objects:
         for slot in object_reference.material_slots:
             if slot.material is None or slot.material.name in seen:
+                continue
+            if slot.material.name not in worn:
                 continue
             seen.add(slot.material.name)
             row = _material_row(slot.material, fresh)
