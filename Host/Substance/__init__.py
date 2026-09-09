@@ -258,7 +258,8 @@ def publish_shader_state():
         return None
     return CONNECTION.writer(topic_module.SHADING).write(record_module.shading(
         HOST.name, shader_state.values_by_texture_set(),
-        shader_name_by_texture_set=shader_state.shader_by_texture_set()))
+        shader_name_by_texture_set=shader_state.shader_by_texture_set(),
+        lookups_by_texture_set=dict(_lookups_held)))
 
 
 def publish_textures(preset_name):
@@ -418,7 +419,8 @@ class RuriBridgePanel(QtWidgets.QWidget):
             values = shader_state.values_by_texture_set()
             _shader_gate.prime(values)
             CONNECTION.writer(topic_module.SHADING).write(
-                record_module.shading(HOST.name, values))
+                record_module.shading(HOST.name, values,
+                                  lookups_by_texture_set=dict(_lookups_held)))
         except Exception as error:
             LOG.error("could not send shader values: %s", error)
             self.set_status("send failed: {0}".format(error))
@@ -609,7 +611,8 @@ def live_sync():
                  cost * 1000.0, interval)
     if _shader_gate.should_publish(values):
         CONNECTION.writer(topic_module.SHADING).write(
-            record_module.shading(HOST.name, values))
+            record_module.shading(HOST.name, values,
+                                  lookups_by_texture_set=dict(_lookups_held)))
         _panel.set_status("live: sent shader values")
 
 
@@ -693,6 +696,15 @@ def _on_shelf_settled(_event):
         LOG.error("could not apply the waiting shader values: %s", error)
 
 
+#: What this application's shader texture parameters point at, as READ BACK from
+#: it after they were set. Kept because the cheap value poll cannot see them --
+#: this application's own serialisation of an instance carries numbers and not
+#: resource references -- and asking the expensive question on every poll would
+#: cost a full shader declaration per instance for an answer that only moves when
+#: images arrive. Refreshed exactly then.
+_lookups_held = {}
+
+
 def _apply_lookup_textures(lookups):
     """Point the shader's own texture parameters at the images that just landed.
 
@@ -711,9 +723,14 @@ def _apply_lookup_textures(lookups):
     written = sum(len(names) for names in report["applied"].values())
     LOG.info("pointed %d shader texture parameter(s) at the images that arrived", written)
     try:
+        _lookups_held.clear()
+        _lookups_held.update(shader_state.texture_values_by_texture_set())
         _shader_gate.suppress(shader_state.values_by_texture_set())
     except shader_state.ShaderStateError as error:
         LOG.error("could not re-read the shader values after the lookups: %s", error)
+    held = sum(len(entry) for entry in _lookups_held.values())
+    LOG.info("the shader now points at %d image(s) across %d Texture Set(s)",
+             held, len(_lookups_held))
     return report
 
 
@@ -744,7 +761,8 @@ def _apply_shader_values(payload):
     _shader_gate.suppress(values)
     if refused:
         CONNECTION.writer(topic_module.SHADING).write(
-            record_module.shading(HOST.name, values))
+            record_module.shading(HOST.name, values,
+                                  lookups_by_texture_set=dict(_lookups_held)))
         LOG.info("wrote back what actually stuck, because %s", ", ".join(refused))
     if _panel is not None:
         _panel.set_status("applied shader values: {0}".format(report["applied"] or "nothing"))

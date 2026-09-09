@@ -185,7 +185,8 @@ def presence(source, is_open, project_path, mesh_path, texture_sets,
 
 
 def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
-            vocabulary_by_texture_set=None, shader_name_by_texture_set=None):
+            vocabulary_by_texture_set=None, shader_name_by_texture_set=None,
+            lookups_by_texture_set=None):
     """Either way: the current value of every watched uniform, and nothing else.
 
     This is the record that rides in the control block rather than in a
@@ -214,6 +215,14 @@ def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
     block that holds half of one: the publish raised, and the state that mattered
     never crossed at all. A name per Texture Set is the whole of the shape a
     receiver needs.
+
+    ``lookups_by_texture_set`` is the one part of a shader's state that is a name
+    rather than a number: the images its texture parameters point at. Nothing
+    consuming this record can use another application's url, so it is here to be
+    READ -- it is how "the shader is sampling the ramp that arrived" stops being
+    something a log claims and becomes something the session states. The values
+    are read back out of the shader after they are set, not remembered from what
+    was sent.
     """
     record = _base("shade", source)
     record.update({
@@ -221,6 +230,7 @@ def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
         "shader_url_by_texture_set": shader_url_by_texture_set or {},
         "vocabulary_by_texture_set": vocabulary_by_texture_set or {},
         "shader_name_by_texture_set": shader_name_by_texture_set or {},
+        "lookups_by_texture_set": lookups_by_texture_set or {},
     })
     return record
 

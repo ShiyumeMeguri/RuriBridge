@@ -244,6 +244,37 @@ def values_by_texture_set():
     return found
 
 
+def texture_values_by_texture_set(layout=None):
+    """What each Texture Set's shader texture parameters currently point at.
+
+    Read from ``parameters()`` and not from the layout object, because this
+    application's own serialisation of an instance carries its numbers and not
+    its resource references -- so the one thing a picture-shaped parameter has to
+    say is exactly the thing the cheap read leaves out.
+
+    That read is the expensive one (a full declaration per instance), so this is
+    asked when the answer can have changed -- after images are pointed at -- and
+    not on the value poll, which is looking for moved numbers.
+    """
+    layout = layout or Layout()
+    found = {}
+    asked = {}
+    for identity, identifier in layout.instance_by_texture_set.items():
+        # Read once per INSTANCE, not once per Texture Set: several sets share
+        # one instance until somebody gives them different shaders. And read it
+        # fresh -- the declaration cache answers for what a shader exposes, which
+        # does not move, while this is asking what it currently holds, which just
+        # did.
+        if identifier not in asked:
+            asked[identifier] = {
+                name: body.get("value") for name, body in parameters(identifier).items()
+                if isinstance(body, dict) and isinstance(body.get("value"), str)
+                and body.get("value")}
+        if asked[identifier]:
+            found[identity] = dict(asked[identifier])
+    return found
+
+
 def _flat(by_group):
     """Values as names, out of the groups the panel arranges them in.
 
