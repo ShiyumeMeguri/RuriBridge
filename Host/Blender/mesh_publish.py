@@ -450,6 +450,27 @@ def _slot_material_identities(object_reference):
     return identities
 
 
+def _uv_layers_in_send_order(mesh, name):
+    """The mesh's UV maps with the one it renders with first.
+
+    The first set is the one the far side paints in, and this application does
+    not render with its first UV map -- it renders with the one it marks active.
+    A mesh that kept an older unwrap beside the real one therefore crossed with
+    the wrong coordinates in the slot everything reads, and the paint landed
+    somewhere plausible enough to look like a shading fault rather than a
+    mismatch of maps. The rest keep their order, so a map named for a slot still
+    arrives in it.
+    """
+    layers = list(mesh.uv_layers)
+    active = next((layer for layer in layers if layer.active_render), None)
+    if active is not None and layers and layers[0] is not active:
+        layers.remove(active)
+        layers.insert(0, active)
+        LOG.info("%s renders with UV map %r, not the first one; it goes first",
+                 name, active.name)
+    return layers[:MAXIMUM_TEXCOORD_SETS]
+
+
 def _read_colors(mesh, corner_count, vertex_count):
     """The active colour attribute, with the domain it lives on."""
     layer = mesh.color_attributes.active_color
@@ -566,7 +587,7 @@ def gather_object(object_reference, depsgraph, include_colors=True):
         corner_normal = corner_normal.reshape(-1, 3)
 
         texcoords = []
-        for layer in list(mesh.uv_layers)[:MAXIMUM_TEXCOORD_SETS]:
+        for layer in _uv_layers_in_send_order(mesh, object_reference.name):
             values = numpy.empty(corner_count * 2, dtype=numpy.float32)
             layer.uv.foreach_get("vector", values)
             values = values.reshape(-1, 2)
