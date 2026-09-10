@@ -24,12 +24,14 @@ from __future__ import annotations
 import uuid
 
 import bpy
+import mathutils
 import numpy
 
 from ...Kernel import record as record_module
-from ...Kernel.glb import (AttributeLayout, GlbWriter, MeshLayout, PrimitiveLayout,
-                             SceneLayout, SEMANTIC_COLOR_0, SEMANTIC_NORMAL,
-                             SEMANTIC_POSITION, TEXCOORD_PREFIX)
+from ...Kernel.glb import (AttributeLayout, BLENDER_TO_GLTF_ROTATION, GlbWriter,
+                             MeshLayout, PrimitiveLayout, SceneLayout,
+                             SEMANTIC_COLOR_0, SEMANTIC_NORMAL, SEMANTIC_POSITION,
+                             TEXCOORD_PREFIX)
 from ...Kernel.log import logger
 from . import texture_publish
 
@@ -331,6 +333,37 @@ def _worn_by_triangles(objects):
     return worn
 
 
+#: The names the far side's shader exposes for the object's axes. Three columns
+#: rather than a matrix because a shader parameter is a vector; the fourth column
+#: is a translation the shading never reads.
+OBJECT_BASIS_PARAMETERS = ("i_ObjectToWorld0", "i_ObjectToWorld1", "i_ObjectToWorld2")
+
+#: What the shading language calls object space, relative to this application's:
+#: Y and Z swapped. It is a reflection, not a rotation -- the two handedness
+#: conventions differ -- which is exactly why a host left to assume the identity
+#: gets every left-right term backwards rather than merely rotated.
+_OBJECT_AXIS_SWAP = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0),
+                                      (0.0, 0.0, 1.0, 0.0),
+                                      (0.0, 1.0, 0.0, 0.0),
+                                      (0.0, 0.0, 0.0, 1.0)))
+
+
+def object_basis(object_reference):
+    """The object's axes as the far side's world sees them, column by column.
+
+    Composed from the three pieces this side knows: where the object stands, the
+    rotation the payload's root node carries so the far side's up axis is Y, and
+    the swap above. The far side multiplies vectors by these columns exactly as
+    the engine does with its object matrix, so composing them here means neither
+    host holds a second opinion about any of the three.
+    """
+    root = mathutils.Quaternion(
+        (BLENDER_TO_GLTF_ROTATION[3], BLENDER_TO_GLTF_ROTATION[0],
+         BLENDER_TO_GLTF_ROTATION[1], BLENDER_TO_GLTF_ROTATION[2])).to_matrix().to_4x4()
+    matrix = root @ object_reference.matrix_world @ _OBJECT_AXIS_SWAP
+    return [[matrix[row][column] for row in range(3)] + [0.0] for column in range(3)]
+
+
 def parameter_rows(objects, fresh=()):
     """Every material in scope that some triangle renders with, and what it is
     set to.
@@ -351,9 +384,12 @@ def parameter_rows(objects, fresh=()):
                 continue
             seen.add(slot.material.name)
             row = _material_row(slot.material, fresh)
+            basis = object_basis(object_reference)
             declared = _declared_row(slot.material)
             if declared is not None:
                 row["properties"] = declared["parameters"]
+                for name, column in zip(OBJECT_BASIS_PARAMETERS, basis):
+                    row["properties"][name] = column
             else:
                 properties = {}
                 for key in slot.material.keys():

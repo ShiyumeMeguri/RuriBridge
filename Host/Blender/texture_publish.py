@@ -270,14 +270,61 @@ def _encode_whole(image, path):
         image.filepath_raw, image.file_format = previous
 
 
-def _write_image(image, directory, stem):
+def _is_opaque(image):
+    """Whether every pixel of this image calls itself fully covering."""
+    if not image.size[0] or not image.size[1]:
+        return True
+    pixels = _read_pixels(image)
+    return bool(pixels.shape[2] < 4 or (pixels[..., 3] >= 0.999).all())
+
+
+def _encode_opaque(image, path):
+    """The picture with its alpha set aside: colour as it is, coverage complete."""
+    pixels = _read_pixels(image).copy()
+    pixels[..., 3] = 1.0
+    height, width, _ = pixels.shape
+    made = bpy.data.images.new(os.path.basename(path), width, height, alpha=True,
+                               is_data=image.colorspace_settings.name != "sRGB")
+    try:
+        made.colorspace_settings.name = image.colorspace_settings.name
+        made.pixels.foreach_set(pixels.reshape(-1))
+        made.file_format = "PNG"
+        made.filepath_raw = path
+        made.save()
+    finally:
+        bpy.data.images.remove(made)
+
+
+def _write_image(image, directory, stem, coverage=True):
     """Put one image in the session, without making a second copy of it.
 
     Even copying bytes that are already correct is eighteen megabytes a send on
     one character, and every send does it again for images that did not move --
     so the copy happens once into the cache and every generation after that links
     to it.
+
+    ``coverage`` is whether the far side will read this image's alpha as coverage.
+    A surface channel is filled from a layer, and a layer masks itself with the
+    alpha of the picture it holds -- so an image whose source alpha is a shape
+    (an iris, a cut-out ornament) would leave three quarters of the channel
+    unwritten. Those cross opaque; the shape already crosses as the opacity
+    channel beside them. A lookup keeps its alpha: the shader reads it by name.
     """
+    if coverage and not _is_opaque(image):
+        path = os.path.join(directory, stem + ".png")
+        stamp = _content_stamp(image)
+        if stamp is None:
+            _encode_opaque(image, path)
+        else:
+            cache = _picture_cache_directory()
+            kept = os.path.join(cache, "{0}_opaque_{1}.png".format(
+                _safe(image.name), stamp))
+            if not os.path.isfile(kept):
+                os.makedirs(cache, exist_ok=True)
+                _encode_opaque(image, kept)
+            _place(kept, path)
+        arena_module.keep_in_memory(path)
+        return os.path.basename(path), os.path.getsize(path)
     path = os.path.join(directory, stem + _extension_of(image))
     stamp = _content_stamp(image)
     if stamp is None:
@@ -455,16 +502,17 @@ def publish_into(staging, materials):
     total = [0]
     left_behind = {}
 
-    def send(image, material, suffix, lane=None, operation=""):
+    def send(image, material, suffix, lane=None, operation="", coverage=True):
         """One picture in the session, written once however many materials point
         at it. ``lane`` names the part of a packed image to cut out; without it
         the file crosses as it stands, which is both faster and exact."""
-        key = (image.name, lane, operation)
+        key = (image.name, lane, operation, coverage)
         if key not in seen:
             if not os.path.isdir(directory):
                 os.makedirs(directory, exist_ok=True)
             try:
-                seen[key] = (_write_image(image, directory, suffix) if lane is None
+                seen[key] = (_write_image(image, directory, suffix, coverage)
+                             if lane is None
                              else _write_cut(image, lane, operation, directory, suffix))
             except Exception as error:
                 LOG.warning("could not send %s for %s: %s", image.name,
@@ -501,7 +549,10 @@ def publish_into(staging, materials):
                 channels[channel] = entry
         lookups = {}
         for slot, image in sorted(raw.items()):
-            entry = send(image, material, "{0}_{1}".format(_safe(identity), _safe(slot)))
+            # A lookup's alpha is a measurement the shader reads by name (a ramp's
+            # alpha is its shadow weight), never coverage. It crosses untouched.
+            entry = send(image, material, "{0}_{1}".format(_safe(identity), _safe(slot)),
+                         coverage=False)
             if entry is not None:
                 lookups[slot] = entry
         if channels or lookups:
