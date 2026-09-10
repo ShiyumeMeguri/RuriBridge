@@ -146,13 +146,15 @@ def shader_vocabulary(name):
     place the answer comes from, and the two would drift the first time the
     shader grew a texture.
 
-    Returns ``{source name: {"channel", "components", "format", "label"}}``,
-    empty when the shader ships no manifest (then every texture is a resource,
-    which is what this did before manifests existed).
+    Returns ``{source name: {"binding", "name", "components", "format"}}``, or
+    **None** when no manifest sits beside that shader at all. None and empty are
+    different answers: one says "this shader has not been found yet, ask later",
+    the other says "this shader says none of its textures are paintable", and a
+    caller that cannot tell them apart puts every map in the wrong place.
     """
-    if name in _VOCABULARY:
+    if _VOCABULARY.get(name):
         return _VOCABULARY[name]
-    found = {}
+    found = None
     for path in _shelf_shader_files(name + MANIFEST_SUFFIX):
         try:
             with io.open(path, encoding="utf-8") as handle:
@@ -160,6 +162,7 @@ def shader_vocabulary(name):
         except (OSError, ValueError) as error:
             LOG.warning("%s sits beside the shader and could not be read: %s", path, error)
             continue
+        found = {}
         for entry in manifest.get("inputs") or []:
             if entry.get("Kind") != "OverflowChannel":
                 continue
@@ -177,7 +180,8 @@ def shader_vocabulary(name):
         LOG.info("%s says %d of its textures are paintable channels", os.path.basename(path),
                  len(found))
         break
-    _VOCABULARY[name] = found
+    if found:
+        _VOCABULARY[name] = found
     return found
 
 

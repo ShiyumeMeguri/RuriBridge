@@ -717,15 +717,22 @@ def _put_textures_in():
     if arrived is None:
         return None
     names = shader_state.shader_by_texture_set()
-    wanted = sorted({name for name in names.values() if name})
-    if not wanted:
-        LOG.info("%d material(s) of textures are waiting: no Texture Set is running a "
-                 "shader yet, so where they go is not answerable",
+    vocabulary = None
+    for name in sorted({name for name in names.values() if name}):
+        vocabulary = shader_state.shader_vocabulary(name)
+        if vocabulary is not None:
+            break
+    if vocabulary is None:
+        # Either no Texture Set is running a generated shader yet, or the one they
+        # are running ships no manifest -- and on a cold start the first is the
+        # ordinary case, because the shelves settle late. Waiting costs a pass;
+        # putting them in now costs every map landing where it does not belong.
+        LOG.info("%d material(s) of textures are waiting for a shader that says where "
+                 "they go",
                  len((arrived.record.get("textures") or {}).get("by_material") or {}))
         return None
     _pending_textures[0] = None
     try:
-        vocabulary = shader_state.shader_vocabulary(wanted[0])
         report = texture_ingest.apply(arrived, vocabulary)
         if report["lookups"]:
             _apply_lookup_textures(report["lookups"])
