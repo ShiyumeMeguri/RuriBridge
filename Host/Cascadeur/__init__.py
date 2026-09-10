@@ -93,6 +93,27 @@ def domain_scene():
     return application.get_scene_manager().current_scene().domain_scene()
 
 
+def _scene_for_arrival():
+    """A scene of its own for a performance that just arrived.
+
+    Importing into whatever is current stacks: summoned twice with the same
+    character, this application ends up holding two skeletons, and the
+    performance it publishes back carries both -- measured here as five thousand
+    curves becoming eleven and then sixteen thousand, with the second rig's bones
+    reported as "missing" on the other side because nothing over there answers to
+    them.
+
+    A scene is also the honest unit: the other side's document is the document,
+    and this application is the workbench a performance is taken to. Two arrivals
+    are two pieces of work, not one piece of work twice. Nothing is removed --
+    whatever somebody has open stays open, one tab along.
+    """
+    manager = csc.app.get_application().get_scene_manager()
+    made = manager.create_application_scene()
+    manager.set_current_scene(made)
+    return made
+
+
 # ---------------------------------------------------------------------------
 # Receiving
 # ---------------------------------------------------------------------------
@@ -121,8 +142,9 @@ def _payload_path(generation):
 def _receive(topic, generation):
     if topic is topic_module.ANIMATION:
         path = _payload_path(generation)
+        scene = _scene_for_arrival()
         csc.glb.process_import(
-            domain_scene(), path,
+            scene.domain_scene(), path,
             _import_options(with_animation=True, with_objects=True))
         return "took the rig and its performance from {0}".format(
             generation.record.get("source"))
