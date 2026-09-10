@@ -157,12 +157,13 @@ def _declared_images(material):
     """
     declaration = material.get(SHADING_DECLARATION)
     if declaration is None:
-        return None, None, ()
+        return None, None, None, ()
     section = dict(declaration).get("images") or {}
     group = material.get(str(section.get("group") or "")) or {}
     packing = dict(section.get("packing") or {})
     found = {}
     raw = {}
+    remainders = {}
     refused = []
     for slot in sorted(group.keys()):
         lanes = [tuple(lane) for lane in (packing.get(slot) or ())]
@@ -174,6 +175,12 @@ def _declared_images(material):
         if not lanes:
             raw[slot] = image
             continue
+        leftover = _lane_remainder(lanes)
+        if leftover:
+            # Named the way the projection names it, which is what the shader
+            # samples it by. The manifest's input Id is the contract; a name that
+            # drifts from it comes back as "shader values unknown", not silence.
+            remainders["{0}_{1}".format(slot, leftover)] = (image, leftover)
         for lane, semantic, operation in lanes:
             translated = LANE_CHANNELS.get(semantic)
             if translated is None:
@@ -187,7 +194,7 @@ def _declared_images(material):
                 found[channel] = (image, None, "")
                 continue
             found[channel] = (image, lane, operation or cut or "")
-    return found, raw, tuple(refused)
+    return found, raw, remainders, tuple(refused)
 
 
 def images_of(material):
@@ -197,14 +204,14 @@ def images_of(material):
     texture that stayed behind is something said out loud rather than a channel
     that silently came up grey.
     """
-    declared, raw, packed = _declared_images(material)
+    declared, raw, remainders, packed = _declared_images(material)
     if declared is not None:
-        return declared, raw, packed
+        return declared, raw, remainders, packed
     if not material.use_nodes or material.node_tree is None:
-        return {}, {}, ()
+        return {}, {}, {}, ()
     surface = _surface_node(material.node_tree)
     if surface is None:
-        return {}, {}, ()
+        return {}, {}, {}, ()
     found = {}
     for input_name, channel in SURFACE_INPUTS:
         if channel in found:
@@ -217,7 +224,7 @@ def images_of(material):
             found[channel] = (image, None, "")
     # An ordinary material has no slot vocabulary: everything it renders with
     # reaches a surface input, which is the whole of what it can say.
-    return found, {}, ()
+    return found, {}, {}, ()
 
 
 #: What Blender calls a format, and what the file is called.
@@ -293,6 +300,64 @@ def _encode_opaque(image, path):
         made.save()
     finally:
         bpy.data.images.remove(made)
+
+
+def _lane_remainder(lanes):
+    """The lane letters no declared lane of this image names, in rgba order."""
+    claimed = set()
+    for lane, _semantic, _operation in lanes:
+        claimed.update(str(lane))
+    return "".join(letter for letter in "rgba" if letter not in claimed)
+
+
+def _cut_lanes(image, lanes):
+    """A picture whose components are the named lanes of a packed image, in order.
+
+    Not a measurement of one lane but a smaller picture: the far side samples it
+    with the swizzle the projection wrote, so lane order is the whole contract.
+    Components the source does not fill are opaque black, which is what an
+    unwritten component reads as everywhere else.
+    """
+    pixels = _read_pixels(image)
+    out = numpy.zeros(pixels.shape, dtype=numpy.float32)
+    for index, letter in enumerate(lanes[:4]):
+        out[..., index] = pixels[..., LANE_COMPONENTS[letter]]
+    if len(lanes) < 4:
+        out[..., 3] = 1.0
+    return out
+
+
+def _encode_lanes(image, lanes, path):
+    """Write the leftover lanes out. Measurement, so no transfer function."""
+    pixels = _cut_lanes(image, lanes)
+    height, width, _ = pixels.shape
+    made = bpy.data.images.new(os.path.basename(path), width, height,
+                               alpha=True, is_data=True)
+    try:
+        made.pixels.foreach_set(pixels.reshape(-1))
+        made.file_format = "PNG"
+        made.filepath_raw = path
+        made.save()
+    finally:
+        bpy.data.images.remove(made)
+
+
+def _write_lanes(image, lanes, directory, stem):
+    """One leftover cut in the session, kept between sends like every other."""
+    path = os.path.join(directory, stem + ".png")
+    stamp = _content_stamp(image)
+    if stamp is None:
+        _encode_lanes(image, lanes, path)
+    else:
+        cache = _picture_cache_directory()
+        kept = os.path.join(cache, "{0}_lanes{1}_{2}.png".format(
+            _safe(image.name), lanes, stamp))
+        if not os.path.isfile(kept):
+            os.makedirs(cache, exist_ok=True)
+            _encode_lanes(image, lanes, kept)
+        _place(kept, path)
+    arena_module.keep_in_memory(path)
+    return os.path.basename(path), os.path.getsize(path)
 
 
 def _write_image(image, directory, stem, coverage=True):
@@ -502,18 +567,22 @@ def publish_into(staging, materials):
     total = [0]
     left_behind = {}
 
-    def send(image, material, suffix, lane=None, operation="", coverage=True):
+    def send(image, material, suffix, lane=None, operation="", coverage=True,
+             lanes=""):
         """One picture in the session, written once however many materials point
         at it. ``lane`` names the part of a packed image to cut out; without it
         the file crosses as it stands, which is both faster and exact."""
-        key = (image.name, lane, operation, coverage)
+        key = (image.name, lane, operation, coverage, lanes)
         if key not in seen:
             if not os.path.isdir(directory):
                 os.makedirs(directory, exist_ok=True)
             try:
-                seen[key] = (_write_image(image, directory, suffix, coverage)
-                             if lane is None
-                             else _write_cut(image, lane, operation, directory, suffix))
+                if lanes:
+                    seen[key] = _write_lanes(image, lanes, directory, suffix)
+                elif lane is None:
+                    seen[key] = _write_image(image, directory, suffix, coverage)
+                else:
+                    seen[key] = _write_cut(image, lane, operation, directory, suffix)
             except Exception as error:
                 LOG.warning("could not send %s for %s: %s", image.name,
                             material.name, error)
@@ -534,7 +603,7 @@ def publish_into(staging, materials):
         }
 
     for material in materials:
-        found, raw, packed = images_of(material)
+        found, raw, remainders, packed = images_of(material)
         for slot, why in packed:
             left_behind.setdefault("{0}: {1}".format(slot, why), 0)
             left_behind["{0}: {1}".format(slot, why)] += 1
@@ -548,6 +617,11 @@ def publish_into(staging, materials):
             if entry is not None:
                 channels[channel] = entry
         lookups = {}
+        for name, (image, lanes) in sorted((remainders or {}).items()):
+            entry = send(image, material, "{0}_{1}".format(_safe(identity), _safe(name)),
+                         coverage=False, lanes=lanes)
+            if entry is not None:
+                lookups[name] = entry
         for slot, image in sorted(raw.items()):
             # A lookup's alpha is a measurement the shader reads by name (a ramp's
             # alpha is its shadow weight), never coverage. It crosses untouched.
