@@ -739,6 +739,10 @@ def _put_textures_in():
         if _panel is not None and report["applied"]:
             _panel.set_status("took {0} texture(s) into {1} Texture Set(s)".format(
                 report["applied"], len(report["sets"])))
+        # Texture Sets grew channels just now, and what this application is
+        # holding is exactly what the presence record states. Said once at
+        # project time it would describe a project that no longer exists.
+        publish_project_state()
         return report
     except Exception as error:
         LOG.error("could not put the incoming textures in: %s", error)
