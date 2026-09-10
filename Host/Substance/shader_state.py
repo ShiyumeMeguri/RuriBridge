@@ -586,10 +586,20 @@ def apply_by_texture_set(values_by_texture_set, shader_url_by_texture_set=None,
             if name not in exposed:
                 report["unknown"].setdefault(texture_set, []).append(name)
                 continue
-            accepted, coerced = _coerce(value, exposed[name]["description"]["dataType"])
+            # A parameter this application describes as nothing is one it cannot be
+            # told anything about. Naming it is the whole of what can be done --
+            # letting the read raise takes the whole push down, and every value
+            # for every Texture Set with it.
+            described = (exposed[name] or {}).get("description") or {}
+            declared = described.get("dataType")
+            if not declared:
+                report["mismatched"].setdefault(texture_set, []).append(
+                    "{0} says nothing about what it holds".format(name))
+                continue
+            accepted, coerced = _coerce(value, declared)
             if not accepted:
                 report["mismatched"].setdefault(texture_set, []).append(
-                    "{0} expects {1}".format(name, exposed[name]["description"]["dataType"]))
+                    "{0} expects {1}".format(name, declared))
                 continue
             claimed = offers.setdefault(identifier, {})
             if name in claimed and claimed[name] != coerced:
