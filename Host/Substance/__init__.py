@@ -708,10 +708,10 @@ _lookups_held = {}
 def _put_textures_in():
     """Put the waiting textures where the shader says they go.
 
-    Kept waiting rather than put in early: the destinations come from the
-    shader's own manifest, and until a Texture Set is actually running that
-    shader there is nothing to ask. Called again when the shelves settle, which
-    is when a cold start finally finds it.
+    Kept waiting rather than put in early: the lookups land on parameters of the
+    shader itself, and until a Texture Set is actually running that shader there
+    is no parameter to write to. Called again when the shelves settle, which is
+    when a cold start finally finds it.
     """
     arrived = _pending_textures[0]
     if arrived is None:
@@ -733,7 +733,7 @@ def _put_textures_in():
         return None
     _pending_textures[0] = None
     try:
-        report = texture_ingest.apply(arrived, vocabulary)
+        report = texture_ingest.apply(arrived)
         if report["lookups"]:
             _apply_lookup_textures(report["lookups"])
         if _panel is not None and report["applied"]:

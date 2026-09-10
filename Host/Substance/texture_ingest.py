@@ -166,18 +166,7 @@ def _imported(path):
     return resource, _field(identifier, "url") or str(identifier)
 
 
-def _user_channel(entry):
-    """The channel type and format one manifest entry asks for, or None when this
-    build spells them differently."""
-    number = "".join(character for character in entry.get("binding", "") if character.isdigit())
-    if not number:
-        return None, None
-    channel_type = getattr(substance_painter.textureset.ChannelType, "User" + number, None)
-    channel_format = _format_for((entry.get("format", ""), "RGBA8", "L8"))
-    return channel_type, channel_format
-
-
-def apply(generation, vocabulary=None):
+def apply(generation):
     """Put the payload's textures into the open project.
 
     Two destinations, because the payload names two kinds of texture. A surface
@@ -188,19 +177,12 @@ def apply(generation, vocabulary=None):
     Putting a ramp in a channel would be a wrong picture in a right-looking
     place; leaving it out entirely leaves the shader sampling black.
 
-    ``vocabulary`` is what the shader says about its own source textures: the ones
-    it reads through a paintable channel name the channel, its width and its
-    label, and those go into that channel instead of into a parameter. Anything
-    the vocabulary does not mention is a whole resource, which is what every
-    lookup was before shaders started saying otherwise.
-
     Returns what landed and what did not, by material, so a material this project
     has no Texture Set for is said out loud rather than dropped: it means the two
     sides disagree about the model, and that is worth hearing. ``lookups`` comes
     back as Texture Set identity -> parameter name -> url, for the shader value
     writer to push the same way it pushes every other parameter.
     """
-    vocabulary = vocabulary or {}
     section = generation.record.get("textures") or {}
     by_material = section.get("by_material") or {}
     if not by_material:
@@ -211,7 +193,6 @@ def apply(generation, vocabulary=None):
     touched = []
     homeless = []
     lookups = {}
-    painted = {}
     unspeakable = set()
 
     def payload_file(identity, detail):
@@ -250,30 +231,11 @@ def apply(generation, vocabulary=None):
                     layer = _fill_layer(stack)
                 _set_channel(layer, channel_type, resource.identifier())
                 applied += 1
-            if layer is not None and identity not in touched:
+            if layer is not None:
                 touched.append(identity)
             for slot, detail in sorted((sections.get("lookups") or {}).items()):
                 path = payload_file(identity, detail)
                 if path is None:
-                    continue
-                spoken = vocabulary.get(slot)
-                if spoken is not None:
-                    channel_type, channel_format = _user_channel(spoken)
-                    if channel_type is None or channel_format is None:
-                        unspeakable.add(slot)
-                        continue
-                    if not stack.has_channel(channel_type):
-                        # Labelled with what the shader calls it, so the channel list
-                        # reads as the maps it holds and not as a row of slot numbers.
-                        stack.add_channel(channel_type, channel_format,
-                                          spoken.get("name") or slot)
-                    resource, _url = _imported(path)
-                    if layer is None:
-                        layer = _fill_layer(stack)
-                        touched.append(identity)
-                    _set_channel(layer, channel_type, resource.identifier())
-                    painted.setdefault(identity, {})[slot] = spoken.get("name", "")
-                    applied += 1
                     continue
                 _resource, url = _imported(path)
                 lookups.setdefault(identity, {})[slot] = url
@@ -284,10 +246,8 @@ def apply(generation, vocabulary=None):
     if unspeakable:
         LOG.warning("this build names no channel for %s; those images arrived and "
                     "stayed out", ", ".join(sorted(unspeakable)))
-    LOG.info("put %d texture(s) into %d Texture Set(s): %d paintable channel(s) the "
-             "shader reads by name, %d resource(s) it samples whole",
-             applied, len(touched),
-             sum(len(entries) for entries in painted.values()),
+    LOG.info("put %d texture(s) into %d Texture Set(s), %d of them lookups the "
+             "shader samples by name", applied, len(touched),
              sum(len(entries) for entries in lookups.values()))
     return {"applied": applied, "sets": touched, "homeless": homeless,
-            "lookups": lookups, "painted": painted}
+            "lookups": lookups}
