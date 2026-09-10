@@ -88,7 +88,18 @@ class CascadeurHost(host_port.Host):
 HOST = host_port.bind(CascadeurHost())
 
 
+#: The scene a performance was last taken into. Publishing reads from THIS one
+#: rather than from whatever the application calls current: asking it to switch
+#: is a request, and a request that quietly did not happen means the export comes
+#: from a scene holding somebody else's rig as well as this one -- measured here
+#: as a performance coming home with two skeletons and twice the curves, half of
+#: them under names the other side has never heard of.
+_ARRIVED = [None]
+
+
 def domain_scene():
+    if _ARRIVED[0] is not None:
+        return _ARRIVED[0].domain_scene()
     application = csc.app.get_application()
     return application.get_scene_manager().current_scene().domain_scene()
 
@@ -111,6 +122,7 @@ def _scene_for_arrival():
     manager = csc.app.get_application().get_scene_manager()
     made = manager.create_application_scene()
     manager.set_current_scene(made)
+    _ARRIVED[0] = made
     return made
 
 
@@ -275,6 +287,7 @@ def visit(scene=None, session="default", root=None, publish_topic=None,
     finally:
         CONNECTION.close()
         _SCENE = None
+        _ARRIVED[0] = None
     return handled
 
 
