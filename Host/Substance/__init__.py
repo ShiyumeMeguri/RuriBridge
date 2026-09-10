@@ -705,6 +705,39 @@ def _on_shelf_settled(_event):
 _lookups_held = {}
 
 
+def _put_textures_in():
+    """Put the waiting textures where the shader says they go.
+
+    Kept waiting rather than put in early: the destinations come from the
+    shader's own manifest, and until a Texture Set is actually running that
+    shader there is nothing to ask. Called again when the shelves settle, which
+    is when a cold start finally finds it.
+    """
+    arrived = _pending_textures[0]
+    if arrived is None:
+        return None
+    names = shader_state.shader_by_texture_set()
+    wanted = sorted({name for name in names.values() if name})
+    if not wanted:
+        LOG.info("%d material(s) of textures are waiting: no Texture Set is running a "
+                 "shader yet, so where they go is not answerable",
+                 len((arrived.record.get("textures") or {}).get("by_material") or {}))
+        return None
+    _pending_textures[0] = None
+    try:
+        vocabulary = shader_state.shader_vocabulary(wanted[0])
+        report = texture_ingest.apply(arrived, vocabulary)
+        if report["lookups"]:
+            _apply_lookup_textures(report["lookups"])
+        if _panel is not None and report["applied"]:
+            _panel.set_status("took {0} texture(s) into {1} Texture Set(s)".format(
+                report["applied"], len(report["sets"])))
+        return report
+    except Exception as error:
+        LOG.error("could not put the incoming textures in: %s", error)
+        return None
+
+
 def _apply_lookup_textures(lookups):
     """Point the shader's own texture parameters at the images that just landed.
 
@@ -757,6 +790,9 @@ def _apply_shader_values(payload):
         LOG.warning("shader values for %d material(s) this project has no Texture Set "
                     "for: %s", len(report["unmapped"]),
                     ", ".join(report["unmapped"][:4]))
+    # Now that Texture Sets are running the shader, anything that was waiting on
+    # it can go where it belongs.
+    _put_textures_in()
     values = shader_state.values_by_texture_set()
     _shader_gate.suppress(values)
     if refused:
@@ -862,21 +898,7 @@ def _on_project_settled():
         LOG.error("could not adopt the shader values: %s", error)
     if _pending_display_names:
         texture_publish.apply_display_names(_pending_display_names)
-    arrived = _pending_textures[0]
-    _pending_textures[0] = None
-    if arrived is not None:
-        try:
-            names = shader_state.shader_by_texture_set()
-            wanted = sorted({name for name in names.values() if name})
-            vocabulary = shader_state.shader_vocabulary(wanted[0]) if wanted else {}
-            report = texture_ingest.apply(arrived, vocabulary)
-            if report["lookups"]:
-                _apply_lookup_textures(report["lookups"])
-            if _panel is not None and report["applied"]:
-                _panel.set_status("took {0} texture(s) into {1} Texture Set(s)".format(
-                    report["applied"], len(report["sets"])))
-        except Exception as error:
-            LOG.error("could not put the incoming textures in: %s", error)
+    _put_textures_in()
     mesh_ingest.save_where_the_scene_asked()
     if _panel is not None:
         _panel.refresh_presets()
