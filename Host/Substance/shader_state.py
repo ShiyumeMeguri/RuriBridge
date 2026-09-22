@@ -514,6 +514,21 @@ def _wear_what_was_asked_for(layout, values_by_texture_set, name_by_texture_set,
     landing on another does nothing, and "nothing happened" is the one outcome
     that cannot be told apart from a bridge that is not running. Sets already
     wearing it cost one layout write and no swap, so arriving twice is free.
+
+    **The name decides, not a family resemblance.** Asking instead whether the
+    instance happens to expose any of the offered names accepts a different
+    generation of the same generated shader: two of them in one shelf share most
+    of their uniform spelling, so the older one answers to a hundred and seventy
+    eight of the offered names out of two hundred and ninety eight, the swap is
+    declared unnecessary, and the remaining hundred and twenty are then reported
+    as individually unknown -- measured here, on Texture Sets a mesh reload had
+    just put on the project's first instance. The record does not say "something
+    that looks like this"; it says which shader it was written for.
+
+    **Sharing an instance is itself a reason to swap.** A Texture Set a reload
+    created lands on whatever instance was there first, and several of them on
+    one instance can only ever show one material's values -- which is the whole
+    reason :func:`wear_shader` gives each set its own.
     """
     wanted = {}
     for texture_set, name in (name_by_texture_set or {}).items():
@@ -521,14 +536,21 @@ def _wear_what_was_asked_for(layout, values_by_texture_set, name_by_texture_set,
             wanted.setdefault(name, []).append(texture_set)
     if not wanted:
         return
+    shared = {}
+    for identifier in layout.instance_by_texture_set.values():
+        shared[identifier] = shared.get(identifier, 0) + 1
     worn_any = False
     for name, texture_sets in sorted(wanted.items()):
         needed = []
         for texture_set in texture_sets:
             identifier = layout.instance_by_texture_set.get(texture_set)
             if identifier is None:
+                # No instance to read means nothing is wearing anything here yet;
+                # wear_shader says so out loud if it cannot place it either.
+                needed.append(texture_set)
                 continue
-            if not set(values_by_texture_set[texture_set]) & set(layout.exposed(identifier)):
+            running = (layout.shader_by_instance.get(identifier) or "").strip()
+            if running != name or shared.get(identifier, 0) > 1:
                 needed.append(texture_set)
         if not needed:
             continue
