@@ -196,18 +196,12 @@ def images_of(material):
 
 def material_rows(view_layer):
     """The table's Blender half: every worn material, what it paints into, on what."""
-    objects = mesh_publish.scope(view_layer)
-    wearers = {}
-    for object_reference in objects:
-        for slot in object_reference.material_slots:
-            if slot.material is not None:
-                wearers.setdefault(slot.material.name, []).append(object_reference.name)
     rows = []
-    for name, material in mesh_publish.worn_materials(objects).items():
+    for name, (material, wearing) in mesh_publish.wearers(mesh_publish.scope(view_layer)).items():
         rows.append({
             "name": name,
             "texture_set": mesh_publish.texture_set_of(material),
-            "objects": sorted(set(wearers.get(name, []))),
+            "objects": sorted(entry.name for entry in wearing),
             "images": images_of(material),
         })
     return rows
@@ -281,6 +275,27 @@ def send_mesh(context):
         CONNECTION.session.publisher(topic_module.MESH), objects, project_frame(context))
     refresh_view(force=True)
     return generation
+
+
+def sync_material(context):
+    """State every Texture Set's shading on the session: its shader, that shader's
+    identity, and the row of the material that speaks for it.
+
+    Painter decides what it can take: the same shader by identity takes the whole
+    row, any other shader only the parameters both name.
+    """
+    if not CONNECTION.is_open:
+        raise RuntimeError("not attached to a bridge session")
+    rows = mesh_publish.shading_rows(mesh_publish.scope(context.view_layer))
+    if not rows:
+        raise RuntimeError("no material painting into a Texture Set declares its shading")
+    CONNECTION.session.writer(topic_module.SHADING).write(record_module.shading(
+        HOST.name,
+        {texture_set: row["parameters"] for texture_set, row in rows.items()},
+        vocabulary_by_texture_set={texture_set: row["shader"] for texture_set, row in rows.items()},
+        shader_name_by_texture_set={texture_set: row["name"] for texture_set, row in rows.items()},
+        identity_by_texture_set={texture_set: row["identity"] for texture_set, row in rows.items()}))
+    return rows
 
 
 def _ask(what, **details):
@@ -375,6 +390,8 @@ def _receive(topic, generation):
             return send_mesh(bpy.context).number
         if asked == record_module.ASK_TO_BIND:
             return bind(generation.record["texture_set"], generation.record["material"])
+        if asked == record_module.ASK_FOR_SHADING:
+            return sorted(sync_material(bpy.context))
     raise RuntimeError(
         "nothing here receives {0!r} yet, and the topic says this application "
         "hears it".format(topic.key))
@@ -382,15 +399,23 @@ def _receive(topic, generation):
 
 def _describe(report):
     """One line about a textures arrival, saying what is waiting and why."""
-    placed = sum(sum(entry["placed"].values()) for entry in report)
-    homeless = [entry["texture_set"] for entry in report if not entry["materials"]]
-    generated = sorted({name for entry in report for name in entry["generated"]})
-    parts = ["{0} Texture Set(s) in, {1} channel(s) placed".format(len(report), placed)]
-    if generated:
-        parts.append("{0} generated material(s) read them through their shader".format(
-            len(generated)))
-    if homeless:
-        parts.append("nothing here paints into {0}".format(", ".join(homeless)))
+    results = [entry for entry in report if not entry["layer"]]
+    parts = []
+    if results:
+        placed = sum(sum(entry["placed"].values()) for entry in results)
+        homeless = [entry["texture_set"] for entry in results if not entry["materials"]]
+        generated = sorted({name for entry in results for name in entry["generated"]})
+        parts.append("{0} Texture Set(s) in, {1} channel(s) placed".format(
+            len(results), placed))
+        if generated:
+            parts.append("{0} generated material(s) left as they are: their record "
+                         "names their images".format(len(generated)))
+        if homeless:
+            parts.append("nothing here paints into {0}".format(", ".join(homeless)))
+    for entry in report:
+        if entry["layer"]:
+            parts.append("layer {0} of {1}: {2} image(s), kept out of the materials".format(
+                entry["layer"], entry["texture_set"], len(entry["images"])))
     return "; ".join(parts)
 
 
@@ -558,6 +583,23 @@ class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class RURIBRIDGE_OT_sync_material(bpy.types.Operator):
+    bl_idname = "ruri_bridge.sync_material"
+    bl_label = "Sync Material"
+    bl_description = ("Put each Texture Set's shader and parameters on it in Painter. The "
+                      "same shader by identity takes the whole row; another shader only the "
+                      "parameters both name")
+
+    def execute(self, context):
+        try:
+            rows = sync_material(context)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        say("stated the shading of {0} Texture Set(s)".format(len(rows)))
+        return {"FINISHED"}
+
+
 class RURIBRIDGE_OT_pull_textures(bpy.types.Operator):
     bl_idname = "ruri_bridge.pull_textures"
     bl_label = "Pull Textures"
@@ -578,7 +620,8 @@ class RURIBRIDGE_OT_pull_selected_layer(bpy.types.Operator):
     bl_idname = "ruri_bridge.pull_selected_layer"
     bl_label = "Pull Selected Layer"
     bl_description = ("Have Painter export only the layer selected there, on its own, "
-                      "into this document's textures folder")
+                      "into this document's textures folder. It arrives as images and "
+                      "is not put into any material")
 
     def execute(self, context):
         try:
@@ -883,7 +926,9 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         column = layout.column(align=True)
         column.enabled = attached
         column.scale_y = 1.3
-        column.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
+        row = column.row(align=True)
+        row.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
+        row.operator(RURIBRIDGE_OT_sync_material.bl_idname, icon="MATERIAL")
         row = column.row(align=True)
         row.operator(RURIBRIDGE_OT_pull_textures.bl_idname, icon="IMPORT")
         row.operator(RURIBRIDGE_OT_pull_selected_layer.bl_idname, icon="RENDERLAYERS")
@@ -910,7 +955,7 @@ class RURIBRIDGE_PT_cascadeur(bpy.types.Panel):
 
 
 _CLASSES = (RuriBridgePreferences,
-            RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_pull_textures,
+            RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_sync_material, RURIBRIDGE_OT_pull_textures,
             RURIBRIDGE_OT_pull_selected_layer, RURIBRIDGE_OT_bind, RURIBRIDGE_OT_exclude,
             RURIBRIDGE_OT_follow_rename, RURIBRIDGE_OT_start_painter, RURIBRIDGE_OT_reattach,
             RURIBRIDGE_OT_locate_painter, RURIBRIDGE_OT_locate_cascadeur,

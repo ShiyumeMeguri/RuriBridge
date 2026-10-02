@@ -227,35 +227,44 @@ def bind_into_material(material, images_by_channel):
 
 
 def ingest(generation):
-    """Take one textures record in. Returns a report per Texture Set."""
+    """Take one textures record in. Returns a report per Texture Set.
+
+    A Texture Set's result goes into every material painting into it. One layer
+    exported on its own is not what any material shows: its channels arrive as
+    images and stay out of the materials, because wiring a part in where the
+    whole was would overwrite the whole.
+    """
     payload = generation.record
     directory = payload["directory"]
     report = []
     for texture_set in payload["texture_sets"]:
         name = texture_set["name"]
+        layer = texture_set["layer"]
         images = {entry["channel"]: ingest_map(entry, directory)
                   for entry in texture_set["maps"]}
-        materials = materials_painting(name)
+        materials = [] if layer else materials_painting(name)
         placed = {"landed": 0, "created": 0, "connected": 0}
-        waiting = []
+        generated = []
         for material in materials:
             if material.get(mesh_publish.SHADING_DECLARATION) is not None:
-                # A generated material reads its images through its own record and
-                # its shader's packing, not through loose nodes; binding them here
-                # would put nodes in a tree its generator rebuilds.
-                waiting.append(material.name)
+                # A generated material's images are named by its own record and
+                # packed the way its shader reads them; loose nodes in a tree its
+                # generator rebuilds would be neither.
+                generated.append(material.name)
                 continue
             for key, value in bind_into_material(material, images).items():
                 placed[key] += value
-        if not materials:
+        if not materials and not layer:
             LOG.warning("Texture Set %r has no material here that paints into it; its %d "
                         "channel(s) are in the textures folder and nothing shows them",
                         name, len(images))
         report.append({
             "texture_set": name,
+            "layer": layer,
             "materials": [material.name for material in materials],
             "channels": sorted(images),
+            "images": sorted(image.name for image in images.values()),
             "placed": placed,
-            "generated": waiting,
+            "generated": generated,
         })
     return report

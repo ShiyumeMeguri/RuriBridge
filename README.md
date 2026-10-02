@@ -34,17 +34,21 @@ Blender:3D 视图 N 面板 → `RuriBridge` 页
 
 - **Send Mesh**:把绘制表面发给 Painter。Painter 没开工程就用它新建一个;开着就换网格,
   每个纹理集的图层一层不动。
+- **Sync Material**:把每个纹理集的着色器和参数交给 Painter(见下文「材质:身份决定搬多少」)。
 - **Pull Textures**:请 Painter 把所有纹理集导出到这个 .blend 的 `textures` 文件夹,并接进
   画进那个纹理集的材质里。
-- **Pull Selected Layer**:只要 Painter 里选中的那一层,单独导出。
+- **Pull Selected Layer**:只要 Painter 里选中的那一层,单独导出。进来的是图片,不接进材质 ——
+  一层不是材质该显示的全部,接进去就把完整结果顶掉了。
 - **一张表**:每个材质画进哪个纹理集,两边都能改。
 
 Painter:停靠面板 `RuriBridge`
 
 - **Ask Blender For The Mesh**:请 Blender 发表面过来(和 Blender 那边按 Send Mesh 一样)。
+- **Ask Blender For The Material**:请 Blender 交出材质(和那边按 Sync Material 一样)。
 - **Send Textures To Blender**:导出到 Blender 文档的 `textures` 文件夹。
 - **Pull a Blender image into the selected layer**:把 Blender 材质用到的一张图放进选中的图层,
   作为遮罩或参考填充。Blender 没有图层,所以从那边来的东西只可能是这两种形状,而且只碰选中的那一层。
+  拉的是磁盘上的那份文件:Blender 里改过还没存的图,先存盘再拉。
 - **同一张表**:纹理集 / 图层数 / 由哪个 Blender 材质画。有图层却没有材质画它的纹理集标成橙色 ——
   下一次换网格会在它这里停下;要放弃它,勾上 **Drop**(只对下一次换网格有效)。
 
@@ -82,6 +86,21 @@ Painter:停靠面板 `RuriBridge`
 
 选 OBJ 而不是 glTF:glTF 的材质描述会被 Painter 的导入器变成每个新纹理集上一层没人画过的
 「导入的颜色」(金属度还是 1)。OBJ 旁边那份 `.mtl` 只列材质名,别的什么都不说。
+
+## 材质:身份决定搬多少
+
+着色器生成器给每一条腿的产物烙同一个**身份**:风格参数面(part 词汇 × 纹理槽 × uniform 名与类型)
+的散列。Blender 的生成材质把它写在 `ruri_shading.identity`,Painter 货架上的着色器把它写在旁边的
+`<名字>.manifest.json`。
+
+- 一个纹理集由**和它同名的材质**代表(多个材质画进同一个纹理集时,同一个着色器实例只能有一行值)。
+- Painter 货架上同名着色器的身份**与材质声明的相同** → 纹理集换上这个着色器(每个纹理集一个自己的
+  实例,共用实例装不下不同的值),整行参数原样写入。
+- **不同**(别的着色器、同一着色器的另一代、或者没烙身份的旧拷贝)→ 不换着色器,只写两边**同名**的
+  参数,其余的不猜,写进 Painter 日志。
+
+货架上的着色器和清单是一个产物,由导入器一起同步进货架;只同步了着色器、清单还是旧的,身份就对不上,
+桥会退回只写同名参数并说明原因。
 
 ## 贴图
 
@@ -151,5 +170,7 @@ python -m RuriBridge.Kernel.cli pull-textures  --blender <blender.exe> --blend <
 
 ## 已知边界
 
+- 生成材质(带 `ruri_shading` 声明的)拉贴图时不接线:它的图由自己的材质记录点名,按着色器的打包方式读,
+  而导出的是 Painter 的文档通道,对不上它的槽位。图照样落进 `textures`。
 - UDIM 摄取按 Blender 的 `<UDIM>` 平铺图实现了,但没有 UDIM 工程可跑,未实测。
 - Windows only,这是机制本身决定的(Win32 文件属性与映射语义)。

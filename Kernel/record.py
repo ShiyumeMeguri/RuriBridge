@@ -32,6 +32,9 @@ ASK_TO_BIND = "bind"
 #: "Call this Texture Set by that name": answered by the application that owns
 #: the Texture Sets. A rename there is the only edit that keeps every layer.
 ASK_TO_RENAME = "rename"
+#: "State your materials' shading": answered by the application that owns the
+#: materials, on the shading topic.
+ASK_FOR_SHADING = "shading"
 
 RECORD_FILE_NAME = "record.json"
 #: A rig and its performance, as the animation tools on either side read it.

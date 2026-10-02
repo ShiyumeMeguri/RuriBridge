@@ -43,7 +43,7 @@ from ...Kernel import record as record_module
 from ...Kernel import session as session_module
 from ...Kernel import topic as topic_module
 
-from . import mesh_ingest, texture_publish
+from . import mesh_ingest, shader_state, texture_publish
 
 LOG = log_module.logger("painter")
 
@@ -214,8 +214,14 @@ _IMPORTED = {}
 
 
 def _resource_for(path):
-    """The project resource for an image file, imported once per project."""
-    key = os.path.normcase(os.path.abspath(path))
+    """The project resource for an image file as it is on disk now.
+
+    Imported once per version of the file: an image Blender saved again since the
+    last pull is a new picture, and handing back the resource of the old one would
+    pull what was there before without a word.
+    """
+    status = os.stat(path)
+    key = (os.path.normcase(os.path.abspath(path)), status.st_mtime_ns, status.st_size)
     known = _IMPORTED.get(key)
     if known is not None:
         return known
@@ -299,7 +305,7 @@ def _panel_icon():
 
 
 class RuriBridgePanel(QtWidgets.QWidget):
-    """The dock: the table, three buttons and a status line."""
+    """The dock: the table, three requests, the image pull and a status line."""
 
     def __init__(self):
         super().__init__()
@@ -324,8 +330,10 @@ class RuriBridgePanel(QtWidgets.QWidget):
         layout.addWidget(self.table, 1)
 
         self.mesh_button = QtWidgets.QPushButton("Ask Blender For The Mesh")
+        self.material_button = QtWidgets.QPushButton("Ask Blender For The Material")
         self.textures_button = QtWidgets.QPushButton("Send Textures To Blender")
         layout.addWidget(self.mesh_button)
+        layout.addWidget(self.material_button)
         layout.addWidget(self.textures_button)
 
         pull = QtWidgets.QHBoxLayout()
@@ -345,6 +353,7 @@ class RuriBridgePanel(QtWidgets.QWidget):
         layout.addWidget(self.status_label)
 
         self.mesh_button.clicked.connect(self._ask_for_mesh)
+        self.material_button.clicked.connect(self._ask_for_material)
         self.textures_button.clicked.connect(self._send_textures)
         self.mask_button.clicked.connect(lambda: self._pull(True))
         self.reference_button.clicked.connect(lambda: self._pull(False))
@@ -463,6 +472,14 @@ class RuriBridgePanel(QtWidgets.QWidget):
             return
         self.set_status("asked Blender for the mesh")
 
+    def _ask_for_material(self):
+        try:
+            _ask(record_module.ASK_FOR_SHADING)
+        except Exception as error:
+            self.set_status("could not ask: {0}".format(error))
+            return
+        self.set_status("asked Blender for the material")
+
     def _send_textures(self):
         try:
             send_textures()
@@ -493,6 +510,33 @@ _mesh_deadline = [None]
 #: Something changed what this project is at a moment it could not be asked about
 #: it -- a save holds a lock -- so the next tick that can says it.
 _presence_due = [False]
+
+
+def apply_shading(record):
+    """Put Blender's shading on the Texture Sets it names. Returns one line about it."""
+    if not substance_painter.project.is_open():
+        return "a material arrived and no project is open"
+    report = shader_state.apply_by_texture_set(
+        record.get("by_texture_set") or {},
+        vocabulary_by_texture_set=record.get("vocabulary_by_texture_set"),
+        shader_name_by_texture_set=record.get("shader_name_by_texture_set"),
+        identity_by_texture_set=record.get("identity_by_texture_set"))
+    written = sum(len(names) for names in report["applied"].values())
+    parts = ["{0} Texture Set(s) on their own shader, {1} on same-named parameters only; "
+             "{2} value(s) written".format(len(report["same_shader"]),
+                                           len(report["same_names_only"]), written)]
+    if report["no_shader"]:
+        parts.append("not on this shelf: " + ", ".join(sorted(report["no_shader"])))
+    if report["unmapped"]:
+        parts.append("no Texture Set here for " + ", ".join(report["unmapped"]))
+    if report["mismatched"]:
+        parts.append("{0} value(s) of the wrong type".format(
+            sum(len(names) for names in report["mismatched"].values())))
+    for texture_set, why in sorted(report["same_names_only"].items()):
+        LOG.info("%s takes same-named parameters only: %s", texture_set, why)
+    for texture_set, problems in sorted(report["mismatched"].items()):
+        LOG.warning("%s: not written, %s", texture_set, "; ".join(problems))
+    return "; ".join(parts)
 
 
 def _mesh_finished(_status=None):
@@ -555,6 +599,12 @@ def pump():
     for endpoint, payload in CONNECTION.session.changed_state():
         if endpoint.topic is topic_module.PRESENCE:
             CONNECTION.peers[endpoint.peer] = payload
+        elif endpoint.topic is topic_module.SHADING and endpoint.peer == BLENDER.name:
+            try:
+                _panel.set_status(apply_shading(payload))
+            except Exception as error:
+                LOG.error("the material from Blender could not be applied: %s", error)
+                _panel.set_status("material not applied: {0}".format(error))
     for endpoint, generation in CONNECTION.session.incoming():
         try:
             became_busy = _handle(endpoint.topic, generation)

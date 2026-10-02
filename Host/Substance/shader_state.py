@@ -127,61 +127,59 @@ def _value_of(holder, field):
         return found
 
 
-#: What a generated shader may ship beside itself, describing where each source
-#: texture lands. Read, never written: the generator writes it and whoever puts
-#: the shader in a shelf brings it along.
+#: What a generated shader ships beside itself: its identity and the parameters it
+#: declares. Read, never written: the generator writes it and whoever puts the
+#: shader in a shelf brings it along.
 MANIFEST_SUFFIX = ".manifest.json"
 
-_VOCABULARY = {}
 
+def shader_manifest(name):
+    """The manifest beside the shelf's shader of this name, or None when it has none.
 
-def shader_vocabulary(name):
-    """Which host channel each of a shader's source textures lands in.
-
-    A generated shader does not read a ramp and a face mask the same way: one is
-    a whole resource it samples, the other is a CHANNEL somebody paints. Which
-    is which -- and, for a channel, its number, width and label -- is decided
-    when the shader is generated, and written down beside it. Asking the file is
-    the only way to know; computing the same allocation here would be a second
-    place the answer comes from, and the two would drift the first time the
-    shader grew a texture.
-
-    Returns ``{source name: {"binding", "name", "components", "format"}}``, or
-    **None** when no manifest sits beside that shader at all. None and empty are
-    different answers: one says "this shader has not been found yet, ask later",
-    the other says "this shader says none of its textures are paintable", and a
-    caller that cannot tell them apart puts every map in the wrong place.
+    Read where it lies every time it is asked for: the importer replaces it
+    together with the shader, and an answer kept from before would describe the
+    shader that was there then.
     """
-    if _VOCABULARY.get(name):
-        return _VOCABULARY[name]
-    found = None
     for path in _shelf_shader_files(name + MANIFEST_SUFFIX):
         try:
             with io.open(path, encoding="utf-8") as handle:
-                manifest = json.load(handle)
+                return json.load(handle)
         except (OSError, ValueError) as error:
             LOG.warning("%s sits beside the shader and could not be read: %s", path, error)
-            continue
-        found = {}
-        for entry in manifest.get("inputs") or []:
-            if entry.get("Kind") != "OverflowChannel":
-                continue
-            for source in entry.get("Sources") or []:
-                spelled = str(source.get("Source") or "")
-                if spelled:
-                    found[spelled] = {
-                        # The binding is the application's numbered token; the id is
-                        # what the shader and the artist both call it.
-                        "binding": str(entry.get("Binding") or ""),
-                        "name": str(entry.get("Id") or ""),
-                        "components": int(entry.get("Components") or 0),
-                        "format": str(entry.get("Format") or ""),
-                    }
-        LOG.info("%s says %d of its textures are paintable channels", os.path.basename(path),
-                 len(found))
-        break
-    if found:
-        _VOCABULARY[name] = found
+    return None
+
+
+def _painter_type(glsl):
+    """A shading-language type name as this application's parameter descriptions spell it."""
+    scalar = {"bool": "Bool", "int": "Int", "float": "Float"}
+    if glsl in scalar:
+        return scalar[glsl]
+    for prefix, kind in (("bvec", "Bool"), ("ivec", "Int"), ("vec", "Float")):
+        if glsl.startswith(prefix) and glsl[len(prefix):].isdigit():
+            return kind + glsl[len(prefix):]
+    raise ShaderStateError("the shader's manifest declares a parameter of type {0!r}, which "
+                           "nothing here knows how to write".format(glsl))
+
+
+def declared_types(manifest):
+    """Every parameter the generator declared for its shader, typed as this application
+    spells types: the uniforms, the variant selector, the keyword switches.
+
+    Taken from the generator rather than from the instance because an instance's
+    own description can come back without a type for some of its parameters right
+    after a whole layout of shaders is swapped in, and a value refused for that is
+    a value of the very shader it was written for not written. A keyword is a
+    switch and the variant selector is a number by what they are, so the manifest
+    names them without a type.
+    """
+    panel = manifest.get("panel") or {}
+    found = {str(entry["name"]): _painter_type(str(entry["type"]))
+             for entry in panel.get("uniforms") or []}
+    selector = panel.get("variantUniform")
+    if selector:
+        found[str(selector)] = "Int"
+    for keyword in panel.get("keywords") or []:
+        found[str(keyword)] = "Bool"
     return found
 
 
@@ -259,31 +257,27 @@ def wear_shader(layout, texture_sets, shader_name):
             shader_name)
     shaders = layout.object.setdefault("shaders", {})
     bindings = layout.object.setdefault("texturesets", {})
-    display_by_identity = {}
-    for texture_set in substance_painter.textureset.all_texture_sets():
-        display_by_identity[texture_set.original_name] = texture_set.name
 
     touched = []
-    for identity in sorted(texture_sets):
-        display = display_by_identity.get(identity, identity)
-        if display not in bindings:
+    for texture_set in sorted(texture_sets):
+        if texture_set not in bindings:
             continue
-        if not isinstance(shaders.get(display), dict):
-            shaders[display] = {"shader": shader_name, "shaderInstance": display}
-        bindings[display] = {"shader": display}
-        touched.append((identity, display))
+        if not isinstance(shaders.get(texture_set), dict):
+            shaders[texture_set] = {"shader": shader_name, "shaderInstance": texture_set}
+        bindings[texture_set] = {"shader": texture_set}
+        touched.append(texture_set)
     if not touched:
         return [], "none of the offered Texture Sets are in this project"
     assign_instances(layout.object)
 
     identifier_by_label = {entry["label"]: entry["id"] for entry in instances()}
     worn = []
-    for identity, display in touched:
-        found = identifier_by_label.get(display)
+    for texture_set in touched:
+        found = identifier_by_label.get(texture_set)
         if found is None:
             continue
         update_shader(found, url)
-        worn.append(identity)
+        worn.append(texture_set)
     LOG.info("put %s on %d Texture Set(s), each on an instance of its own",
              shader_name, len(worn))
     return worn, ""
@@ -401,15 +395,11 @@ class Layout:
             self.shader_by_instance[entry["id"]] = str(
                 body.get("shader") or entry.get("shader") or "")
 
-        identity_by_display = {texture_set.name: texture_set.original_name
-                               for texture_set
-                               in substance_painter.textureset.all_texture_sets()}
         self.instance_by_texture_set = {}
         for display, body in (self.object.get("texturesets") or {}).items():
             label = body.get("shader")
-            identity = identity_by_display.get(display, display)
             if label in identifier_by_label:
-                self.instance_by_texture_set[identity] = identifier_by_label[label]
+                self.instance_by_texture_set[display] = identifier_by_label[label]
             else:
                 LOG.warning("Texture Set %r names shader instance %r, which is not in "
                             "the instance list", display, label)
@@ -426,32 +416,6 @@ class Layout:
         label = self.label_by_instance.get(identifier)
         body = (self.object.get("shaders") or {}).get(label) or {}
         return _flat(body.get("parameters") or {})
-
-
-def instance_by_texture_set():
-    """Texture Set identity -> shader instance id.
-
-    Painter states this in two halves: the assignment names, per Texture Set, the
-    shader instance *label* it uses, and the instance list carries the id every
-    other call wants. Joining them here keeps that two-step in one place.
-
-    Keyed by identity rather than by the displayed name, because the other side
-    speaks identities -- a Texture Set renamed on either side has to stay the
-    same Texture Set.
-    """
-    identifier_by_label = {entry["label"]: entry["id"] for entry in instances()}
-    identity_by_display = {texture_set.name: texture_set.original_name
-                           for texture_set in substance_painter.textureset.all_texture_sets()}
-    mapping = {}
-    for display, body in assignment().get("texturesets", {}).items():
-        label = body.get("shader")
-        identity = identity_by_display.get(display, display)
-        if label in identifier_by_label:
-            mapping[identity] = identifier_by_label[label]
-        else:
-            LOG.warning("Texture Set %r names shader instance %r, which is not in the "
-                        "instance list", display, label)
-    return mapping
 
 
 def _same_value(held, offered):
@@ -566,8 +530,16 @@ def _wear_what_was_asked_for(layout, values_by_texture_set, name_by_texture_set,
 
 def apply_by_texture_set(values_by_texture_set, shader_url_by_texture_set=None,
                          vocabulary_by_texture_set=None,
-                         shader_name_by_texture_set=None):
+                         shader_name_by_texture_set=None,
+                         identity_by_texture_set=None):
     """Set what the shader on each Texture Set actually exposes; report the rest.
+
+    **The identity decides how much goes.** A row whose shader identity equals the
+    identity on this shelf's shader of that name is written for that very shader:
+    the Texture Set is put on it and takes the whole row. Any other row -- another
+    shader, another generation of it, or a shader nobody stamped -- is written
+    onto whatever the Texture Set runs now, and only the parameters both name go;
+    the rest are reported, not guessed at.
 
     Several Texture Sets share one shader instance until somebody gives them
     different shaders, so an offer aimed at two of them lands on the same
@@ -593,9 +565,26 @@ def apply_by_texture_set(values_by_texture_set, shader_url_by_texture_set=None,
     spoken = vocabulary_by_texture_set or {}
     offers = {}
     report = {"applied": {}, "unknown": {}, "mismatched": {}, "conflicting": {},
-              "wrong_shader": {}, "no_shader": {}, "unmapped": []}
-    if _wear_what_was_asked_for(layout, values_by_texture_set,
-                                shader_name_by_texture_set, report) or swapped:
+              "wrong_shader": {}, "no_shader": {}, "unmapped": [],
+              "same_shader": [], "same_names_only": {}}
+    same = {}
+    types_by_set = {}
+    manifests = {}
+    for texture_set, name in (shader_name_by_texture_set or {}).items():
+        declared = (identity_by_texture_set or {}).get(texture_set) or ""
+        if name and name not in manifests:
+            manifests[name] = shader_manifest(name)
+        manifest = manifests.get(name) or {}
+        shelved = str(manifest.get("identity") or "") or None
+        if declared and shelved == declared:
+            same[texture_set] = name
+            types_by_set[texture_set] = declared_types(manifest)
+            report["same_shader"].append(texture_set)
+        else:
+            report["same_names_only"][texture_set] = (
+                "{0} on this shelf is {1}, the material says {2}".format(
+                    name, shelved or "unstamped", declared or "nothing"))
+    if _wear_what_was_asked_for(layout, values_by_texture_set, same, report) or swapped:
         layout = Layout()
     identifier_by_set = layout.instance_by_texture_set
     report["unmapped"] = sorted(set(values_by_texture_set) - set(identifier_by_set))
@@ -610,14 +599,20 @@ def apply_by_texture_set(values_by_texture_set, shader_url_by_texture_set=None,
             continue
         for name, value in values.items():
             if name not in exposed:
-                report["unknown"].setdefault(texture_set, []).append(name)
+                if texture_set in same:
+                    report["unknown"].setdefault(texture_set, []).append(name)
                 continue
-            # A parameter this application describes as nothing is one it cannot be
-            # told anything about. Naming it is the whole of what can be done --
-            # letting the read raise takes the whole push down, and every value
-            # for every Texture Set with it.
-            described = (exposed[name] or {}).get("description") or {}
-            declared = described.get("dataType")
+            # The type comes from one place per name: what the generator declared,
+            # when this is its shader and it declared that name; otherwise what
+            # this application describes. A parameter described as nothing is one
+            # it cannot be told anything about. Naming it is the whole of what can
+            # be done -- letting the read raise takes the whole push down, and
+            # every value for every Texture Set with it.
+            types = types_by_set.get(texture_set)
+            if types is not None and name in types:
+                declared = types[name]
+            else:
+                declared = ((exposed[name] or {}).get("description") or {}).get("dataType")
             if not declared:
                 report["mismatched"].setdefault(texture_set, []).append(
                     "{0} says nothing about what it holds".format(name))

@@ -115,8 +115,9 @@ def _worn_indices(object_reference):
     return tuple(numpy.unique(indices).tolist())
 
 
-def worn_materials(objects):
-    """Every material some face in scope wears, by name, in a stable order.
+def wearers(objects):
+    """Every material some face in scope wears, by name, in a stable order, with
+    the objects some face of which wears it, in scope order.
 
     A slot no face points at is not shading anything -- a model imported from a
     game arrives with variant leftovers -- and a Texture Set for it would be a
@@ -127,8 +128,15 @@ def worn_materials(objects):
         slots = object_reference.material_slots
         for index in _worn_indices(object_reference):
             if index < len(slots) and slots[index].material is not None:
-                found.setdefault(slots[index].material.name, slots[index].material)
+                _, wearing = found.setdefault(
+                    slots[index].material.name, (slots[index].material, []))
+                if object_reference not in wearing:
+                    wearing.append(object_reference)
     return {name: found[name] for name in sorted(found)}
+
+
+def worn_materials(objects):
+    return {name: material for name, (material, _) in wearers(objects).items()}
 
 
 def ensure_materials(objects):
@@ -480,6 +488,35 @@ _OBJECT_AXIS_SWAP = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0),
                                       (0.0, 0.0, 1.0, 0.0),
                                       (0.0, 1.0, 0.0, 0.0),
                                       (0.0, 0.0, 0.0, 1.0)))
+
+
+def shading_rows(objects):
+    """What each Texture Set's shading is, as the material that speaks for it states it.
+
+    The material named like the Texture Set speaks for it; a Texture Set painted by
+    materials none of which carries that name is spoken for by the first of them
+    in name order. Several materials painting into one Texture Set share one
+    shader instance over there, so only one row can be its row, and the rule has
+    to be one a person can predict. A material whose shading nobody declared has
+    no row: its shader is not something this side knows how to describe.
+    """
+    speakers = {}
+    for name, (material, wearing) in wearers(objects).items():
+        texture_set = texture_set_of(material)
+        if not texture_set:
+            continue
+        if texture_set not in speakers or name == texture_set:
+            speakers[texture_set] = (material, wearing[0])
+    rows = {}
+    for texture_set, (material, wearer) in sorted(speakers.items()):
+        declared = declared_row(material)
+        if declared is None:
+            continue
+        for parameter, column in zip(OBJECT_BASIS_PARAMETERS, object_basis(wearer)):
+            declared["parameters"][parameter] = column
+        declared["material"] = material.name
+        rows[texture_set] = declared
+    return rows
 
 
 def object_basis(object_reference):

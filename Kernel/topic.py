@@ -137,6 +137,7 @@ ANSWERED_WITH = {
     record_module.ASK_FOR_ANIMATION: host_port.ANIMATION,
     record_module.ASK_TO_BIND: host_port.SCENE_GRAPH,
     record_module.ASK_TO_RENAME: host_port.TEXTURE_SETS,
+    record_module.ASK_FOR_SHADING: host_port.SCENE_GRAPH,
 }
 
 

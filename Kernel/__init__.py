@@ -2,8 +2,8 @@
 """Host-free core of the Ruri DCC bridge.
 
 Nothing under this package imports ``bpy`` or ``substance_painter``: it is the
-one copy of the arena, the wire contract and the GLB writer that both hosts and
-the command line share. The host packages beside it are thin -- they translate
+one copy of the arena and the wire contract that every host and the command line
+share. The host packages beside it are thin -- they translate
 their own objects into what these modules already define, and back.
 """
 

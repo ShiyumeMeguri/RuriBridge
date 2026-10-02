@@ -26,13 +26,12 @@ application will reveal them:
               counterpart script into its own command folder, because it loads
               commands by module path out of its installation.
 
-**One payload format, everywhere: glTF binary.** Not a preference and not a
-negotiation -- a second format would mean the same model exists twice, in two
-encodings, with two sets of rounding. GLB is chosen because its binary chunk on
-disk already IS the memory layout of the vertex arrays, which is what makes a
-publish a write into pages the other side has mapped rather than a serialise.
-An application whose build cannot read it does not get a quieter fallback; it
-fails at attach, by name.
+**One payload format per crossing, the one the reader takes without side
+effects.** A rig and its performance cross as glTF binary, which both animation
+tools read and write natively. The surface a texturing tool paints on crosses as
+an OBJ in the project's own frame: a glTF material description is what that
+tool's importer turns into a layer nobody painted, and the frame is a fact of the
+project it has to match to the last bit.
 """
 
 from __future__ import annotations
