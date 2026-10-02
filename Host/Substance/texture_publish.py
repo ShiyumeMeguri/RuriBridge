@@ -330,12 +330,14 @@ def _attach_recipes(entry, shader, manifests):
         entry["slots_refused"] = refused
 
 
-def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False, shaders=None):
+def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False, shaders=None,
+            texture_sets=None):
     """Export into the document's textures folder and say what landed where.
 
     With ``layer`` set, only the layer selected in Painter is rendered: its
     Texture Set alone, every other layer hidden for the length of the export, the
     files named after the layer so they never overwrite the Texture Set's own.
+    Otherwise the whole of ``texture_sets`` is, or of every Texture Set when it is None.
 
     ``shaders`` names, per Texture Set, the generated shader its materials run and
     that shader's identity; a whole export carries the recipe that stands that
@@ -353,7 +355,8 @@ def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False, 
         suffix = _safe("_".join(node.get_name() for node in chosen))
         isolation = _only_these_visible(stack, chosen)
     else:
-        texture_sets = list(substance_painter.textureset.all_texture_sets())
+        texture_sets = list(substance_painter.textureset.all_texture_sets()
+                            if texture_sets is None else texture_sets)
         suffix = ""
         isolation = contextlib.nullcontext()
 

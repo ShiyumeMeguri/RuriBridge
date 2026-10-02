@@ -255,9 +255,9 @@ def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
     different ones mean only the names both shaders share can be trusted to mean
     the same thing.
 
-    ``requested`` names the Texture Sets the reader asked about -- the one selected
-    over there -- when this is the answer: the statement is then theirs alone, and the
-    reader stands their textures up too. Empty when the material's side stated its
+    ``requested`` names the Texture Sets the reader asked about -- every one it has, or
+    the one selected there -- when this is the answer: the statement is then theirs
+    alone, and the reader stands their textures up too. Empty when the material's side stated its
     shading of its own accord, which is every Texture Set's, and only the shading.
     """
     record = _base("shade", source)

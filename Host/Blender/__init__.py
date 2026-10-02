@@ -310,9 +310,10 @@ def sync_material(context, requested=()):
     Painter decides what it can take: the same shader by identity takes the whole
     row, any other shader only the parameters both name.
 
-    ``requested`` is what Painter asked about -- the Texture Set selected there -- and
-    the statement is then that set's alone, marked as asked for, so Painter stands its
-    textures up as well. Stated from here, it is every Texture Set's shading and only that.
+    ``requested`` is what Painter asked about -- every Texture Set it has, or the one
+    selected there -- and the statement is then theirs alone, marked as asked for, so
+    Painter stands their textures up as well. Stated from here, it is every Texture Set's
+    shading and only that.
     """
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
@@ -649,8 +650,8 @@ class RURIBRIDGE_OT_sync_material(bpy.types.Operator):
     bl_label = "Sync Material"
     bl_description = ("Put each Texture Set's shader and parameters on it in Painter. The "
                       "same shader by identity takes the whole row; another shader only the "
-                      "parameters both name. Textures come over only when Painter asks for "
-                      "the material of the Texture Set selected there")
+                      "parameters both name. Textures come over only when Painter asks "
+                      "(Sync All Material or Sync Selected Material there)")
 
     def execute(self, context):
         try:
