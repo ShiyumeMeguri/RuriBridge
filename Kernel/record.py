@@ -18,22 +18,34 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 3
 
 #: What a request is asking for. The only "kind" left, because it is the only
-#: one that distinguishes something WITHIN a topic -- every other distinction the
-#: old kinds carried is now the channel a record arrived on.
+#: one that distinguishes something WITHIN a topic -- every other distinction is
+#: the channel a record arrived on.
 ASK_FOR_MESH = "mesh"
 ASK_FOR_TEXTURES = "textures"
 ASK_FOR_ANIMATION = "anim"
-
-INTENT_AUTO = "auto"
-INTENT_CREATE_PROJECT = "create_project"
-INTENT_RELOAD_MESH = "reload_mesh"
+#: "This Texture Set is painted by that material": answered by the application
+#: that owns the materials, because it is the one that names what crosses.
+ASK_TO_BIND = "bind"
+#: "Call this Texture Set by that name": answered by the application that owns
+#: the Texture Sets. A rename there is the only edit that keeps every layer.
+ASK_TO_RENAME = "rename"
 
 RECORD_FILE_NAME = "record.json"
+#: A rig and its performance, as the animation tools on either side read it.
 SCENE_FILE_NAME = "scene.glb"
+#: The surface somebody paints on, as the texturing tool reads it, and the library
+#: beside it that names its materials.
+SURFACE_FILE_NAME = "surface.obj"
+SURFACE_MATERIALS_FILE_NAME = "surface.mtl"
 TEXTURE_DIRECTORY_NAME = "maps"
+
+#: The texturing tool's own length unit, per metre. A project the bridge starts
+#: measures in it, so a brush or a projection sized in centimetres means what it
+#: says.
+CENTIMETRES_PER_METRE = 100.0
 
 COLOR_SPACE_SRGB = "sRGB"
 COLOR_SPACE_DATA = "Non-Color"
@@ -86,52 +98,56 @@ def _base(kind, source):
     }
 
 
-def binding(scene_identity, scene_identity_is_new, document, project_path,
-            vertex_count=0):
-    """Which document on the sending side a Painter project belongs to.
+def frame(scale, offset=(0.0, 0.0, 0.0)):
+    """Where a modelling world lands inside a texturing project.
 
-    This travels into the Painter project's own metadata, where saving carries
-    it along, so a project opened again days later still knows which scene it
-    answers to. Names cannot do that job: both hosts let people rename anything,
-    and a path moves the moment somebody reorganises a drive.
+    A project keeps the frame its surface first arrived in, for life: a texturing
+    tool places its 3D projections and re-projects its strokes relative to that
+    frame, so a surface that arrives in any other one is a different surface to
+    it. Positions in the file are ``scale`` times the world turned Y-up, plus
+    ``offset``.
     """
-    return {
-        "scene_identity": scene_identity,
-        "scene_identity_is_new": scene_identity_is_new,
-        "document": document,
-        "project_path": project_path,
-        "vertex_count": vertex_count,
-    }
+    return {"scale": float(scale), "offset": [float(value) for value in offset]}
 
 
-def mesh(source, intent, scene, materials, unit_scale, up_axis, binding_record=None,
-         textures=None):
-    """The model: geometry lives in the GLB, everything else here.
+def same_frame(first, second, tolerance=1e-9):
+    if not first or not second:
+        return False
+    if abs(float(first["scale"]) - float(second["scale"])) > tolerance * max(
+            1.0, abs(float(first["scale"]))):
+        return False
+    return all(abs(float(a) - float(b)) <= tolerance * max(1.0, abs(float(a)))
+               for a, b in zip(first["offset"], second["offset"]))
 
-    ``scene`` describes what went into the GLB (object names, primitive counts,
-    the bounds) so the consumer can report and verify without parsing it.
-    ``materials`` are the producing side's material rows, carried verbatim.
 
-    ``textures`` is what the sending side ALREADY has on those materials -- the
-    ground a texturing tool paints on top of. Each material has two sections:
-    ``channels`` are surface channels, the ground the painting goes on; and
-    ``lookups`` are images the shader samples directly through a parameter of
-    the slot's own name -- a ramp, a LUT, an SDF map -- which are not paintable
-    material and do not belong in a channel. Each entry names a file beside the
-    GLB and the colour space the image itself declares. Absent when the scene
-    renders with no images, which is a real answer rather than a missing one.
+def mesh(source, scene_file, scene, materials, frame_of_project):
+    """The surface somebody paints on, in the frame of the project it is for.
+
+    ``scene`` describes what went into the file (object names, how many faces
+    paint into which Texture Set, the bounds) so the consumer can report and gate
+    without parsing it. ``materials`` are the producing side's material rows,
+    carried verbatim; each names the Texture Set it paints into, which is also the
+    material name the file carries, because a texturing tool matches its Texture
+    Sets by that name.
     """
     record = _base("mesh", source)
     record.update({
-        "intent": intent,
-        "scene_file": SCENE_FILE_NAME,
+        "scene_file": scene_file,
         "scene": scene,
         "materials": materials,
-        "unit_scale": unit_scale,
-        "up_axis": up_axis,
-        "binding": binding_record or {},
-        "textures": textures or {},
+        "frame": frame_of_project,
     })
+    return record
+
+
+def performance(source, scene_file, scene_name, **timing):
+    """A rig and what it does: the GLB beside the record, and when it plays."""
+    record = _base("anim", source)
+    record.update({
+        "scene_file": scene_file,
+        "scene": {"name": scene_name},
+    })
+    record.update(timing)
     return record
 
 
@@ -149,80 +165,60 @@ def request(source, asked_for, **details):
     return record
 
 
-def textures(source, project_path, mesh_path, texture_sets):
-    """Painter -> Blender: what was rendered, where, and how to read it.
+def textures(source, document, directory, texture_sets):
+    """Rendered channels: which files, in which folder, and how to read them.
 
-    Each map carries its own colour space because that is a fact about the
-    texture, decided by the side that knows the channel's format. A consumer
-    that re-derives it from a file name or a slot will eventually be wrong.
+    ``directory`` is a real folder beside the document the textures belong to,
+    not a transport generation: they are the textures, and a file that has to be
+    found again tomorrow cannot live somewhere that is recycled. Each map carries
+    its own colour space because that is a fact about the texture, decided by the
+    side that knows the channel's format.
     """
     record = _base("tex", source)
     record.update({
-        "project_path": project_path,
-        "mesh_path": mesh_path,
-        "directory": TEXTURE_DIRECTORY_NAME,
+        "document": document,
+        "directory": str(directory),
         "texture_sets": texture_sets,
     })
     return record
 
 
-def presence(source, is_open, project_path, mesh_path, texture_sets,
-             binding_record=None):
-    """What this application currently has open, and what it is bound to.
+def presence(source, document, texture_sets=(), materials=(), textures_directory="",
+             frame_of_project=None):
+    """What this application has open, stated by the application itself.
 
     Everybody publishes it and everybody reads everybody else's, which is how a
     side stops guessing whether the other one is there and what it is holding.
+    A texturing tool fills ``texture_sets`` and the frame its project's surface
+    lives in -- None for a project the bridge did not start and nobody has
+    measured; a modelling tool fills ``materials`` and says where the textures of
+    its document live. ``document`` is empty when nothing is open, which is an
+    answer and not a missing one.
     """
     record = _base("here", source)
     record.update({
-        "is_open": is_open,
-        "project_path": project_path,
-        "mesh_path": mesh_path,
-        "texture_sets": texture_sets,
-        "binding": binding_record or {},
+        "document": document or "",
+        "texture_sets": list(texture_sets),
+        "materials": list(materials),
+        "textures_directory": textures_directory or "",
+        "frame": frame_of_project,
     })
     return record
 
 
 def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
             vocabulary_by_texture_set=None, shader_name_by_texture_set=None,
-            lookups_by_texture_set=None):
-    """Either way: the current value of every watched uniform, and nothing else.
+            lookups_by_texture_set=None, identity_by_texture_set=None):
+    """The current value of every shading parameter, per Texture Set.
 
-    This is the record that rides in the control block rather than in a
-    generation, because it is state and not an event -- a value that has already
-    been replaced has nothing to say, so the latest one overwriting the previous
-    one in place is exactly right, and it costs no filesystem at all.
+    State and not an event, so it rides in the control block: a value that has
+    already been replaced has nothing to say.
 
-    An offer is deliberately unfiltered. The sender does not know which uniforms
-    the other side's shader exposes, and a table of names kept here would be a
-    second truth source for something the shader can be asked about directly, so
-    the intersection is computed by the receiver and reported back.
-
-    Which shader each Texture Set runs travels in the same record because it is
-    state too: assigning the shader an instance already runs is nothing.
-
-    An offer may also say which shader's vocabulary it is spoken in, when the
-    material it came from declared one. That is not a filter either -- the
-    intersection is still the receiver's to compute -- but it is the difference
-    between "your shader does not expose these hundred and thirty six names" and
-    "these values are for a shader nobody here is running", and only one of those
-    two sentences tells somebody what to do about it.
-
-    The shader's own declaration -- every parameter's label, widget and help text
-    -- is deliberately NOT here. Nothing ever read it, and on a character with a
-    generated shader on every Texture Set it is two megabytes against a control
-    block that holds half of one: the publish raised, and the state that mattered
-    never crossed at all. A name per Texture Set is the whole of the shape a
-    receiver needs.
-
-    ``lookups_by_texture_set`` is the one part of a shader's state that is a name
-    rather than a number: the images its texture parameters point at. Nothing
-    consuming this record can use another application's url, so it is here to be
-    READ -- it is how "the shader is sampling the ramp that arrived" stops being
-    something a log claims and becomes something the session states. The values
-    are read back out of the shader after they are set, not remembered from what
-    was sent.
+    ``identity_by_texture_set`` is the shader's own identity -- the one hash its
+    generator stamped into every application's copy of it. Two equal identities
+    mean the two sides run the same shader, so every value crosses as it is; two
+    different ones mean only the names both shaders share can be trusted to mean
+    the same thing.
     """
     record = _base("shade", source)
     record.update({
@@ -231,6 +227,7 @@ def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
         "vocabulary_by_texture_set": vocabulary_by_texture_set or {},
         "shader_name_by_texture_set": shader_name_by_texture_set or {},
         "lookups_by_texture_set": lookups_by_texture_set or {},
+        "identity_by_texture_set": identity_by_texture_set or {},
     })
     return record
 
@@ -246,9 +243,7 @@ def color_space_for(channel_format_name):
     ``Channel.is_color`` is deliberately not consulted. It means RGB rather than
     grayscale, not perceptual colour -- a normal map is RGB16F and answers True --
     so letting it choose between linear colour and data marks every normal map in
-    every default Painter project as colour. Under Blender's default scene-linear
-    space that costs nothing, but under an ACES config it would run normals
-    through a primaries conversion.
+    every default Painter project as colour.
     """
     if channel_format_name == CHANNEL_FORMAT_SRGB8:
         return COLOR_SPACE_SRGB

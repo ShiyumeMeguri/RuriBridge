@@ -157,6 +157,20 @@ class Session:
         waiting.sort(key=lambda row: row[0])
         return tuple((endpoint, generation) for _number, endpoint, generation in waiting)
 
+    def current_state(self, topic):
+        """(speaker, value) for every application's current value on a state topic.
+
+        What the other side IS right now, whether or not it changed since this
+        host last looked -- the question a host asks once, when it attaches, and
+        which ``changed_state`` deliberately does not answer.
+        """
+        found = []
+        for endpoint in self._sources.get(topic.key, ()):
+            payload, _generation = self.arena.read_state(endpoint.channel)
+            if payload is not None:
+                found.append((endpoint.peer, payload))
+        return tuple(found)
+
     def changed_state(self):
         """Every state topic whose value moved since this host last looked."""
         moved = []

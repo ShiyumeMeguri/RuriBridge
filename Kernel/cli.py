@@ -5,17 +5,16 @@ Everything here reads the same arena the two hosts do, from a third process, so
 the protocol can be watched and verified without either application running --
 which is the point of putting the state in mapped files rather than in a socket.
 
-``verify-mesh`` is the real check: it re-reads the published GLB out of the arena
-and asserts the things a consumer depends on (chunk sizes against the file, every
-buffer view inside the binary chunk, every index inside its own vertex range, and
-the declared bounds actually bounding the positions). A publish that passes it is
-one Painter can open.
+``verify-mesh`` is the real check: it re-reads the published surface out of the
+arena and asserts the things a consumer depends on (every face corner inside the
+vertex, UV and normal lists, the faces each object paints into each Texture Set
+counted as the record says, the declared bounds actually bounding the positions,
+and a frame to place it in). A publish that passes it is one Painter can open.
 """
 
 from __future__ import annotations
 
 import argparse
-import array
 import json
 import os
 import shutil
@@ -28,7 +27,6 @@ from pathlib import Path
 
 from . import arena as arena_module
 from . import channel as channel_module
-from . import glb as glb_module
 from . import log as log_module
 from . import painter_host
 from . import counterpart as counterpart_module
@@ -40,7 +38,6 @@ LOG = log_module.logger("cli")
 
 PAINTER_PLUGIN_DIRECTORY_NAME = "painter_plugin"
 INSTALLED_NAME = "RuriBridge"
-DEFAULT_EXPORT_PRESET = "Document channels + Normal + AO (No Alpha)"
 
 
 def _roster_index(name):
@@ -168,80 +165,68 @@ def command_verify_mesh(arguments):
         if number is None:
             print("no mesh has been published on {0}".format(topic_module.MESH.channel(peers_module.BLENDER.name)))
             return 1
-        path = directory / payload.get("scene_file", record_module.SCENE_FILE_NAME)
-        failures = verify_glb(path)
-        document, total, binary_length = glb_module.read_document(path)
+        path = directory / payload["scene_file"]
+        failures, counts = verify_surface(path, payload)
         print("generation {0}".format(number))
         print("file       {0}".format(path))
-        print("size       {0} bytes (binary chunk {1})".format(total, binary_length))
-        print("meshes     {0}, materials {1}, accessors {2}".format(
-            len(document["meshes"]), len(document["materials"]), len(document["accessors"])))
-        for mesh in document["meshes"]:
-            for primitive in mesh["primitives"]:
-                position = document["accessors"][primitive["attributes"]["POSITION"]]
-                indices = document["accessors"][primitive["indices"]]
-                print("  {0} / {1}: {2} vertices, {3} triangles, {4}".format(
-                    mesh["name"], document["materials"][primitive["material"]]["name"],
-                    position["count"], indices["count"] // 3,
-                    ", ".join(sorted(primitive["attributes"]))))
+        print("size       {0} bytes".format(os.path.getsize(path)))
+        print("frame      {0}".format(payload.get("frame")))
+        for (name, texture_set), faces in sorted(counts.items()):
+            print("  {0} / {1}: {2} faces".format(name, texture_set, faces))
         if failures:
             for failure in failures:
                 print("FAIL {0}".format(failure))
             return 1
-        print("OK all accessors inside the binary chunk, all indices in range, "
-              "all declared bounds hold")
+        print("OK every corner inside its lists, every count as declared, all declared "
+              "bounds hold")
     return 0
 
 
-def verify_glb(path):
-    """Re-read a published GLB and check what a consumer will rely on."""
+def verify_surface(path, record):
+    """Re-read a published surface and check what a consumer will rely on."""
     failures = []
-    document, total, binary_length = glb_module.read_document(path)
-    actual = os.path.getsize(path)
-    if actual != total:
-        failures.append("header says {0} bytes, file is {1}".format(total, actual))
-    declared = document["buffers"][0]["byteLength"]
-    if declared != binary_length:
-        failures.append("buffer declares {0} bytes, binary chunk holds {1}".format(
-            declared, binary_length))
-    for index, view in enumerate(document["bufferViews"]):
-        end = view.get("byteOffset", 0) + view["byteLength"]
-        if end > binary_length:
-            failures.append("bufferView {0} ends at {1}, past the {2} byte chunk".format(
-                index, end, binary_length))
-
-    for mesh in document["meshes"]:
-        for primitive in mesh["primitives"]:
-            position_index = primitive["attributes"]["POSITION"]
-            position = document["accessors"][position_index]
-            values = array.array("f")
-            with glb_module.mapped_accessor(path, position_index) as view:
-                values.frombytes(bytes(view))
-            if len(values) != position["count"] * 3:
-                failures.append("{0}: POSITION holds {1} floats for {2} vertices".format(
-                    mesh["name"], len(values), position["count"]))
-                continue
-            for axis in range(3):
-                column = values[axis::3]
-                if not column:
-                    continue
-                if min(column) < position["min"][axis] - 1e-6:
-                    failures.append("{0}: POSITION axis {1} goes below its declared min".format(
-                        mesh["name"], axis))
-                if max(column) > position["max"][axis] + 1e-6:
-                    failures.append("{0}: POSITION axis {1} goes above its declared max".format(
-                        mesh["name"], axis))
-
-            indices = array.array("I")
-            with glb_module.mapped_accessor(path, primitive["indices"]) as view:
-                indices.frombytes(bytes(view))
-            if len(indices) % 3:
-                failures.append("{0}: {1} indices is not a whole number of triangles".format(
-                    mesh["name"], len(indices)))
-            if indices and max(indices) >= position["count"]:
-                failures.append("{0}: index {1} is outside its {2} vertices".format(
-                    mesh["name"], max(indices), position["count"]))
-    return failures
+    if not record.get("frame"):
+        failures.append("the record states no frame to place the surface in")
+    sizes = {"v": 0, "vt": 0, "vn": 0}
+    positions = {}
+    counts = {}
+    current_object = None
+    current_set = None
+    with open(path, encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            tag, _, rest = line.rstrip("\n").partition(" ")
+            if tag in sizes:
+                sizes[tag] += 1
+                if tag == "v":
+                    positions.setdefault(current_object, []).append(
+                        [float(value) for value in rest.split()])
+            elif tag == "o":
+                current_object = rest
+            elif tag == "usemtl":
+                current_set = rest
+            elif tag == "f":
+                key = (current_object, current_set)
+                counts[key] = counts.get(key, 0) + 1
+                for token in rest.split():
+                    parts = token.split("/")
+                    for kind, value in zip(("v", "vt", "vn"), parts):
+                        if value and not 1 <= int(value) <= sizes[kind]:
+                            failures.append("line {0}: {1} index {2} outside its {3} "
+                                            "entries".format(number, kind, value, sizes[kind]))
+    for entry in record.get("scene", []):
+        for texture_set, declared in entry.get("texture_sets", {}).items():
+            found = counts.get((entry["name"], texture_set), 0)
+            if found != declared:
+                failures.append("{0} / {1}: {2} faces, the record says {3}".format(
+                    entry["name"], texture_set, found, declared))
+        rows = positions.get(entry["name"], [])
+        for axis in range(3):
+            column = [row[axis] for row in rows]
+            if column and (min(column) < entry["bounds_min"][axis] - 1e-9
+                           or max(column) > entry["bounds_max"][axis] + 1e-9):
+                failures.append("{0}: axis {1} leaves its declared bounds".format(
+                    entry["name"], axis))
+    return failures, counts
 
 
 def command_textures(arguments):
@@ -255,7 +240,7 @@ def command_textures(arguments):
         if payload.get("kind") != "tex":
             print("newest generation is {0}, not textures".format(payload.get("kind")))
             return 1
-        maps_directory = directory / payload["directory"]
+        maps_directory = Path(payload["directory"])
         for texture_set in payload["texture_sets"]:
             print("{0} {1}".format(texture_set["name"], texture_set["resolution"]))
             for entry in texture_set["maps"]:
@@ -276,13 +261,13 @@ def command_textures(arguments):
 
 
 _DRIVER = """
-import sys
+import importlib
 import time
 import addon_utils
 import bpy
 
-addon_utils.enable({addon!r}, default_set=False, persistent=False)
-module = sys.modules[{addon!r}]
+addon_utils.enable({addon!r}, default_set=True, persistent=False)
+module = importlib.import_module({addon!r} + ".Host.Blender")
 module.connect({session!r}, {root!r})
 try:
 {body}
@@ -325,33 +310,24 @@ def _run_blender(arguments, body):
     return 0
 
 
+def _body(*lines):
+    """Lines of the driver body, indented into its ``try`` block."""
+    return "\n".join("    " + line for line in lines)
+
+
 def command_publish_mesh(arguments):
-    body = (
-        "    generation = module.publish_mesh(bpy.context, {scope!r}, {intent!r}, True)\n"
-        "    print({marker!r}, 'published', generation.number)"
-    ).format(scope=arguments.scope, intent=arguments.intent, marker=MARKER)
-    if arguments.then_request_export:
-        body += (
-            "\n    generation = module.request_export({preset!r})\n"
-            "    print({marker!r}, 'requested', generation.number)"
-        ).format(preset=arguments.preset, marker=MARKER)
-    return _run_blender(arguments, body)
+    lines = ["generation = module.send_mesh(bpy.context)",
+             "print({0!r}, 'published', generation.number)".format(MARKER)]
+    if arguments.then_pull_textures:
+        lines += ["generation = module.pull_textures()",
+                  "print({0!r}, 'requested', generation.number)".format(MARKER)]
+    return _run_blender(arguments, _body(*lines))
 
 
 def command_request_export(arguments):
-    body = (
-        "    generation = module.request_export({preset!r})\n"
-        "    print({marker!r}, 'requested', generation.number)"
-    ).format(preset=arguments.preset, marker=MARKER)
-    return _run_blender(arguments, body)
-
-
-def command_push_shader_values(arguments):
-    body = (
-        "    generation = module.push_shader_parameters(bpy.context, {scope!r})\n"
-        "    print({marker!r}, 'shader values', generation.number)"
-    ).format(scope=arguments.scope, marker=MARKER)
-    return _run_blender(arguments, body)
+    return _run_blender(arguments, _body(
+        "generation = module.pull_textures()",
+        "print({0!r}, 'requested', generation.number)".format(MARKER)))
 
 
 def command_shaders(arguments):
@@ -374,30 +350,24 @@ def command_shaders(arguments):
 
 
 def command_pull_textures(arguments):
-    if arguments.wait:
-        body = (
-            "    deadline = time.time() + {timeout}\n"
-            "    received = []\n"
-            "    while time.time() < deadline and not received:\n"
-            "        for number, kind, report in module.pump(bind={bind}):\n"
-            "            print({marker!r}, kind, number, report)\n"
-            "            if kind == 'textures':\n"
-            "                received.append(number)\n"
-            "        time.sleep(0.5)\n"
-            "    if not received:\n"
-            "        raise SystemExit('no textures arrived within {timeout}s')\n"
-        ).format(timeout=arguments.timeout, bind=arguments.bind, marker=MARKER)
-    else:
-        body = (
-            "    generation, report = module.ingest_latest_textures(bind={bind})\n"
-            "    print({marker!r}, 'textures', generation.number, report)\n"
-        ).format(bind=arguments.bind, marker=MARKER)
+    """Ask Painter for its textures and wait for them to land in the materials."""
+    lines = [
+        "module.{0}()".format("pull_selected_layer" if arguments.layer else "pull_textures"),
+        "deadline = time.time() + {0}".format(arguments.timeout),
+        "received = []",
+        "while time.time() < deadline and not received:",
+        "    for key, number, report in module.pump():",
+        "        print({0!r}, key, number, report)".format(MARKER),
+        "        if key == 'tex':",
+        "            received.append(number)",
+        "    time.sleep(0.5)",
+        "if not received:",
+        "    raise SystemExit('no textures arrived within {0}s')".format(arguments.timeout),
+    ]
     if arguments.save:
-        body += (
-            "    bpy.ops.wm.save_mainfile()\n"
-            "    print({marker!r}, 'saved', bpy.data.filepath)"
-        ).format(marker=MARKER)
-    return _run_blender(arguments, body)
+        lines += ["bpy.ops.wm.save_mainfile()",
+                  "print({0!r}, 'saved', bpy.data.filepath)".format(MARKER)]
+    return _run_blender(arguments, _body(*lines))
 
 
 def _is_reparse_point(path):
@@ -586,26 +556,14 @@ def build_parser():
 
     publish = subparsers.add_parser("publish-mesh")
     add_blender_arguments(publish)
-    publish.add_argument("--scope", default="VISIBLE", choices=["SELECTED", "VISIBLE"])
-    publish.add_argument("--intent", default=record_module.INTENT_AUTO,
-                         choices=[record_module.INTENT_AUTO,
-                                  record_module.INTENT_CREATE_PROJECT,
-                                  record_module.INTENT_RELOAD_MESH])
-    publish.add_argument("--then-request-export", action="store_true",
-                         help="publish an export request right behind the mesh, from the "
-                              "same Blender run, so both reach Painter in one batch")
-    publish.add_argument("--preset", default=DEFAULT_EXPORT_PRESET)
+    publish.add_argument("--then-pull-textures", action="store_true",
+                         help="ask for the textures right behind the mesh, from the same "
+                              "Blender run, so both reach Painter in one batch")
     publish.set_defaults(handler=command_publish_mesh)
 
     request = subparsers.add_parser("request-export")
     add_blender_arguments(request)
-    request.add_argument("--preset", default=DEFAULT_EXPORT_PRESET)
     request.set_defaults(handler=command_request_export)
-
-    push_values = subparsers.add_parser("push-shader-values")
-    add_blender_arguments(push_values)
-    push_values.add_argument("--scope", default="VISIBLE", choices=["SELECTED", "VISIBLE"])
-    push_values.set_defaults(handler=command_push_shader_values)
 
     shaders = subparsers.add_parser("shaders")
     shaders.add_argument("--name", default=None, help="only parameters containing this text")
@@ -613,11 +571,9 @@ def build_parser():
 
     pull = subparsers.add_parser("pull-textures")
     add_blender_arguments(pull)
-    pull.add_argument("--wait", action="store_true",
-                      help="wait for a new publish instead of taking the latest one")
+    pull.add_argument("--layer", action="store_true",
+                      help="only the layer selected in Painter")
     pull.add_argument("--timeout", type=float, default=180.0)
-    pull.add_argument("--bind", action="store_true",
-                      help="fill Image Texture nodes labelled with an incoming channel")
     pull.add_argument("--save", action="store_true", help="save the blend after ingesting")
     pull.set_defaults(handler=command_pull_textures)
 
@@ -639,7 +595,7 @@ def main(argv=None):
     arguments = build_parser().parse_args(argv)
     try:
         return arguments.handler(arguments)
-    except (arena_module.ArenaError, record_module.RecordError, glb_module.GlbError) as error:
+    except (arena_module.ArenaError, record_module.RecordError) as error:
         print(error)
         return 1
 

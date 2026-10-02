@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Rendering Painter's channels into the arena and publishing what came out.
+"""Rendering Painter's channels into the Blender document's textures folder.
 
 Which maps exist and which channels feed them is not a table kept here: it comes
 from a Painter export preset via ``list_output_maps``, which is Painter's own
 answer for the stack in front of it. This module only overrides two things per
 map -- the file format and the bit depth -- and it derives both from the format
 of the channels that map reads, so a 16-bit channel is never quietly written out
-as 8-bit. That is what makes the round trip lossless.
+as 8-bit.
 
-Only the file names are the bridge's own, and deliberately so: naming the maps
-here is what lets an exported path be attributed back to the map that produced
-it without guessing.
+The files land in the folder the Blender document names, under names made from
+the Texture Set and the map. They are the textures from then on: written once,
+read in place, and found again tomorrow.
 
 Colour space is settled from ``ChannelFormat``, whose documented storage column
 is the one place Painter says whether a channel is held sRGB-encoded or linear.
@@ -18,14 +18,15 @@ is the one place Painter says whether a channel is held sRGB-encoded or linear.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 
 import substance_painter.export
+import substance_painter.layerstack
 import substance_painter.project
 import substance_painter.textureset
 
-from ...Kernel import arena as arena_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
@@ -42,6 +43,7 @@ _TOKEN = re.compile(r"\$(" + "|".join(WILDCARDS) + ")")
 _LEFTOVER_TOKEN = re.compile(r"\$\w+")
 _EMPTY_GROUP = re.compile(r"[(\[{][_\-. ]*[)\]}]")
 _SEPARATORS = "_-. "
+_UNSAFE_IN_FILE_NAMES = re.compile(r'[\\/:*?"<>|\s]+')
 
 
 class TexturePublishError(RuntimeError):
@@ -79,7 +81,7 @@ def _map_key(file_name, document_names, other_names, index):
     The wildcards are stripped by the documented vocabulary rather than by a
     general word pattern: Painter's separator is an underscore, which a word
     pattern swallows along with the name after it, leaving every map called the
-    same thing and every exported file matching the first map's template.
+    same thing.
     """
     leftover = _LEFTOVER_TOKEN.findall(_TOKEN.sub("", file_name))
     if leftover:
@@ -173,10 +175,11 @@ class PlannedMap:
         self.definition = definition
 
 
-def plan_stack(preset_name, texture_set, stack):
-    """Every map this stack will write, with the bridge's own file names."""
+def plan_stack(preset_name, texture_set, stack, stem_suffix=""):
+    """Every map this stack will write, named ``<Texture Set>[_<suffix>]_<map>``."""
     channels_by_name = _channels_by_name(stack)
     tiled = texture_set.has_uv_tiles()
+    stem = "$textureSet" + ("_" + stem_suffix if stem_suffix else "")
     planned = []
     for index, output_map in enumerate(_output_maps_for(preset_name, stack)):
         document_names, other_names, channels = _map_sources(output_map, channels_by_name)
@@ -187,7 +190,7 @@ def plan_stack(preset_name, texture_set, stack):
                 "stack {2}; they would overwrite each other on disk".format(
                     preset_name, key, stack))
         file_format, bit_depth, floating, is_color = _format_override(channels)
-        file_name = ("$textureSet_$udim_" + key) if tiled else ("$textureSet_" + key)
+        file_name = (stem + "_$udim_" + key) if tiled else (stem + "_" + key)
         definition = dict(output_map)
         definition["fileName"] = file_name
         parameters = dict(definition.get("parameters", {}))
@@ -204,36 +207,14 @@ def plan_stack(preset_name, texture_set, stack):
     return planned
 
 
-def _touched_by(planned_map, dirty_channels):
-    """Whether one map has to be re-rendered for this set of changed channels.
-
-    A map with no document channel behind it is derived from the stack by
-    Painter -- a converted normal, a mixed occlusion -- and there is no way from
-    here to say which channel it was derived from, so it re-renders whenever
-    anything in its stack did.
-    """
-    document_sources = [name for name in planned_map.source_channels if name.islower()]
-    if not document_sources:
-        return True
-    return any(name in dirty_channels for name in document_sources)
-
-
-def build_configuration(export_directory, preset_name, selected_texture_sets=None,
-                        dirty_channels_by_texture_set=None):
+def build_configuration(export_directory, preset_name, texture_sets, stem_suffix=""):
     """The export JSON, plus the plan needed to read its output back."""
-    if not substance_painter.project.is_open():
-        raise TexturePublishError("no project is open")
     presets = []
     export_list = []
     plan_by_stack = {}
-    for texture_set in substance_painter.textureset.all_texture_sets():
-        if selected_texture_sets and texture_set.name not in selected_texture_sets:
-            continue
+    for texture_set in texture_sets:
         for stack in texture_set.all_stacks():
-            planned = plan_stack(preset_name, texture_set, stack)
-            if dirty_channels_by_texture_set is not None:
-                dirty = dirty_channels_by_texture_set.get(texture_set.name, set())
-                planned = [entry for entry in planned if _touched_by(entry, dirty)]
+            planned = plan_stack(preset_name, texture_set, stack, stem_suffix)
             if not planned:
                 continue
             generated_name = "ruri_{0}".format(str(stack).replace("/", "_"))
@@ -242,7 +223,7 @@ def build_configuration(export_directory, preset_name, selected_texture_sets=Non
             export_list.append({"rootPath": str(stack), "exportPreset": generated_name})
             plan_by_stack[(texture_set.name, stack.name())] = (texture_set, stack, planned)
     if not export_list:
-        raise TexturePublishError("the open project has no stack with any channel to export")
+        raise TexturePublishError("nothing to export: no stack has a channel")
     configuration = {
         "exportShaderParams": False,
         "exportPath": str(export_directory),
@@ -262,8 +243,7 @@ def _attribute(paths, planned, export_directory):
     for path in paths:
         stem, _extension = os.path.splitext(os.path.basename(path))
         for entry in planned:
-            match = entry.pattern.match(stem)
-            if match is None:
+            if entry.pattern.match(stem) is None:
                 continue
             by_key.setdefault(entry.key, []).append(
                 os.path.relpath(path, export_directory).replace("\\", "/"))
@@ -273,121 +253,169 @@ def _attribute(paths, planned, export_directory):
     return by_key, unmatched
 
 
-def publish(arena, publisher, preset_name=DEFAULT_PRESET_NAME, selected_texture_sets=None,
-            dirty_channels_by_texture_set=None):
-    """Export channels into a fresh generation and publish it.
+def _selected_layers():
+    """The layers selected in the active stack, with an effect standing for its layer."""
+    stack = substance_painter.textureset.get_active_stack()
+    chosen = []
+    for node in substance_painter.layerstack.get_selected_nodes(stack):
+        while node is not None and not isinstance(node, substance_painter.layerstack.LayerNode):
+            node = node.get_parent()
+        if node is not None and node not in chosen:
+            chosen.append(node)
+    if not chosen:
+        raise TexturePublishError("no layer is selected in Painter")
+    return stack, chosen
 
-    Passing the changed channels turns this into an incremental publish: only
-    those maps are rendered and written, which is what makes a paint stroke cost
-    one map rather than a whole Texture Set.
+
+@contextlib.contextmanager
+def _only_these_visible(stack, chosen):
+    """Hide every other layer of the stack for the duration, then put them back.
+
+    The folders a chosen layer sits in stay visible, or nothing inside them would
+    render; their other contents are hidden like everything else. A layer that
+    was already hidden is left hidden and is not "restored" afterwards.
     """
-    with publisher.staging() as staging:
-        export_directory = staging.path(record_module.TEXTURE_DIRECTORY_NAME)
-        export_directory.mkdir(parents=True, exist_ok=True)
-
-        configuration, plan_by_stack = build_configuration(
-            export_directory, preset_name, selected_texture_sets,
-            dirty_channels_by_texture_set)
-        result = substance_painter.export.export_project_textures(configuration)
-        if result.status != substance_painter.export.ExportStatus.Success:
-            LOG.warning("export finished as %s: %s", result.status, result.message)
-        # This application has no buffer-shaped exit -- rendering to a path is the
-        # only door there is -- so the files it just made are ordinary ones. Asking
-        # for them to stay resident is what keeps the leg at one write and one
-        # read: the reader on the other side maps these same pages.
-        for written in result.textures.values():
-            for entry in written:
-                arena_module.keep_in_memory(entry)
-
-        texture_sets = []
-        for identity, paths in result.textures.items():
-            entry = plan_by_stack.get(identity)
-            if entry is None:
-                LOG.warning("Painter exported stack %s which was not planned", identity)
+    keep = set()
+    for node in chosen:
+        parent = node.get_parent()
+        while parent is not None and isinstance(parent, substance_painter.layerstack.LayerNode):
+            keep.add(parent)
+            parent = parent.get_parent()
+    hidden = []
+    pending = list(substance_painter.layerstack.get_root_layer_nodes(stack))
+    try:
+        while pending:
+            node = pending.pop()
+            if node in chosen:
                 continue
-            texture_set, stack, planned = entry
-            by_key, unmatched = _attribute(paths, planned, export_directory)
-            for path in unmatched:
-                LOG.warning("exported file %s matched no planned map", path)
-            resolution = texture_set.get_resolution()
-            maps = []
-            for planned_map in planned:
-                files = by_key.get(planned_map.key)
-                if not files:
-                    continue
-                maps.append({
-                    "channel": planned_map.key,
-                    "files": sorted(files),
-                    "file_format": planned_map.file_format,
-                    "bit_depth": planned_map.bit_depth,
-                    "is_floating": planned_map.is_floating,
-                    "is_color": planned_map.is_color,
-                    "color_space": planned_map.color_space,
-                    "source_channels": planned_map.source_channels,
-                })
-            texture_sets.append({
-                "identity": texture_set.original_name,
-                "name": texture_set.name,
-                "stack": stack.name(),
-                "resolution": [resolution.width, resolution.height],
-                "maps": maps,
-            })
-
-        return staging.publish(record_module.textures(
-            source="Substance",
-            project_path=substance_painter.project.file_path(),
-            mesh_path=substance_painter.project.last_imported_mesh_path(),
-            texture_sets=texture_sets))
+            if node in keep:
+                children = getattr(node, "sub_layers", None)
+                if callable(children):
+                    pending.extend(children())
+                continue
+            if node.is_visible():
+                node.set_visible(False)
+                hidden.append(node)
+        yield
+    finally:
+        for node in hidden:
+            node.set_visible(True)
 
 
-def apply_display_names(names_by_identity):
-    """Show the readable material names Blender knows, keyed by identity.
+def _safe(name):
+    return _UNSAFE_IN_FILE_NAMES.sub("_", name).strip("_") or "layer"
 
-    The name Blender puts in the mesh is an identity, so that renaming a material
-    there cannot arrive here as a different material and strand the paint. That
-    identity is what ``original_name`` reports for ever after, and it is also what
-    the Texture Set would be called in the UI -- which is unreadable. So the
-    display name is set from what Blender calls the material today, and reset
-    whenever Blender says it changed.
+
+def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False):
+    """Export into the document's textures folder and say what landed where.
+
+    With ``layer`` set, only the layer selected in Painter is rendered: its
+    Texture Set alone, every other layer hidden for the length of the export, the
+    files named after the layer so they never overwrite the Texture Set's own.
     """
-    renamed = {}
-    for texture_set in substance_painter.textureset.all_texture_sets():
-        wanted = names_by_identity.get(texture_set.original_name)
-        if not wanted or texture_set.name == wanted:
+    if not substance_painter.project.is_open():
+        raise TexturePublishError("no project is open")
+    if not directory:
+        raise TexturePublishError("Blender has not said where its textures live; "
+                                  "save the .blend and attach it")
+    os.makedirs(directory, exist_ok=True)
+    if layer:
+        stack, chosen = _selected_layers()
+        texture_sets = [stack.material()]
+        suffix = _safe("_".join(node.get_name() for node in chosen))
+        isolation = _only_these_visible(stack, chosen)
+    else:
+        texture_sets = list(substance_painter.textureset.all_texture_sets())
+        suffix = ""
+        isolation = contextlib.nullcontext()
+
+    with isolation:
+        configuration, plan_by_stack = build_configuration(
+            directory, preset_name, texture_sets, suffix)
+        result = substance_painter.export.export_project_textures(configuration)
+    if result.status != substance_painter.export.ExportStatus.Success:
+        LOG.warning("export finished as %s: %s", result.status, result.message)
+
+    exported = []
+    for identity, paths in result.textures.items():
+        entry = plan_by_stack.get(identity)
+        if entry is None:
+            LOG.warning("Painter exported stack %s which was not planned", identity)
             continue
-        try:
-            texture_set.name = wanted
-        except ValueError as error:
-            LOG.warning("cannot show %r as %r: %s", texture_set.original_name, wanted, error)
-            continue
-        renamed[texture_set.original_name] = wanted
-    if renamed:
-        LOG.info("renamed %d Texture Set(s) to follow Blender", len(renamed))
-    return renamed
+        texture_set, stack, planned = entry
+        by_key, unmatched = _attribute(paths, planned, directory)
+        for path in unmatched:
+            LOG.warning("exported file %s matched no planned map", path)
+        maps = []
+        for planned_map in planned:
+            files = by_key.get(planned_map.key)
+            if not files:
+                continue
+            maps.append({
+                "channel": planned_map.key,
+                "files": sorted(files),
+                "file_format": planned_map.file_format,
+                "bit_depth": planned_map.bit_depth,
+                "is_color": planned_map.is_color,
+                "color_space": planned_map.color_space,
+                "source_channels": planned_map.source_channels,
+            })
+        resolution = texture_set.get_resolution()
+        exported.append({
+            "name": texture_set.name,
+            "stack": stack.name(),
+            "layer": suffix,
+            "resolution": [resolution.width, resolution.height],
+            "maps": maps,
+        })
+    if not exported:
+        raise TexturePublishError("the export wrote nothing: {0}".format(result.message))
+    return publisher.publish_record(record_module.textures(
+        "Substance", substance_painter.project.file_path(), directory, exported))
+
+
+def rename(renames):
+    """Rename Texture Sets, old name to new. The one edit that keeps every layer.
+
+    Done in two steps through names nobody uses, so swapping two names, or
+    renaming A to B while B is renamed away, never collides half-way. A target
+    that is already taken by a Texture Set not being renamed is refused before
+    anything moves.
+    """
+    by_name = {texture_set.name: texture_set
+               for texture_set in substance_painter.textureset.all_texture_sets()}
+    wanted = {old: new for old, new in renames.items() if old in by_name and old != new}
+    missing = sorted(set(renames) - set(by_name))
+    if missing:
+        LOG.warning("asked to rename Texture Sets this project does not have: %s",
+                    ", ".join(missing))
+    staying = set(by_name) - set(wanted)
+    taken = sorted(new for new in wanted.values() if new in staying)
+    if taken:
+        raise TexturePublishError(
+            "this project already has Texture Sets called {0}; rename or remove "
+            "those first".format(", ".join(taken)))
+    if len(set(wanted.values())) != len(wanted):
+        raise TexturePublishError("two Texture Sets cannot both be called the same thing")
+    for index, old in enumerate(sorted(wanted)):
+        by_name[old].name = "__ruri_rename_{0}".format(index)
+    for index, old in enumerate(sorted(wanted)):
+        by_name[old].name = wanted[old]
+    if wanted:
+        LOG.info("renamed %s", ", ".join("{0} -> {1}".format(old, new)
+                                         for old, new in sorted(wanted.items())))
+    return wanted
 
 
 def current_project_state():
-    """What Painter has open, for the panel and for Blender's status line."""
+    """What Painter has open: the project file, every Texture Set with its layers,
+    and the frame its surface lives in."""
     if not substance_painter.project.is_open():
-        return record_module.presence("Substance", False, None, None, [], {})
-    texture_sets = []
-    for texture_set in substance_painter.textureset.all_texture_sets():
-        resolution = texture_set.get_resolution()
-        stacks = []
-        for stack in texture_set.all_stacks():
-            stacks.append({
-                "name": stack.name(),
-                "channels": sorted(channel_type.name
-                                   for channel_type in stack.all_channels()),
-            })
-        texture_sets.append({
-            "identity": texture_set.original_name,
-            "name": texture_set.name,
-            "resolution": [resolution.width, resolution.height],
-            "stacks": stacks,
-        })
+        return record_module.presence("Substance", "")
+    texture_sets = [{"name": texture_set.name,
+                     "layers": mesh_ingest.layer_count(texture_set)}
+                    for texture_set in substance_painter.textureset.all_texture_sets()]
     return record_module.presence(
-        "Substance", True,
-        substance_painter.project.file_path(),
-        substance_painter.project.last_imported_mesh_path(),
-        texture_sets, mesh_ingest.stored_binding())
+        "Substance", substance_painter.project.file_path() or "(unsaved project)",
+        texture_sets=sorted(texture_sets, key=lambda entry: entry["name"]),
+        frame_of_project=mesh_ingest.project_frame())

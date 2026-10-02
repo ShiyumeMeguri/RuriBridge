@@ -104,9 +104,9 @@ def _mark_temporary(path):
 def keep_in_memory(path):
     """Ask the cache manager to keep this file's pages resident.
 
-    For payloads another application wrote for itself. Everything produced
-    through :meth:`Arena.create_mapped_file` is already marked; this is the same
-    request, made after the fact, for bytes that arrived from outside.
+    For payloads an application writes as ordinary files: the reader on the other
+    side opens them moments later, and a file marked temporary is served from the
+    cache rather than written out and read back.
     """
     _mark_temporary(Path(path))
     return path
@@ -507,26 +507,6 @@ class Arena:
         path = self.generation_directory(channel, generation)
         if path.exists():
             shutil.rmtree(path, ignore_errors=True)
-
-    def create_mapped_file(self, path, size):
-        """Create a file of exactly ``size`` bytes and map it read/write.
-
-        The returned map is the producer's writing surface and the consumer's
-        reading surface at once: filling it is the only time these bytes are
-        ever written.
-        """
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as handle:
-            handle.truncate(size)
-        _mark_temporary(path)
-        handle = open(path, "r+b")
-        try:
-            mapped = mmap.mmap(handle.fileno(), size, access=mmap.ACCESS_WRITE)
-        except (ValueError, OSError) as error:
-            handle.close()
-            raise ArenaError("could not map {0} at {1} bytes: {2}".format(path, size, error))
-        return handle, mapped
 
     def describe(self):
         """Every slot, for the CLI and for the two panels."""

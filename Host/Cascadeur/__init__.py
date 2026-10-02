@@ -42,10 +42,6 @@ LOG = log_module.logger("cascadeur")
 
 PEER = peers_module.CASCADEUR
 
-#: This application works in centimetres and glTF is metres. One constant, used
-#: in both directions, so the two conversions cannot drift apart.
-CENTIMETRES_PER_METRE = 100.0
-
 #: The scene handed to a command, for the duration of one visit. It is how this
 #: application says things to its own user, and it does not outlive the visit.
 _SCENE = None
@@ -136,13 +132,15 @@ def _import_options(with_animation, with_objects):
     options.include_animation = with_animation
     options.include_objects = with_objects
     options.throw_exception = True
-    options.scale_factor = CENTIMETRES_PER_METRE
+    # This application works in centimetres and glTF is metres; one constant serves
+    # both directions, so the two conversions cannot drift apart.
+    options.scale_factor = record_module.CENTIMETRES_PER_METRE
     return options
 
 
 def _payload_path(generation):
     """The GLB inside a generation, named by the record rather than guessed."""
-    name = generation.record.get("scene_file") or record_module.SCENE_FILE_NAME
+    name = generation.record["scene_file"]
     path = generation.directory / name
     if not path.exists():
         raise RuntimeError(
@@ -181,7 +179,7 @@ def _export_options(with_animation, selected_only):
     options.include_animation = with_animation
     options.for_selected_objects = selected_only
     options.throw_exception = True
-    options.scale_factor = 1.0 / CENTIMETRES_PER_METRE
+    options.scale_factor = 1.0 / record_module.CENTIMETRES_PER_METRE
     options.normalize_weights = True
     options.remove_empty_nodes = True
     return options
@@ -210,11 +208,8 @@ def publish(topic, selected_only=False, connection=None):
         # It wrote the file itself, so it is an ordinary one until it is asked to
         # stay resident -- and the reader on the other side maps these pages.
         arena_module.keep_in_memory(path)
-        payload = record_module.mesh(
-            HOST.name, record_module.INTENT_AUTO,
-            {"name": _scene_name()}, [], CENTIMETRES_PER_METRE, "Y")
-        payload["kind"] = topic.key
-        generation = staging.publish(payload)
+        generation = staging.publish(record_module.performance(
+            HOST.name, record_module.SCENE_FILE_NAME, _scene_name()))
     HOST.log(host_port.INFO, "published {0} generation {1} ({2} bytes)".format(
         topic.key, generation.number, path.stat().st_size))
     return generation
@@ -276,7 +271,7 @@ def visit(scene=None, session="default", root=None, publish_topic=None,
                 handled.append((endpoint.topic.key, generation.number, str(error)))
             endpoint.reader.acknowledge(generation)
         CONNECTION.session.writer(topic_module.PRESENCE).write(
-            record_module.presence(HOST.name, True, "", "", []))
+            record_module.presence(HOST.name, _scene_name()))
         if publish_topic is not None:
             handled.append((publish_topic.key, 0,
                             publish(publish_topic, selected_only).number))

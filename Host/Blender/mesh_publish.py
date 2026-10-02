@@ -1,194 +1,413 @@
 # -*- coding: utf-8 -*-
-"""Turning Blender's evaluated meshes into a GLB inside the shared arena.
+"""Turning Blender's meshes into the surface a texturing project paints on.
 
-The gather is one ``foreach_get`` per attribute straight out of Blender's C
-arrays; no Python-level loop over corners ever runs. What comes back lives on the
-corner domain, because split normals and UV seams are corner facts, so corners
-are deduplicated into the minimal vertex set before anything is written.
+**What crosses is the surface somebody paints on**, not the picture this
+application renders. That is the base mesh in its rest shape, with the modelling
+modifiers that make it -- a mirror, a triangulation -- and without the ones whose
+output only exists for the render: a rig's pose, and whatever geometry nodes grow
+at render time, outline shells and fur layers among them. A texturing tool given
+those paints on a posed body inside twenty copies of itself.
 
-Deduplication never materialises the values it compares. Two corners share a
-position exactly when they share a vertex index, so the key is that index plus
-the corner-domain attributes as they already sit in Blender's buffers -- compared
-as raw 32-bit lanes, which is why it is one vectorised call rather than a
-tolerance search. The result is an ordering, and every attribute is then gathered
-through that ordering *directly into the mapped page*: one pass, one write, no
-intermediate array.
+**It lands in the project's own frame.** Painter places every 3D projection and
+re-projects every stroke relative to the frame the project's surface first came
+in, and it refuses to carry strokes onto a surface whose units or scale differ.
+So the frame is a fact of the project, stated by Painter, and the surface is
+written into it: a project the bridge starts measures in centimetres, and one that
+began as somebody else's file keeps whatever frame that file had. A surface sent
+in any other frame is, to Painter, a different object.
 
-Point-domain data stays off the key entirely: it is already implied by the vertex
-index, and it is written by composing the two index arrays instead of expanding
-it to the corner domain first.
+**It is an OBJ of the polygons as they are.** Painter triangulates on import, and
+the triangulation it chose is part of what a stroke or a selection is recorded
+against; handing it Blender's own triangles would be handing it a second opinion.
+The format carries one UV set and no material description at all -- the UV set
+Painter paints is the one Blender renders with, and a material description is
+exactly what a glTF import turns into an unasked-for layer on every new Texture
+Set.
+
+**Which Texture Set a material paints into** is the one fact this side keeps
+about the other. It is a name, written on the material the first time it crosses
+and held still afterwards, so renaming the material here renames a label and not
+the paint. Several materials may name the same Texture Set -- one material split
+in two across one UV layout is still one surface to paint -- and a material may
+name none, which keeps its faces out of the texturing tool entirely.
 """
 
 from __future__ import annotations
 
-import uuid
+import contextlib
 
 import bpy
 import mathutils
 import numpy
 
+from ...Kernel import arena as arena_module
 from ...Kernel import record as record_module
-from ...Kernel.glb import (AttributeLayout, BLENDER_TO_GLTF_ROTATION, GlbWriter,
-                             MeshLayout, PrimitiveLayout, SceneLayout,
-                             SEMANTIC_COLOR_0, SEMANTIC_NORMAL, SEMANTIC_POSITION,
-                             TEXCOORD_PREFIX)
 from ...Kernel.log import logger
-from . import texture_publish
 
 LOG = logger("blender.mesh")
 
-MAXIMUM_TEXCOORD_SETS = 8
+#: The Texture Set a material paints into. Absent until the material first
+#: crosses; an empty string when it is deliberately kept out of the texturing
+#: tool. A key written into .blend files, so it never changes spelling.
 IDENTITY_PROPERTY = "ruri_bridge_identity"
-#: The custom property a material uses to say what its shading row is: which
-#: shader vocabulary it speaks, which variant of it, and which property groups
-#: hold the values under what spelling. Written by whatever generated the
-#: material; the bridge only reads it.
+#: The custom property a generated material uses to say what its shading row
+#: is. Written by whatever generated the material; the bridge only reads it.
 SHADING_DECLARATION = "ruri_shading"
-NEGATIVE_ZERO_PATTERN = numpy.uint32(0x80000000)
+#: Modifier types whose output belongs to the render and not to the surface: an
+#: armature poses the surface, and geometry nodes in this toolchain grow render
+#: geometry -- outline shells, fur layers -- on top of it.
+RENDER_TIME_MODIFIERS = frozenset(("ARMATURE", "NODES"))
+#: Blender's world turned the way a texturing tool stands, Y up: a quarter turn
+#: about X, (x, y, z) becoming (x, z, -y). Written out rather than computed, so it
+#: carries no rounding into a frame that has to match to the last bit.
+PAINTER_AXES = numpy.array(((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)))
 
 
-class AttributeSource:
-    """How one attribute reaches the page: take(values, order) with no copy first."""
+# -- which Texture Set ---------------------------------------------------------
 
-    __slots__ = ("semantic", "values", "order")
+def texture_set_of(material):
+    """The Texture Set this material paints into; empty when it paints none.
 
-    def __init__(self, semantic, values, order):
-        self.semantic = semantic
-        self.values = values
-        self.order = order
-
-    @property
-    def component_count(self):
-        return self.values.shape[1]
-
-
-class ObjectData:
-    """One source object, resolved down to index arrays and its own buffers."""
-
-    __slots__ = ("name", "node_matrix", "vertex_count", "sources", "primitives",
-                 "identity", "include_colors")
-
-    def __init__(self, name, node_matrix, vertex_count, sources, primitives, identity,
-                 include_colors=True):
-        self.name = name
-        self.node_matrix = node_matrix
-        self.vertex_count = vertex_count
-        self.sources = sources
-        self.primitives = primitives
-        self.identity = identity
-        #: What it was read WITH, so a send that asks for something different does
-        #: not quietly get the previous answer.
-        self.include_colors = include_colors
-
-
-def _column_major(matrix):
-    return [matrix[row][column] for column in range(4) for row in range(4)]
-
-
-def mint_identity(datablock):
-    """The name the other side knows this by, and whether it was just settled on.
-
-    It is the datablock's own name, taken once and then held still. Painter
-    matches a Texture Set to the mesh material it came from by name, so what
-    travels has to stay put across a rename here -- but it has to stay a *name*,
-    because it is what somebody reads in Painter's Texture Set list. An
-    identifier minted out of nothing satisfies the first half and fails the
-    second: the list fills with hex.
-
-    Whether it was just settled on is worth carrying. It only becomes durable
-    when the file holding it is saved, so a caller that has just taken one is
-    admitting it has no memory of previous sessions, and the receiving side can
-    adopt rather than read it as proof that this is somebody else's work.
+    A material that has never crossed answers with its own name, which is also
+    what it is settled to the first time it does.
     """
-    existing = datablock.get(IDENTITY_PROPERTY)
-    if existing:
-        return existing, False
-    datablock[IDENTITY_PROPERTY] = datablock.name
-    return datablock.name, True
+    if IDENTITY_PROPERTY in material.keys():
+        return str(material[IDENTITY_PROPERTY])
+    return material.name
 
 
-def mint_scene_identity(scene):
-    """The scene's identity, which nobody ever reads, so it is minted.
+def is_excluded(material):
+    return IDENTITY_PROPERTY in material.keys() and not str(material[IDENTITY_PROPERTY])
 
-    Unlike a material, this never crosses into a name anyone sees: it lives in
-    the Painter project's metadata and answers one question, whether this project
-    belongs to this scene. Names cannot answer that -- two files both called
-    Scene are the common case, and binding them together would be worse than
-    having no binding at all.
+
+def settle(material):
+    """Hold the name still from here on, so a rename is a rename of the label."""
+    if IDENTITY_PROPERTY not in material.keys():
+        material[IDENTITY_PROPERTY] = material.name
+    return str(material[IDENTITY_PROPERTY])
+
+
+def paint_into(material, texture_set):
+    """Make this material paint into that Texture Set, or into none when empty."""
+    material[IDENTITY_PROPERTY] = texture_set
+
+
+# -- which objects, which materials ---------------------------------------------
+
+def scope(view_layer):
+    """The objects the model is made of: every visible mesh in the view layer."""
+    return [entry for entry in view_layer.objects
+            if entry.type == "MESH" and entry.visible_get()]
+
+
+def _worn_indices(object_reference):
+    """The slot indices some face of this object is actually rendered with.
+
+    Read off the attribute, not the polygons: both answer the same question and
+    one of them is free. An absent attribute is itself the answer -- Blender only
+    stores it once some face leaves slot zero.
     """
-    existing = scene.get(IDENTITY_PROPERTY)
-    if existing:
-        return existing, False
-    minted = uuid.uuid4().hex
-    scene[IDENTITY_PROPERTY] = minted
-    return minted, True
+    attribute = object_reference.data.attributes.get("material_index")
+    if attribute is None:
+        return (0,)
+    indices = numpy.empty(len(attribute.data), dtype=numpy.int32)
+    attribute.data.foreach_get("value", indices)
+    return tuple(numpy.unique(indices).tolist())
 
 
-def identity_of(datablock):
-    """The name Painter knows this by, which renaming here cannot move."""
-    return mint_identity(datablock)[0]
+def worn_materials(objects):
+    """Every material some face in scope wears, by name, in a stable order.
 
-
-def vertex_count_of(objects):
-    """How big this scene is, as one number both sides can compare.
-
-    Cheap enough to take on every send and specific enough to answer the only
-    question a name match needs answered: is the project on the other side built
-    from this model at all. Read from the stored meshes rather than the evaluated
-    ones so the number does not move when a modifier is toggled.
+    A slot no face points at is not shading anything -- a model imported from a
+    game arrives with variant leftovers -- and a Texture Set for it would be a
+    Texture Set for nothing.
     """
-    total = 0
+    found = {}
     for object_reference in objects:
-        vertices = getattr(object_reference.data, "vertices", None)
-        if vertices is not None:
-            total += len(vertices)
-    return total
+        slots = object_reference.material_slots
+        for index in _worn_indices(object_reference):
+            if index < len(slots) and slots[index].material is not None:
+                found.setdefault(slots[index].material.name, slots[index].material)
+    return {name: found[name] for name in sorted(found)}
 
 
-def adopt_identities(objects):
-    """Give every material its identity now, and name the ones that had none.
+def ensure_materials(objects):
+    """Give every object a real material before its name crosses the bridge.
 
-    An identity lives in the .blend, so a file that has not been saved since the
-    bridge first touched it takes a fresh set every session -- and Painter, which
-    matches Texture Sets by exactly that, then reads every material as new and
-    builds a second set of Texture Sets beside the painted ones. Doing it in one
-    pass before anything is written is what makes that visible while it can still
-    be prevented, instead of after the paint is stranded.
-
-    Two materials can want the same identity, because an identity is a name that
-    stopped moving while the names around it did not: rename A to B and call the
-    next material A, and both now answer to A. Painter would read one material and
-    merge the paint, so the collision is broken here, the second one taking the
-    next free suffix the way Blender numbers its own duplicates.
+    A Texture Set is named after the material it came from, and the return trip
+    finds its way home by that same name. An object with no material has no name
+    to give, so it gets one here, named after itself, and the log says so.
     """
-    fresh = set()
-    claimed = {}
+    created = []
     for object_reference in objects:
-        for slot in object_reference.material_slots:
-            material = slot.material
-            if material is None:
+        slots = list(object_reference.material_slots)
+        if not slots:
+            material = bpy.data.materials.new(object_reference.name)
+            object_reference.data.materials.append(material)
+            created.append(material.name)
+            continue
+        for index, slot in enumerate(slots):
+            if slot.material is not None:
                 continue
-            identity, is_new = mint_identity(material)
-            other = claimed.get(identity)
-            if other is not None and other is not material:
-                identity = _next_free_identity(identity, claimed)
-                LOG.warning("%r and %r both answer to %r over the bridge; %r takes %r",
-                            other.name, material.name, material[IDENTITY_PROPERTY],
-                            material.name, identity)
-                material[IDENTITY_PROPERTY] = identity
-                is_new = True
-            claimed[identity] = material
-            if is_new:
-                fresh.add(material.name)
-    return fresh
+            material = bpy.data.materials.new(object_reference.name)
+            object_reference.data.materials[index] = material
+            created.append(material.name)
+    if created:
+        LOG.info("created %d material(s) so the paint has somewhere to come back to: %s",
+                 len(created), ", ".join(created))
+    return created
 
 
-def _next_free_identity(identity, claimed):
-    suffix = 1
-    while "{0}.{1:03d}".format(identity, suffix) in claimed:
-        suffix += 1
-    return "{0}.{1:03d}".format(identity, suffix)
+def texture_set_rows(objects):
+    """Which Texture Set each worn material paints into, grouped by Texture Set."""
+    rows = {}
+    for material in worn_materials(objects).values():
+        name = texture_set_of(material)
+        if name:
+            rows.setdefault(name, []).append(material.name)
+    return [{"texture_set": name, "materials": sorted(materials)}
+            for name, materials in sorted(rows.items())]
 
+
+@contextlib.contextmanager
+def surface_only(objects):
+    """Evaluate these objects as the surface, with render-time modifiers off.
+
+    Switched off for the duration of one read and back on in ``finally``, so the
+    file holds exactly what it held before. Only modifiers that were on are
+    touched -- one the user had switched off stays off.
+    """
+    switched = []
+    try:
+        for object_reference in objects:
+            for modifier in object_reference.modifiers:
+                if modifier.type in RENDER_TIME_MODIFIERS and modifier.show_viewport:
+                    modifier.show_viewport = False
+                    switched.append(modifier)
+        yield
+    finally:
+        for modifier in switched:
+            modifier.show_viewport = True
+
+
+# -- reading one object ----------------------------------------------------------
+
+class SurfacePart:
+    """One object's paintable faces, already in the project's frame.
+
+    The corner arrays index this object's own vertex, UV and normal lists; the
+    writer moves them past whatever was written before. ``faces`` names, per
+    Texture Set, the polygons that paint into it as slices of the corner arrays.
+    """
+
+    __slots__ = ("name", "positions", "texcoords", "normals",
+                 "corner_vertex", "corner_texcoord", "corner_normal", "faces")
+
+    def __init__(self, name, positions, texcoords, normals,
+                 corner_vertex, corner_texcoord, corner_normal, faces):
+        self.name = name
+        self.positions = positions
+        self.texcoords = texcoords
+        self.normals = normals
+        self.corner_vertex = corner_vertex
+        self.corner_texcoord = corner_texcoord
+        self.corner_normal = corner_normal
+        self.faces = faces
+
+
+def _render_uv_layer(mesh, name):
+    """The UV map Blender renders with -- the one the far side paints in."""
+    layers = list(mesh.uv_layers)
+    if not layers:
+        LOG.warning("%s has no UV map; Painter will have to unwrap it", name)
+        return None
+    return next((layer for layer in layers if layer.active_render), layers[0])
+
+
+def _corner_order(starts, totals):
+    """Every corner of the given polygons, polygon after polygon, in loop order."""
+    offsets = numpy.cumsum(totals) - totals
+    return (numpy.arange(int(totals.sum()), dtype=numpy.int64)
+            - numpy.repeat(offsets, totals) + numpy.repeat(starts, totals))
+
+
+def gather_object(object_reference, depsgraph, frame_of_project):
+    """Read one evaluated object into the project's frame.
+
+    None when nothing of it crosses: no faces, or every face wears a material that
+    paints into no Texture Set.
+    """
+    texture_sets = [texture_set_of(slot.material) for slot in object_reference.material_slots]
+    evaluated = object_reference.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    if mesh is None:
+        return None
+    try:
+        polygon_count = len(mesh.polygons)
+        if polygon_count == 0:
+            return None
+        polygon_material = numpy.empty(polygon_count, dtype=numpy.int32)
+        mesh.polygons.foreach_get("material_index", polygon_material)
+        slot_of_polygon = numpy.minimum(polygon_material, len(texture_sets) - 1)
+        crossing = numpy.array([bool(name) for name in texture_sets])[slot_of_polygon]
+        if not crossing.any():
+            return None
+        starts = numpy.empty(polygon_count, dtype=numpy.int64)
+        mesh.polygons.foreach_get("loop_start", starts)
+        totals = numpy.empty(polygon_count, dtype=numpy.int64)
+        mesh.polygons.foreach_get("loop_total", totals)
+
+        corner_count = len(mesh.loops)
+        vertex_of_loop = numpy.empty(corner_count, dtype=numpy.int32)
+        mesh.loops.foreach_get("vertex_index", vertex_of_loop)
+        positions = numpy.empty(len(mesh.vertices) * 3, dtype=numpy.float32)
+        mesh.vertices.foreach_get("co", positions)
+        normal_of_loop = numpy.empty(corner_count * 3, dtype=numpy.float32)
+        mesh.corner_normals.foreach_get("vector", normal_of_loop)
+        layer = _render_uv_layer(mesh, object_reference.name)
+
+        kept = numpy.flatnonzero(crossing)
+        corners = _corner_order(starts[kept], totals[kept])
+        used, corner_vertex = numpy.unique(vertex_of_loop[corners], return_inverse=True)
+
+        world = numpy.array(object_reference.matrix_world, dtype=numpy.float64)
+        scale = float(frame_of_project["scale"])
+        offset = numpy.array(frame_of_project["offset"], dtype=numpy.float64)
+        local = positions.reshape(-1, 3)[used].astype(numpy.float64)
+        placed = (local @ world[:3, :3].T + world[:3, 3]) @ PAINTER_AXES.T * scale + offset
+
+        normal_matrix = numpy.array(
+            object_reference.matrix_world.to_3x3().inverted_safe().transposed(),
+            dtype=numpy.float64)
+        turned = normal_of_loop.reshape(-1, 3)[corners].astype(numpy.float64) @ (
+            PAINTER_AXES @ normal_matrix).T
+        turned /= numpy.maximum(numpy.linalg.norm(turned, axis=1, keepdims=True), 1e-30)
+        normals, corner_normal = numpy.unique(turned.astype(numpy.float32), axis=0,
+                                              return_inverse=True)
+        texcoords = numpy.empty((0, 2), dtype=numpy.float32)
+        corner_texcoord = None
+        if layer is not None:
+            uv_of_loop = numpy.empty(corner_count * 2, dtype=numpy.float32)
+            layer.uv.foreach_get("vector", uv_of_loop)
+            texcoords, corner_texcoord = numpy.unique(uv_of_loop.reshape(-1, 2)[corners],
+                                                      axis=0, return_inverse=True)
+            corner_texcoord = corner_texcoord.reshape(-1)
+
+        boundaries = numpy.concatenate(([0], numpy.cumsum(totals[kept])))
+        slot_of_kept = slot_of_polygon[kept]
+        faces = []
+        # Two materials painting into one Texture Set are one surface over there,
+        # so their faces cross under one name rather than two that happen to match.
+        for name in sorted({name for name in texture_sets if name}):
+            slots = [index for index, one in enumerate(texture_sets) if one == name]
+            polygons = numpy.flatnonzero(numpy.isin(slot_of_kept, slots))
+            if len(polygons):
+                faces.append((name, boundaries[polygons], boundaries[polygons + 1]))
+        return SurfacePart(object_reference.name, placed, texcoords, normals,
+                           corner_vertex.reshape(-1), corner_texcoord,
+                           corner_normal.reshape(-1), faces)
+    finally:
+        evaluated.to_mesh_clear()
+
+
+# -- writing ---------------------------------------------------------------------
+
+def _corner_tokens(part, vertex_base, texcoord_base, normal_base):
+    """Every corner as an OBJ face token, numbered past the parts written before."""
+    vertices = (part.corner_vertex + (vertex_base + 1)).tolist()
+    normals = (part.corner_normal + (normal_base + 1)).tolist()
+    if part.corner_texcoord is None:
+        return ["{0}//{1}".format(vertex, normal) for vertex, normal in zip(vertices, normals)]
+    texcoords = (part.corner_texcoord + (texcoord_base + 1)).tolist()
+    return ["{0}/{1}/{2}".format(vertex, texcoord, normal)
+            for vertex, texcoord, normal in zip(vertices, texcoords, normals)]
+
+
+def write_material_library(path, names):
+    """Name every material the surface uses, and say nothing else about them.
+
+    The importer reports each name it cannot find in a library as an error, and
+    anything a library did say -- a colour, a shininess -- is what an importer
+    would turn into layers nobody painted.
+    """
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("".join("newmtl {0}\n".format(name) for name in sorted(names)))
+
+
+def write_obj(path, parts):
+    """Write every part into one OBJ, beside the library naming its materials.
+
+    Returns the scene the record describes it as.
+    """
+    library = path.with_name(record_module.SURFACE_MATERIALS_FILE_NAME)
+    write_material_library(library, {name for part in parts for name, _firsts, _ends
+                                     in part.faces})
+    lines = ["mtllib " + library.name]
+    scene = []
+    vertex_base = texcoord_base = normal_base = 0
+    for part in parts:
+        lines.append("o " + part.name)
+        lines.extend("v {0!r} {1!r} {2!r}".format(*row) for row in part.positions.tolist())
+        lines.extend("vt {0!r} {1!r}".format(*row) for row in
+                     part.texcoords.astype(numpy.float64).tolist())
+        lines.extend("vn {0!r} {1!r} {2!r}".format(*row) for row in
+                     part.normals.astype(numpy.float64).tolist())
+        tokens = _corner_tokens(part, vertex_base, texcoord_base, normal_base)
+        counts = {}
+        for name, firsts, ends in part.faces:
+            lines.append("usemtl " + name)
+            lines.extend("f " + " ".join(tokens[first:end])
+                         for first, end in zip(firsts.tolist(), ends.tolist()))
+            counts[name] = len(firsts)
+        scene.append({
+            "name": part.name,
+            "texture_sets": counts,
+            "bounds_min": part.positions.min(axis=0).tolist(),
+            "bounds_max": part.positions.max(axis=0).tolist(),
+        })
+        vertex_base += len(part.positions)
+        texcoord_base += len(part.texcoords)
+        normal_base += len(part.normals)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(lines))
+        handle.write("\n")
+    return scene
+
+
+def publish(publisher, objects, frame_of_project):
+    """Gather, write and publish the surface in the project's frame. Returns the generation."""
+    if ensure_materials(objects):
+        bpy.context.view_layer.update()
+    for material in worn_materials(objects).values():
+        settle(material)
+    with surface_only(objects):
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        depsgraph.update()
+        parts = []
+        for object_reference in objects:
+            part = gather_object(object_reference, depsgraph, frame_of_project)
+            if part is None:
+                LOG.info("%s has no face that paints into a Texture Set; not sent",
+                         object_reference.name)
+                continue
+            parts.append(part)
+    if not parts:
+        raise RuntimeError("nothing to send: no visible object has a face that paints "
+                           "into a Texture Set")
+    with publisher.staging() as staging:
+        path = staging.path(record_module.SURFACE_FILE_NAME)
+        scene = write_obj(path, parts)
+        arena_module.keep_in_memory(path)
+        arena_module.keep_in_memory(staging.path(record_module.SURFACE_MATERIALS_FILE_NAME))
+        return staging.publish(record_module.mesh(
+            source="Blender",
+            scene_file=record_module.SURFACE_FILE_NAME,
+            scene=scene,
+            materials=texture_set_rows(objects),
+            frame_of_project=frame_of_project))
+
+
+# -- shading rows ------------------------------------------------------------------
 
 def _linear(value):
     """One authored channel, as the shader reads it.
@@ -197,9 +416,6 @@ def _linear(value):
     upload, and this is that curve to the letter -- including the branch at one,
     which is a plain 2.2 power rather than the sRGB piece, and which is what
     carries an HDR colour's overbright range through instead of flattening it.
-    Written out here because the value has to be identical to the one the
-    producing side's own shader reads; a curve that agreed only below one would
-    put every emissive colour somewhere else.
     """
     one = float(value)
     if one <= 0.04045:
@@ -218,24 +434,15 @@ def _plain(value):
     return [_plain(entry) for entry in value]
 
 
-def _declared_row(material):
+def declared_row(material):
     """The parameter row a material says it has, spelled the way its shader spells it.
 
-    A generator stores a row in whatever shape suits it -- this one keeps three
-    property groups by value type -- while a shader has one flat set of uniform
-    names. The two differ, and the difference is not guessable: here it is a
-    ``_ST`` suffix on one group of sixteen. So the material states it, and this
-    reads the statement: which property groups hold the row, and how each group's
-    keys spell out over there.
-
-    Nothing here knows what those groups are called. A table of group names kept
-    on this side would be a second copy of a rule that lives in the generator,
-    and the failure it buys is silent: a new group is simply not sent, and the
-    values that were in it look like values the far side chose not to expose.
-
-    A group the material does not name is not part of the row. Materials carry
-    other people's property groups -- an exporter's settings, a panel's fold
-    state -- and those are not shading parameters just because they are nearby.
+    A generator stores a row in whatever shape suits it while a shader has one
+    flat set of uniform names, and the difference is not guessable. So the
+    material states it, and this reads the statement: which property groups hold
+    the row, how each group's keys spell out over there, which values are
+    constants of the material rather than parameters, and which are authored
+    gamma-encoded and read linear.
     """
     declaration = material.get(SHADING_DECLARATION)
     if declaration is None:
@@ -245,103 +452,30 @@ def _declared_row(material):
         group = material.get(group_name)
         if group is None:
             continue
-        # One conversion of the whole group, not a lookup per name: asking for
-        # the keys and then for each key's value walks the property tree once
-        # per name, and a character's worth of materials is five thousand of
-        # them on every live tick. The plain spelling is the common one and is
-        # the key itself, so it skips the formatting too.
         plain = spelling == "{0}"
         for key, value in dict(group).items():
             row[key if plain else spelling.format(key)] = _plain(value)
-    # Values the material has for its shader that are not in any of its property
-    # groups, because on this side they are not parameters at all. The part a
-    # material belongs to is the one that matters: this application compiles a
-    # tree per part, so the part is structure here and a uniform over there, and
-    # a shader that never hears it renders every material as part zero -- a
-    # character whose face, hair and eyes are all shaded as plain surfaces, with
-    # nothing reported anywhere.
     for name, value in dict(declaration.get("constants") or {}).items():
         row[name] = _plain(value)
-    # An offer is what the far side's shader should READ, and a gamma-encoded
-    # parameter is stored authored and read linear. This side converts on the way
-    # into its own shader; a row handed over as it is stored arrives a whole
-    # gamma curve away, with every name matching and nothing to report -- the
-    # colours are simply wrong. Which names those are is the material's to say.
     for name in list(declaration.get("gamma") or []):
         value = row.get(str(name))
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             row[str(name)] = _linear(value)
         elif isinstance(value, list) and len(value) >= 3:
-            # The fourth component of a colour was never chromatic.
             row[str(name)] = [_linear(one) for one in value[:3]] + list(value[3:])
     return {"shader": str(declaration.get("shader") or ""),
             "name": str(declaration.get("name") or ""),
+            "identity": str(declaration.get("identity") or ""),
             "variant": str(declaration.get("variant") or ""),
             "parameters": row}
 
 
-def _material_row(material, fresh=()):
-    """Which material this is, and whose shading vocabulary it speaks.
-
-    Not what it is set to. The values are a state that keeps changing while the
-    model does not, they have a channel of their own that says so, and putting
-    them in every mesh generation as well was a hundred and ninety kilobytes and
-    ten milliseconds per live tick for a copy nobody read.
-    """
-    row = {"identity": identity_of(material), "name": material.name,
-           "identity_is_new": material.name in fresh}
-    declaration = material.get(SHADING_DECLARATION)
-    if declaration is not None:
-        row["shading"] = {"shader": str(declaration.get("shader") or ""),
-                          "name": str(declaration.get("name") or ""),
-                          "variant": str(declaration.get("variant") or "")}
-    return row
-
-
-def _worn_by_triangles(objects):
-    """The materials some triangle in scope is actually rendered with.
-
-    A model imported from a game arrives with slots nothing uses -- variant and
-    detail-level leftovers -- and a slot no triangle points at is not shading
-    anything. Offering its values means offering them for a material the other
-    side has no Texture Set for, because it was never sent one, which reads in
-    that application's log as the two sides disagreeing about the model.
-    """
-    worn = set()
-    for object_reference in objects:
-        data = getattr(object_reference, "data", None)
-        attributes = getattr(data, "attributes", None)
-        slots = object_reference.material_slots
-        if attributes is None:
-            worn.update(slot.material.name for slot in slots if slot.material)
-            continue
-        # Read the attribute, not the polygons. Both answer the same question and
-        # one of them is free: asking each polygon costs 133 ms on a character
-        # here -- on EVERY live tick -- while the attribute is one buffer copy.
-        # An absent attribute is itself the answer: this application only stores
-        # it once some face leaves slot zero.
-        attribute = attributes.get("material_index")
-        if attribute is None:
-            used = (0,)
-        else:
-            indices = numpy.empty(len(attribute.data), dtype=numpy.int32)
-            attribute.data.foreach_get("value", indices)
-            used = numpy.unique(indices)
-        for index in used:
-            if index < len(slots) and slots[index].material is not None:
-                worn.add(slots[index].material.name)
-    return worn
-
-
 #: The names the far side's shader exposes for the object's axes. Three columns
-#: rather than a matrix because a shader parameter is a vector; the fourth column
-#: is a translation the shading never reads.
+#: rather than a matrix because a shader parameter is a vector.
 OBJECT_BASIS_PARAMETERS = ("i_ObjectToWorld0", "i_ObjectToWorld1", "i_ObjectToWorld2")
 
-#: What the shading language calls object space, relative to this application's:
-#: Y and Z swapped. It is a reflection, not a rotation -- the two handedness
-#: conventions differ -- which is exactly why a host left to assume the identity
-#: gets every left-right term backwards rather than merely rotated.
+#: What the shading language calls object space, relative to Blender's: Y and Z
+#: swapped. A reflection, not a rotation -- the two handedness conventions differ.
 _OBJECT_AXIS_SWAP = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0),
                                       (0.0, 0.0, 1.0, 0.0),
                                       (0.0, 1.0, 0.0, 0.0),
@@ -349,405 +483,7 @@ _OBJECT_AXIS_SWAP = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0),
 
 
 def object_basis(object_reference):
-    """The object's axes as the far side's world sees them, column by column.
-
-    Composed from the three pieces this side knows: where the object stands, the
-    rotation the payload's root node carries so the far side's up axis is Y, and
-    the swap above. The far side multiplies vectors by these columns exactly as
-    the engine does with its object matrix, so composing them here means neither
-    host holds a second opinion about any of the three.
-    """
-    root = mathutils.Quaternion(
-        (BLENDER_TO_GLTF_ROTATION[3], BLENDER_TO_GLTF_ROTATION[0],
-         BLENDER_TO_GLTF_ROTATION[1], BLENDER_TO_GLTF_ROTATION[2])).to_matrix().to_4x4()
+    """The object's axes as the far side's world sees them, column by column."""
+    root = mathutils.Matrix(PAINTER_AXES.tolist()).to_4x4()
     matrix = root @ object_reference.matrix_world @ _OBJECT_AXIS_SWAP
     return [[matrix[row][column] for row in range(3)] + [0.0] for column in range(3)]
-
-
-def parameter_rows(objects, fresh=()):
-    """Every material in scope that some triangle renders with, and what it is
-    set to.
-
-    Read off the slots rather than off a payload: this answers "what is the
-    shading in scope", which is a question about the document and not about the
-    last thing that was sent. Which slots count is the same question the mesh
-    payload answers with :func:`materials_in`, and it has the same answer.
-    """
-    rows = []
-    seen = set()
-    worn = _worn_by_triangles(objects)
-    for object_reference in objects:
-        for slot in object_reference.material_slots:
-            if slot.material is None or slot.material.name in seen:
-                continue
-            if slot.material.name not in worn:
-                continue
-            seen.add(slot.material.name)
-            row = _material_row(slot.material, fresh)
-            basis = object_basis(object_reference)
-            declared = _declared_row(slot.material)
-            if declared is not None:
-                row["properties"] = declared["parameters"]
-                for name, column in zip(OBJECT_BASIS_PARAMETERS, basis):
-                    row["properties"][name] = column
-            else:
-                properties = {}
-                for key in slot.material.keys():
-                    if key == IDENTITY_PROPERTY:
-                        continue
-                    value = slot.material[key]
-                    if hasattr(value, "keys"):
-                        continue
-                    properties[key] = _plain(value)
-                if properties:
-                    row["properties"] = properties
-            rows.append(row)
-    return rows
-
-
-def ensure_materials(objects):
-    """Give every object a real material before its name crosses the bridge.
-
-    Painter names a Texture Set after the material it came from, and the return
-    trip finds its way home by that same name. An object with no material has no
-    name to give, so the old code invented one from the object -- and the paint
-    then came back addressed to a material that had never existed, landing in
-    image datablocks nothing referenced. Nothing failed; it simply never showed.
-
-    Creating the material here is the smallest thing that makes the round trip
-    closed by construction rather than by the user having remembered.
-    """
-    created = []
-    for object_reference in objects:
-        slots = list(object_reference.material_slots)
-        if not slots:
-            material = bpy.data.materials.new(object_reference.name)
-            material.use_nodes = True
-            object_reference.data.materials.append(material)
-            created.append(material.name)
-            continue
-        for index, slot in enumerate(slots):
-            if slot.material is not None:
-                continue
-            material = bpy.data.materials.new(object_reference.name)
-            material.use_nodes = True
-            object_reference.data.materials[index] = material
-            created.append(material.name)
-    if created:
-        LOG.info("created %d material(s) so the paint has somewhere to come back to: %s",
-                 len(created), ", ".join(created))
-    return created
-
-
-def _slot_material_identities(object_reference):
-    identities = []
-    for slot in object_reference.material_slots:
-        if slot.material is None:
-            raise RuntimeError(
-                "{0} still has an empty material slot; ensure_materials should have "
-                "filled it before the identities were read".format(object_reference.name))
-        identities.append(identity_of(slot.material))
-    return identities
-
-
-def _uv_layers_in_send_order(mesh, name):
-    """The mesh's UV maps with the one it renders with first.
-
-    The first set is the one the far side paints in, and this application does
-    not render with its first UV map -- it renders with the one it marks active.
-    A mesh that kept an older unwrap beside the real one therefore crossed with
-    the wrong coordinates in the slot everything reads, and the paint landed
-    somewhere plausible enough to look like a shading fault rather than a
-    mismatch of maps. The rest keep their order, so a map named for a slot still
-    arrives in it.
-    """
-    layers = list(mesh.uv_layers)
-    active = next((layer for layer in layers if layer.active_render), None)
-    if active is not None and layers and layers[0] is not active:
-        layers.remove(active)
-        layers.insert(0, active)
-        LOG.info("%s renders with UV map %r, not the first one; it goes first",
-                 name, active.name)
-    return layers[:MAXIMUM_TEXCOORD_SETS]
-
-
-def _read_colors(mesh, corner_count, vertex_count):
-    """The active colour attribute, with the domain it lives on."""
-    layer = mesh.color_attributes.active_color
-    if layer is None:
-        return None, None
-    expected = vertex_count if layer.domain == "POINT" else corner_count
-    if len(layer.data) != expected:
-        LOG.warning("colour attribute %r has %d entries for %d on domain %s; skipped",
-                    layer.name, len(layer.data), expected, layer.domain)
-        return None, None
-    values = numpy.empty(expected * 4, dtype=numpy.float32)
-    layer.data.foreach_get("color", values)
-    return values.reshape(-1, 4), layer.domain
-
-
-def _deduplicate(key_columns):
-    """Order the minimal vertex set and map every corner onto it."""
-    total_width = sum(column.shape[1] for column in key_columns)
-    key = numpy.empty((key_columns[0].shape[0], total_width), dtype=numpy.uint32)
-    cursor = 0
-    for column in key_columns:
-        width = column.shape[1]
-        key[:, cursor:cursor + width] = column.view(numpy.uint32)
-        cursor += width
-    key[key == NEGATIVE_ZERO_PATTERN] = 0
-    void_type = numpy.dtype((numpy.void, key.dtype.itemsize * total_width))
-    rows = numpy.ascontiguousarray(key).view(void_type).reshape(key.shape[0])
-    _values, order, inverse = numpy.unique(rows, return_index=True, return_inverse=True)
-    return order, inverse.reshape(-1)
-
-
-#: What the last publish read out of each object, by object name. Reading an
-#: object is 81% of a publish on a real scene, and most objects are the same as
-#: they were -- so the expensive half is skipped for everything Blender did not
-#: report as changed.
-_GATHERED = {}
-
-
-def forget_gathered(names=None):
-    """Drop cached reads. Everything, or just the objects named."""
-    if names is None:
-        _GATHERED.clear()
-        return
-    for name in names:
-        _GATHERED.pop(name, None)
-
-
-def gather_scope(objects, depsgraph, include_colors=True, changed=None):
-    """Read every object, reusing what has not changed since the last read.
-
-    ``changed`` is the set of names Blender reported as updated; None means
-    "assume everything" -- which is what a manual send does, because a manual
-    send is somebody saying they want what is there now.
-    """
-    gathered = []
-    reused = 0
-    for object_reference in objects:
-        name = object_reference.name
-        entry = _GATHERED.get(name)
-        matrix = _column_major(object_reference.matrix_world)
-        data_name = getattr(object_reference.data, "name", "")
-        stale = (entry is None
-                 or changed is None
-                 or name in changed
-                 or (data_name and data_name in changed)
-                 or entry.include_colors != include_colors)
-        # A move is not a re-read: the same buffers at a different place. The
-        # matrix rides on the entry and is refreshed either way.
-        if stale:
-            entry = gather_object(object_reference, depsgraph, include_colors)
-            if entry is None:
-                _GATHERED.pop(name, None)
-                LOG.warning("%s evaluated to no triangles and was skipped", name)
-                continue
-            _GATHERED[name] = entry
-        else:
-            entry.node_matrix = matrix
-            reused += 1
-        gathered.append(entry)
-    if reused:
-        LOG.info("reused %d of %d object(s) unchanged since the last send",
-                 reused, len(objects))
-    return gathered
-
-
-def gather_object(object_reference, depsgraph, include_colors=True):
-    """Read one evaluated object into index arrays over its own buffers."""
-    evaluated = object_reference.evaluated_get(depsgraph)
-    mesh = evaluated.to_mesh()
-    if mesh is None:
-        return None
-    try:
-        mesh.calc_loop_triangles()
-        triangle_count = len(mesh.loop_triangles)
-        if triangle_count == 0:
-            return None
-        corner_count = len(mesh.loops)
-        vertex_count = len(mesh.vertices)
-
-        triangle_corners = numpy.empty(triangle_count * 3, dtype=numpy.int32)
-        mesh.loop_triangles.foreach_get("loops", triangle_corners)
-        triangle_material = numpy.empty(triangle_count, dtype=numpy.int32)
-        mesh.loop_triangles.foreach_get("material_index", triangle_material)
-
-        positions = numpy.empty(vertex_count * 3, dtype=numpy.float32)
-        mesh.attributes["position"].data.foreach_get("vector", positions)
-        positions = positions.reshape(-1, 3)
-
-        corner_vertex = numpy.empty(corner_count, dtype=numpy.int32)
-        mesh.loops.foreach_get("vertex_index", corner_vertex)
-
-        corner_normal = numpy.empty(corner_count * 3, dtype=numpy.float32)
-        mesh.corner_normals.foreach_get("vector", corner_normal)
-        corner_normal = corner_normal.reshape(-1, 3)
-
-        texcoords = []
-        for layer in _uv_layers_in_send_order(mesh, object_reference.name):
-            values = numpy.empty(corner_count * 2, dtype=numpy.float32)
-            layer.uv.foreach_get("vector", values)
-            values = values.reshape(-1, 2)
-            values[:, 1] = 1.0 - values[:, 1]
-            texcoords.append(values)
-        if not texcoords:
-            LOG.warning("%s has no UV map; Painter will have to unwrap it",
-                        object_reference.name)
-
-        colors, color_domain = (_read_colors(mesh, corner_count, vertex_count)
-                                if include_colors else (None, None))
-
-        key_columns = [corner_vertex.reshape(-1, 1), corner_normal]
-        key_columns.extend(texcoords)
-        if colors is not None and color_domain == "CORNER":
-            key_columns.append(colors)
-        order, inverse = _deduplicate(key_columns)
-        vertex_order = corner_vertex[order]
-
-        sources = [AttributeSource(SEMANTIC_POSITION, positions, vertex_order),
-                   AttributeSource(SEMANTIC_NORMAL, corner_normal, order)]
-        for index, values in enumerate(texcoords):
-            sources.append(AttributeSource(TEXCOORD_PREFIX + str(index), values, order))
-        if colors is not None:
-            sources.append(AttributeSource(
-                SEMANTIC_COLOR_0, colors,
-                vertex_order if color_domain == "POINT" else order))
-
-        material_identities = _slot_material_identities(object_reference)
-        triangle_by_material = triangle_corners.reshape(-1, 3)
-        primitives = []
-        # numpy, not a Python loop over every triangle: measured 134 ms against
-        # 29 ms on the five heaviest objects of a real scene, for the same answer.
-        for material_index in numpy.unique(triangle_material).tolist():
-            rows = triangle_by_material[
-                numpy.flatnonzero(triangle_material == material_index)].reshape(-1)
-            identity = (material_identities[material_index]
-                        if material_index < len(material_identities)
-                        else material_identities[-1])
-            primitives.append((identity, inverse[rows]))
-
-        return ObjectData(object_reference.name,
-                          _column_major(object_reference.matrix_world),
-                          int(order.shape[0]), sources, primitives,
-                          identity_of(object_reference), include_colors)
-    finally:
-        evaluated.to_mesh_clear()
-
-
-def build_layout(objects):
-    meshes = []
-    for entry in objects:
-        attributes = [AttributeLayout(source.semantic, source.component_count)
-                      for source in entry.sources]
-        primitives = [PrimitiveLayout(name, int(indices.shape[0]))
-                      for name, indices in entry.primitives]
-        meshes.append(MeshLayout(entry.name, entry.node_matrix, entry.vertex_count,
-                                 attributes, primitives))
-    return SceneLayout(meshes)
-
-
-def _fill_attribute(window, source, vertex_count):
-    """Gather one attribute straight into the mapped page. Returns its extents."""
-    target = numpy.frombuffer(window, dtype=numpy.float32).reshape(
-        vertex_count, source.component_count)
-    numpy.take(source.values, source.order, axis=0, out=target)
-    return target.min(axis=0), target.max(axis=0)
-
-
-def _fill_indices(window, indices):
-    target = numpy.frombuffer(window, dtype=numpy.uint32)
-    numpy.copyto(target, indices, casting="unsafe")
-
-
-def write_glb(arena, path, objects):
-    """Lay the file out from counts, then fill its binary chunk in one pass."""
-    layout = build_layout(objects)
-    scene_description = []
-    with GlbWriter.create(arena, path, layout) as writer:
-        for mesh_index, entry in enumerate(objects):
-            for source in entry.sources:
-                with writer.attribute_window(mesh_index, source.semantic) as window:
-                    minimum, maximum = _fill_attribute(window, source, entry.vertex_count)
-                if source.semantic == SEMANTIC_POSITION:
-                    writer.set_bounds(mesh_index, minimum, maximum)
-                    bounds = (minimum, maximum)
-            primitive_description = []
-            for primitive_index, (name, indices) in enumerate(entry.primitives):
-                with writer.index_window(mesh_index, primitive_index) as window:
-                    _fill_indices(window, indices)
-                primitive_description.append({
-                    "material": name,
-                    "triangle_count": int(indices.shape[0] // 3),
-                })
-            scene_description.append({
-                "identity": entry.identity,
-                "name": entry.name,
-                "node_matrix": [float(value) for value in entry.node_matrix],
-                "vertex_count": entry.vertex_count,
-                "semantics": [source.semantic for source in entry.sources],
-                "bounds_min": [float(value) for value in bounds[0]],
-                "bounds_max": [float(value) for value in bounds[1]],
-                "primitives": primitive_description,
-            })
-    return scene_description
-
-
-def materials_in(objects, gathered):
-    """The materials the payload actually contains, in a stable order.
-
-    A slot no triangle uses does not reach the other side: the GLB has no
-    primitive for it, so the consumer builds nothing for it, and a row describing
-    it is a row about something that was not sent. Worse than useless -- the
-    consumer reports it as a material it has no place for, which reads as the two
-    sides disagreeing about the model when nothing is wrong at all.
-    """
-    wanted = {identity for entry in gathered for identity, _indices in entry.primitives}
-    found = {}
-    for object_reference in objects:
-        for slot in object_reference.material_slots:
-            material = slot.material
-            if material is None:
-                continue
-            identity = identity_of(material)
-            if identity in wanted:
-                found.setdefault(identity, material)
-    return [found[identity] for identity in sorted(found)]
-
-
-def publish(arena, publisher, objects_to_send, depsgraph, intent, unit_scale,
-            include_colors=True, binding=None, changed=None):
-    """Gather, write and publish one mesh generation. Returns the generation."""
-    created_materials = ensure_materials(objects_to_send)
-    if created_materials:
-        depsgraph.update()
-    fresh = adopt_identities(objects_to_send)
-    if fresh:
-        LOG.warning(
-            "%d material(s) had no identity and were given one just now. Save the "
-            ".blend: an unsaved file mints different identities next session, and "
-            "Painter then builds new Texture Sets beside the ones already painted",
-            len(fresh))
-    gathered = gather_scope(objects_to_send, depsgraph, include_colors, changed)
-    if not gathered:
-        raise RuntimeError("nothing to publish: no object in scope evaluated to triangles")
-
-    with publisher.staging() as staging:
-        scene_description = write_glb(
-            arena, staging.path(record_module.SCENE_FILE_NAME), gathered)
-        sent = materials_in(objects_to_send, gathered)
-        # A live tick names what changed; a manual send names nothing. Only the
-        # second one is somebody asking for everything, and the textures are the
-        # expensive half of everything.
-        materials = sent if changed is None else ()
-        return staging.publish(record_module.mesh(
-            source="Blender",
-            intent=intent,
-            scene=scene_description,
-            materials=[_material_row(material, fresh) for material in sent],
-            unit_scale=unit_scale,
-            up_axis="Z",
-            binding_record=binding,
-            textures=texture_publish.publish_into(staging, materials)))
