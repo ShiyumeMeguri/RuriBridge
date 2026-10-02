@@ -35,13 +35,13 @@ from ...Kernel import session as session_module
 from ...Kernel import summon as summon_module
 from ...Kernel import topic as topic_module
 
-from . import glb_ingest, mesh_publish, texture_ingest
+from . import glb_ingest, mesh_publish, slot_compose, texture_ingest
 
 # Kernel.host is deliberately absent: it holds the bound driver, and reloading it
 # would clear the binding while everything that already imported it kept the old
 # module object -- "no application is bound", from the next call on.
 for _module in (arena_module, record_module, topic_module, session_module,
-                glb_ingest, mesh_publish, texture_ingest):
+                glb_ingest, mesh_publish, slot_compose, texture_ingest):
     importlib.reload(_module)
 
 LOG = log_module.logger("blender")
@@ -126,7 +126,7 @@ class _Connection:
 
 CONNECTION = _Connection()
 _status = [""]
-_view = {"materials": [], "fingerprint": None, "ticks": 0}
+_view = {"materials": [], "bare": [], "fingerprint": None, "ticks": 0}
 
 
 def connect(session=arena_module.DEFAULT_SESSION, root=None):
@@ -194,15 +194,19 @@ def images_of(material):
     return found
 
 
-def material_rows(view_layer):
-    """The table's Blender half: every worn material, what it paints into, on what."""
+def material_rows(objects):
+    """The table's Blender half: every worn material, what it paints into, on what, and
+    which generated shader it runs."""
     rows = []
-    for name, (material, wearing) in mesh_publish.wearers(mesh_publish.scope(view_layer)).items():
+    for name, (material, wearing) in mesh_publish.wearers(objects).items():
+        shader, identity = mesh_publish.declared_shader(material)
         rows.append({
             "name": name,
             "texture_set": mesh_publish.texture_set_of(material),
             "objects": sorted(entry.name for entry in wearing),
             "images": images_of(material),
+            "shader": shader,
+            "identity": identity,
         })
     return rows
 
@@ -215,10 +219,14 @@ def presence_record():
 
 def refresh_view(force=False):
     """Re-read this document's table; say so to the session when it moved."""
-    rows = material_rows(bpy.context.view_layer)
+    objects = mesh_publish.scope(bpy.context.view_layer)
+    rows = material_rows(objects)
+    bare = mesh_publish.bare_objects(objects)
     fingerprint = (bpy.data.filepath, textures_directory(),
-                   tuple((row["name"], row["texture_set"]) for row in rows))
+                   tuple((row["name"], row["texture_set"], row["identity"]) for row in rows),
+                   tuple(bare))
     _view["materials"] = rows
+    _view["bare"] = bare
     if not force and fingerprint == _view["fingerprint"]:
         return False
     _view["fingerprint"] = fingerprint
@@ -231,6 +239,24 @@ def refresh_view(force=False):
 def painter_state():
     """What Painter last said it has open, or an empty answer."""
     return CONNECTION.peers.get(PAINTER.name) or {}
+
+
+def texture_sets_new_to_painter():
+    """Texture Sets the next mesh would add to a project Painter already paints in.
+
+    A new Texture Set starts with nothing on it. When it is a material just made,
+    that is what anybody expects; when it is a material that used to paint into
+    another set, its faces leave their paint behind there -- every layer is kept,
+    and none of it shows on them any more. The two look the same from here, so the
+    person sending decides.
+    """
+    painter = painter_state()
+    existing = painter.get("texture_sets") or []
+    if not painter.get("document") or not any(entry["layers"] for entry in existing):
+        return []
+    known = {entry["name"] for entry in existing}
+    return sorted({row["texture_set"] for row in _view["materials"]
+                   if row["texture_set"] and row["texture_set"] not in known})
 
 
 def painter_is_attached():
@@ -404,12 +430,23 @@ def _describe(report):
     if results:
         placed = sum(sum(entry["placed"].values()) for entry in results)
         homeless = [entry["texture_set"] for entry in results if not entry["materials"]]
-        generated = sorted({name for entry in results for name in entry["generated"]})
+        stood_up = [entry for entry in results if entry["stood_up"] is not None]
         parts.append("{0} Texture Set(s) in, {1} channel(s) placed".format(
             len(results), placed))
-        if generated:
-            parts.append("{0} generated material(s) left as they are: their record "
-                         "names their images".format(len(generated)))
+        if stood_up:
+            took = {material: slots for entry in stood_up
+                    for material, slots in entry["stood_up"]["taken"].items()}
+            parts.append("{0} generated material(s) took {1} texture(s) from Painter".format(
+                len(took), sum(len(slots) for slots in took.values())))
+        flat = [entry["texture_set"] for entry in stood_up if entry["stood_up"]["flat"]]
+        if flat:
+            parts.append("nothing painted on {0}, so its materials keep their textures".format(
+                ", ".join(flat)))
+        refused = ["{0}{1}: {2}".format(entry["texture_set"], " " + slot if slot else "", why)
+                   for entry in stood_up for slot, why in sorted(entry["stood_up"]["refused"].items())]
+        if refused:
+            LOG.warning("not stood up: %s", "; ".join(refused))
+            parts.append("{0} texture(s) not stood up (see the log)".format(len(refused)))
         if homeless:
             parts.append("nothing here paints into {0}".format(", ".join(homeless)))
     for entry in report:
@@ -570,6 +607,18 @@ class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
     bl_description = ("Send every visible mesh to Painter as the surface to paint on. "
                       "Painter swaps it in under the layers it already has; a Texture "
                       "Set with layers that nothing here paints into stops the swap")
+
+    def invoke(self, context, event):
+        refresh_view()
+        fresh = texture_sets_new_to_painter()
+        if not fresh:
+            return self.execute(context)
+        return context.window_manager.invoke_confirm(
+            self, event, title="Send Mesh",
+            message=("Painter gets {0} new Texture Set(s) with nothing painted on them: {1}. "
+                     "Faces that move into one leave their paint behind in the Texture Set "
+                     "they came from".format(len(fresh), ", ".join(fresh))),
+            confirm_text="Send")
 
     def execute(self, context):
         try:
@@ -911,6 +960,11 @@ def _draw_table(layout):
             operator = line.operator(RURIBRIDGE_OT_exclude.bl_idname, text="",
                                      icon="HIDE_ON")
             operator.material, operator.excluded = row["name"], False
+    if _view["bare"]:
+        box = layout.box()
+        box.label(text="No material, not sent")
+        for name in _view["bare"]:
+            box.label(text=name, icon="MESH_DATA")
 
 
 class RURIBRIDGE_PT_panel(bpy.types.Panel):

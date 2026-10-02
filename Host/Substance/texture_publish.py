@@ -30,7 +30,7 @@ import substance_painter.textureset
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import mesh_ingest
+from . import mesh_ingest, shader_state, slot_recipe
 
 LOG = logger("painter.textures")
 
@@ -306,12 +306,36 @@ def _safe(name):
     return _UNSAFE_IN_FILE_NAMES.sub("_", name).strip("_") or "layer"
 
 
-def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False):
+def _attach_recipes(entry, shader, manifests):
+    """Say how the generated shader this Texture Set's materials run is stood up again
+    from this export, or why it is not. Only for the very shader on this shelf: another
+    generation of it reads its channels differently, and a recipe written from the
+    wrong table puts every lane in the wrong place without a word."""
+    if not shader["name"]:
+        return
+    if shader["name"] not in manifests:
+        manifests[shader["name"]] = shader_state.shader_manifest(shader["name"])
+    manifest = manifests[shader["name"]]
+    shelved = str((manifest or {}).get("identity") or "")
+    if not shelved or shelved != shader["identity"]:
+        entry["slots_refused"] = {"": "{0} on this shelf is {1}, the material says {2}".format(
+            shader["name"], shelved or "unstamped", shader["identity"] or "nothing")}
+        return
+    entry["slots"], refused = slot_recipe.recipes(manifest, entry["maps"])
+    if refused:
+        entry["slots_refused"] = refused
+
+
+def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False, shaders=None):
     """Export into the document's textures folder and say what landed where.
 
     With ``layer`` set, only the layer selected in Painter is rendered: its
     Texture Set alone, every other layer hidden for the length of the export, the
     files named after the layer so they never overwrite the Texture Set's own.
+
+    ``shaders`` names, per Texture Set, the generated shader its materials run and
+    that shader's identity; a whole export carries the recipe that stands that
+    shader's textures up from the maps (see ``slot_recipe``).
     """
     if not substance_painter.project.is_open():
         raise TexturePublishError("no project is open")
@@ -337,6 +361,7 @@ def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False):
         LOG.warning("export finished as %s: %s", result.status, result.message)
 
     exported = []
+    manifests = {}
     for identity, paths in result.textures.items():
         entry = plan_by_stack.get(identity)
         if entry is None:
@@ -361,13 +386,17 @@ def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False):
                 "source_channels": planned_map.source_channels,
             })
         resolution = texture_set.get_resolution()
-        exported.append({
+        entry = {
             "name": texture_set.name,
             "stack": stack.name(),
             "layer": suffix,
             "resolution": [resolution.width, resolution.height],
             "maps": maps,
-        })
+        }
+        shader = (shaders or {}).get(texture_set.name)
+        if shader is not None and not layer:
+            _attach_recipes(entry, shader, manifests)
+        exported.append(entry)
     if not exported:
         raise TexturePublishError("the export wrote nothing: {0}".format(result.message))
     return publisher.publish_record(record_module.textures(

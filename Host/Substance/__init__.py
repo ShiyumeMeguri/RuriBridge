@@ -195,17 +195,33 @@ def _ask(what, **details):
         record_module.request(HOST.name, what, **details))
 
 
+def shaders_by_texture_set(rows):
+    """Which generated shader each Texture Set's Blender materials run, as the material
+    that speaks for the set says it: the one named like the set, else the first by name
+    -- the same rule the shading row follows."""
+    speakers = {}
+    for row in sorted(rows, key=lambda one: one["name"]):
+        texture_set = row["texture_set"]
+        if not texture_set or not row["shader"]:
+            continue
+        if texture_set not in speakers or row["name"] == texture_set:
+            speakers[texture_set] = {"name": row["shader"], "identity": row["identity"]}
+    return speakers
+
+
 def send_textures(layer=False, directory=None):
     """Export into the folder Blender named, and say so on the session."""
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
-    target = directory or blender_state().get("textures_directory") or ""
+    blender = blender_state()
+    target = directory or blender.get("textures_directory") or ""
     if not target:
         raise RuntimeError("Blender has not said where its textures live; save the "
                            ".blend and keep it attached")
     return texture_publish.publish(
         CONNECTION.session.publisher(topic_module.TEXTURES), target,
-        texture_publish.DEFAULT_PRESET_NAME, layer=layer)
+        texture_publish.DEFAULT_PRESET_NAME, layer=layer,
+        shaders=shaders_by_texture_set(blender.get("materials") or []))
 
 
 # -- pulling an image into the selected layer ----------------------------------------

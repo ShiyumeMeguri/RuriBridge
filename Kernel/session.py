@@ -24,6 +24,7 @@ from __future__ import annotations
 from . import arena as arena_module
 from . import channel as channel_module
 from . import peers as peers_module
+from . import record as record_module
 from . import topic as topic_module
 from .log import logger
 
@@ -172,15 +173,26 @@ class Session:
         return tuple(found)
 
     def changed_state(self):
-        """Every state topic whose value moved since this host last looked."""
+        """Every state topic whose value moved since this host last looked.
+
+        A value written by another build of the bridge is not handed on: it is named
+        in the log once, when it arrives, and the slot stays as if unwritten until the
+        application that wrote it runs this build too.
+        """
         moved = []
         for entries in self._sources.values():
             for endpoint in entries:
                 if endpoint.topic.kind != topic_module.STATE:
                     continue
                 payload = endpoint.reader.take()
-                if payload is not None:
-                    moved.append((endpoint, payload))
+                if payload is None:
+                    continue
+                try:
+                    record_module.checked(payload, endpoint.channel)
+                except record_module.RecordError as error:
+                    LOG.error("%s", error)
+                    continue
+                moved.append((endpoint, payload))
         return tuple(moved)
 
     # -- who is there ------------------------------------------------------

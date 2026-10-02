@@ -16,7 +16,9 @@ Which materials a Texture Set belongs to is the material's own statement (see
 ``mesh_publish.texture_set_of``): every material that paints into it receives
 its channels, which is what one material split in two across one UV layout
 needs. Inside a material, a channel lands in the Image Texture node labelled
-after it, or in one created for it and wired to the shader input of that name.
+after it, or in one created for it and wired to the shader input of that name. A
+generated material takes no loose channels: its own textures are stood up from them
+and go into its record (see ``slot_compose``).
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ import re
 import bpy
 
 from ...Kernel.log import logger
-from . import mesh_publish
+from . import mesh_publish, slot_compose
 
 LOG = logger("blender.textures")
 
@@ -249,11 +251,21 @@ def ingest(generation):
             if material.get(mesh_publish.SHADING_DECLARATION) is not None:
                 # A generated material's images are named by its own record and
                 # packed the way its shader reads them; loose nodes in a tree its
-                # generator rebuilds would be neither.
-                generated.append(material.name)
+                # generator rebuilds would be neither. Its textures are stood up
+                # from the maps and go into that record instead.
+                generated.append(material)
                 continue
             for key, value in bind_into_material(material, images).items():
                 placed[key] += value
+        stood_up = None
+        if generated:
+            if "slots" in texture_set:
+                stood_up = slot_compose.compose(texture_set, directory, generated,
+                                                mesh_publish.SHADING_DECLARATION)
+            else:
+                stood_up = {"taken": {}, "flat": False, "refused": dict(
+                    texture_set.get("slots_refused")
+                    or {"": "Painter sent no recipe for their shader"})}
         if not materials and not layer:
             LOG.warning("Texture Set %r has no material here that paints into it; its %d "
                         "channel(s) are in the textures folder and nothing shows them",
@@ -265,6 +277,7 @@ def ingest(generation):
             "channels": sorted(images),
             "images": sorted(image.name for image in images.values()),
             "placed": placed,
-            "generated": generated,
+            "generated": [material.name for material in generated],
+            "stood_up": stood_up,
         })
     return report

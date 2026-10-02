@@ -115,6 +115,14 @@ def _worn_indices(object_reference):
     return tuple(numpy.unique(indices).tolist())
 
 
+def _material_at(slots, index):
+    """The material a face with this slot index renders with. Past the last slot
+    Blender uses the last one; an object with no slot renders with none."""
+    if not len(slots):
+        return None
+    return slots[min(index, len(slots) - 1)].material
+
+
 def wearers(objects):
     """Every material some face in scope wears, by name, in a stable order, with
     the objects some face of which wears it, in scope order.
@@ -127,9 +135,9 @@ def wearers(objects):
     for object_reference in objects:
         slots = object_reference.material_slots
         for index in _worn_indices(object_reference):
-            if index < len(slots) and slots[index].material is not None:
-                _, wearing = found.setdefault(
-                    slots[index].material.name, (slots[index].material, []))
+            material = _material_at(slots, index)
+            if material is not None:
+                _, wearing = found.setdefault(material.name, (material, []))
                 if object_reference not in wearing:
                     wearing.append(object_reference)
     return {name: found[name] for name in sorted(found)}
@@ -139,31 +147,29 @@ def worn_materials(objects):
     return {name: material for name, (material, _) in wearers(objects).items()}
 
 
-def ensure_materials(objects):
-    """Give every object a real material before its name crosses the bridge.
+def bare_objects(objects):
+    """Objects some of whose faces wear no material. Those faces have no Texture Set
+    to paint into, so they stay out of the texturing tool.
 
-    A Texture Set is named after the material it came from, and the return trip
-    finds its way home by that same name. An object with no material has no name
-    to give, so it gets one here, named after itself, and the log says so.
+    Nothing is made up for them: a material named after the object would be a name
+    nobody chose, in Blender and as a Texture Set, and filling a slot behind the
+    user's back changes what the object renders with.
     """
-    created = []
+    found = []
     for object_reference in objects:
-        slots = list(object_reference.material_slots)
-        if not slots:
-            material = bpy.data.materials.new(object_reference.name)
-            object_reference.data.materials.append(material)
-            created.append(material.name)
-            continue
-        for index, slot in enumerate(slots):
-            if slot.material is not None:
-                continue
-            material = bpy.data.materials.new(object_reference.name)
-            object_reference.data.materials[index] = material
-            created.append(material.name)
-    if created:
-        LOG.info("created %d material(s) so the paint has somewhere to come back to: %s",
-                 len(created), ", ".join(created))
-    return created
+        slots = object_reference.material_slots
+        if any(_material_at(slots, index) is None for index in _worn_indices(object_reference)):
+            found.append(object_reference.name)
+    return sorted(found)
+
+
+def declared_shader(material):
+    """The generated shader a material says it runs, and that shader's identity; two
+    empty strings for a material whose shading nobody declared."""
+    declaration = material.get(SHADING_DECLARATION)
+    if declaration is None:
+        return "", ""
+    return str(declaration.get("name") or ""), str(declaration.get("identity") or "")
 
 
 def texture_set_rows(objects):
@@ -245,7 +251,10 @@ def gather_object(object_reference, depsgraph, frame_of_project):
     None when nothing of it crosses: no faces, or every face wears a material that
     paints into no Texture Set.
     """
-    texture_sets = [texture_set_of(slot.material) for slot in object_reference.material_slots]
+    texture_sets = [texture_set_of(slot.material) if slot.material is not None else ""
+                    for slot in object_reference.material_slots]
+    if not texture_sets:
+        return None
     evaluated = object_reference.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh()
     if mesh is None:
@@ -384,8 +393,9 @@ def write_obj(path, parts):
 
 def publish(publisher, objects, frame_of_project):
     """Gather, write and publish the surface in the project's frame. Returns the generation."""
-    if ensure_materials(objects):
-        bpy.context.view_layer.update()
+    bare = bare_objects(objects)
+    if bare:
+        LOG.info("faces that wear no material stay out of Painter: %s", ", ".join(bare))
     for material in worn_materials(objects).values():
         settle(material)
     with surface_only(objects):

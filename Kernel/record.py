@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -71,19 +71,28 @@ def write(generation_directory, record):
     return path
 
 
+def checked(record, where):
+    """The record, if it is in the shape this build speaks; refused by name otherwise.
+
+    Two applications on one session run whatever copy of the bridge each loaded,
+    and a record from another copy is missing what this one reads or means
+    something else by it -- read anyway, it fails three calls later as a missing
+    key nobody can trace back.
+    """
+    version = record.get("format_version")
+    if version != FORMAT_VERSION:
+        raise RecordError("{0} is record format {1}, this build speaks {2}: restart the "
+                          "application that wrote it".format(where, version, FORMAT_VERSION))
+    return record
+
+
 def read(generation_directory):
     directory = Path(generation_directory)
     path = directory / RECORD_FILE_NAME
     if not path.exists():
         raise RecordError("generation {0} has no {1}".format(directory, RECORD_FILE_NAME))
     with open(path, "r", encoding="utf-8") as handle:
-        record = json.load(handle)
-    version = record.get("format_version")
-    if version != FORMAT_VERSION:
-        raise RecordError(
-            "generation {0} is record format {1}, this build speaks {2}".format(
-                directory, version, FORMAT_VERSION))
-    return record
+        return checked(json.load(handle), "generation {0}".format(directory))
 
 
 def _base(kind, source):
@@ -176,6 +185,11 @@ def textures(source, document, directory, texture_sets):
     found again tomorrow cannot live somewhere that is recycled. Each map carries
     its own colour space because that is a fact about the texture, decided by the
     side that knows the channel's format.
+
+    A Texture Set whose materials run a generated shader the texturing side holds
+    the same generation of also carries ``slots``: for each texture that shader
+    samples, lane by lane, which exported map and component stands it up again and
+    through which operation -- or ``slots_refused``, saying why not.
     """
     record = _base("tex", source)
     record.update({
@@ -195,8 +209,10 @@ def presence(source, document, texture_sets=(), materials=(), textures_directory
     A texturing tool fills ``texture_sets`` and the frame its project's surface
     lives in -- None for a project the bridge did not start and nobody has
     measured; a modelling tool fills ``materials`` and says where the textures of
-    its document live. ``document`` is empty when nothing is open, which is an
-    answer and not a missing one.
+    its document live. A material row names the generated shader the material runs
+    and that shader's identity, empty for a material nobody generated.
+    ``document`` is empty when nothing is open, which is an answer and not a
+    missing one.
     """
     record = _base("here", source)
     record.update({
