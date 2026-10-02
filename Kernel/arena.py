@@ -146,22 +146,14 @@ class SlotState:
         self.dropped_generations = dropped_generations
         self.writer_process_id = writer_process_id
         self.heartbeat = heartbeat
-        #: What each listener has taken, by roster index. The single
-        #: ``acknowledged_generation`` above is the oldest of them, which is what
-        #: retention has to respect.
+        #: What each listener has taken, by roster index: what retention reads. The
+        #: single ``acknowledged_generation`` above is only the furthest any of them
+        #: got, for the diagnostics.
         self.acknowledged_by = tuple(acknowledged_by)
 
-    def taken_by(self, listeners):
-        """The oldest generation every one of those listeners has taken.
-
-        Zero when any of them has taken nothing: a payload is owed until the last
-        listener has it, and "nobody has read this yet" must not read as "all
-        caught up".
-        """
-        if not listeners:
-            return self.generation
-        return min(self.acknowledged_by[index] if index < len(self.acknowledged_by)
-                   else 0 for index in listeners)
+    def taken(self, listener):
+        """How far one listener has taken this channel; zero when it has taken nothing."""
+        return self.acknowledged_by[listener] if listener < len(self.acknowledged_by) else 0
 
     @property
     def writer_is_live(self):

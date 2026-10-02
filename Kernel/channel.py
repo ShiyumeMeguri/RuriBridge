@@ -70,16 +70,17 @@ class Staging:
 class Publisher:
     """The writing end of one channel.
 
-    ``listeners`` are the roster indices of everyone who hears this channel. A
-    payload is owed until every one of them has taken it, so retirement is a
-    minimum over exactly that set -- not over the roster, which would let an
-    application that never listens hold payloads forever.
+    ``owed`` says who a record published here is owed to, as roster indices:
+    everyone who hears the channel, or for a request only those able to answer it.
+    A payload is kept until every one of them has taken it -- not until the whole
+    roster has, which would let an application that never listens, or could never
+    answer, hold payloads forever.
     """
 
-    def __init__(self, arena, channel, listeners=()):
+    def __init__(self, arena, channel, owed):
         self.arena = arena
         self.channel = channel
-        self.listeners = tuple(listeners)
+        self.owed = owed
 
     def next_generation_number(self):
         state = self.arena.read_slot(self.channel)
@@ -133,33 +134,48 @@ class Publisher:
     def _retire(self, newest):
         """Drop what nobody can still be using, and cap an unread backlog.
 
-        The generation the consumer acknowledged *last* is kept alongside the
-        newest one, because acknowledging means "I have taken this", not "I have
-        finished with it": a Blender image loaded out of a payload keeps pointing
-        at it until a newer payload replaces it, and retiring it underneath would
-        leave that image dangling. Two survivors is the whole cost.
+        A generation is kept until everyone it is owed to has taken it. The one each
+        of them took *last* is kept as well, because acknowledging means "I have
+        taken this", not "I have finished with it": a Blender image loaded out of a
+        payload keeps pointing at it until a newer payload replaces it, and retiring
+        it underneath would leave that image dangling.
         """
         state = self.arena.read_slot(self.channel)
-        acknowledged = state.taken_by(self.listeners)
         dropped = state.dropped_generations
+        owed = {number: self._owed(number)
+                for number in self.arena.existing_generations(self.channel) if number < newest}
+        last_taken = set()
+        for listener in set().union(*owed.values()):
+            taken = [number for number, owing in owed.items()
+                     if listener in owing and number <= state.taken(listener)]
+            if taken:
+                last_taken.add(max(taken))
         outstanding = []
-        for number in self.arena.existing_generations(self.channel):
-            if number >= newest or number == acknowledged:
-                continue
-            if number <= acknowledged:
-                self.arena.discard_generation(self.channel, number)
-            else:
+        for number, owing in sorted(owed.items()):
+            if any(number > state.taken(listener) for listener in owing):
                 outstanding.append(number)
+            elif number not in last_taken:
+                self.arena.discard_generation(self.channel, number)
         overflow = len(outstanding) - (MAX_OUTSTANDING_GENERATIONS - 1)
         if overflow > 0:
             for number in outstanding[:overflow]:
                 LOG.warning(
                     "channel %s backlog exceeded %d unacknowledged generations; "
-                    "dropping generation %d before the consumer read it",
+                    "dropping generation %d before everyone it is owed to took it",
                     self.channel, MAX_OUTSTANDING_GENERATIONS, number)
                 self.arena.discard_generation(self.channel, number)
                 dropped += 1
         return dropped
+
+    def _owed(self, number):
+        """Who one generation is owed to. A record this build cannot read is owed to
+        nobody: no reader here could take it either."""
+        try:
+            record = record_module.read(self.arena.generation_directory(self.channel, number))
+        except record_module.RecordError as error:
+            LOG.info("%s generation %d is owed to nobody here: %s", self.channel, number, error)
+            return ()
+        return self.owed(record)
 
 
 class Subscriber:

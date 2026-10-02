@@ -44,15 +44,18 @@ MAX_CHANNEL_NAME = 31
 class Topic:
     """One named stream of statements."""
 
-    __slots__ = ("key", "kind", "speaks", "hears", "description")
+    __slots__ = ("key", "kind", "speaks", "hears", "addressed", "description")
 
-    def __init__(self, key, kind, speaks=None, hears=None, description=""):
+    def __init__(self, key, kind, speaks=None, hears=None, addressed=False, description=""):
         self.key = key
         self.kind = kind
         #: The capability needed to PRODUCE this, or None for one anybody can.
         self.speaks = speaks
         #: The capability needed to CONSUME it.
         self.hears = hears
+        #: Whether each record says what it asks for, so that it is owed only to the
+        #: applications able to answer it rather than to everyone who hears the topic.
+        self.addressed = addressed
         self.description = description
 
     def spoken_by(self, capabilities):
@@ -60,6 +63,12 @@ class Topic:
 
     def heard_by(self, capabilities):
         return self.hears is None or self.hears in capabilities
+
+    def owes(self, record, capabilities):
+        """Whether an application with these capabilities is owed this record."""
+        if self.addressed:
+            return can_answer(record["for"], capabilities)
+        return self.heard_by(capabilities)
 
     def channel(self, speaker):
         name = "{0}@{1}".format(self.key, speaker)
@@ -126,9 +135,11 @@ PRESENCE = Topic(
 
 #: "Please do a thing" -- send me a model, bake me your channels. One topic
 #: rather than one per errand: what is being asked lives in the record, so a
-#: third application can ask for a model without a line of new plumbing.
+#: third application can ask for a model without a line of new plumbing. Each
+#: request is owed only to the applications that can answer it, so one that
+#: cannot is never waited for.
 REQUEST = Topic(
-    "ask", QUEUED,
+    "ask", QUEUED, addressed=True,
     description="A request aimed at another application")
 
 TOPICS = (MESH, TEXTURES, INPUTS, ANIMATION, SHADING, PRESENCE, REQUEST)

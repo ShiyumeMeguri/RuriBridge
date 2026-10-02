@@ -44,10 +44,13 @@ def _index_of(name):
     raise KeyError(name)
 
 
-def _listeners(topic, speaker):
-    """Who actually hears that speaker on that topic, as roster indices."""
-    return tuple(index for index, peer in enumerate(peers_module.PEERS)
-                 if peer.name != speaker and topic.heard_by(peer.capabilities))
+def _owed(topic, speaker):
+    """Who a record that speaker publishes on that topic is owed to, as roster indices:
+    of everyone who hears the topic, the ones the record is for."""
+    hearing = [(index, peer.capabilities) for index, peer in enumerate(peers_module.PEERS)
+               if peer.name != speaker and topic.heard_by(peer.capabilities)]
+    return lambda record: tuple(index for index, capabilities in hearing
+                                if topic.owes(record, capabilities))
 
 
 class Endpoint:
@@ -80,7 +83,7 @@ class Session:
         for one, own in topic_module.publications(name, self.capabilities):
             if one.kind == topic_module.QUEUED:
                 self._publishers[one.key] = channel_module.Publisher(
-                    arena, own, listeners=_listeners(one, name))
+                    arena, own, owed=_owed(one, name))
             else:
                 self._writers[one.key] = channel_module.StateWriter(arena, own)
         for one, remote in topic_module.subscriptions(name, self.capabilities):
