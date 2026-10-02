@@ -82,13 +82,17 @@ def _map_key(file_name, document_names, other_names, index):
     general word pattern: Painter's separator is an underscore, which a word
     pattern swallows along with the name after it, leaving every map called the
     same thing.
+
+    What is left becomes part of a file name, and it can carry anything: Painter
+    names a user channel's map after the channel's label, which is free text. A
+    slash in it would put the file in a folder of its own, where nothing finds it.
     """
     leftover = _LEFTOVER_TOKEN.findall(_TOKEN.sub("", file_name))
     if leftover:
         LOG.warning("export preset uses wildcards this build does not know: %s",
                     ", ".join(sorted(set(leftover))))
     stripped = _LEFTOVER_TOKEN.sub("", _TOKEN.sub("", file_name))
-    stripped = _EMPTY_GROUP.sub("", stripped).strip(_SEPARATORS)
+    stripped = _UNSAFE_IN_FILE_NAMES.sub("_", _EMPTY_GROUP.sub("", stripped)).strip(_SEPARATORS)
     while "__" in stripped:
         stripped = stripped.replace("__", "_")
     if stripped:

@@ -35,6 +35,9 @@ ASK_TO_RENAME = "rename"
 #: "State your materials' shading": answered by the application that owns the
 #: materials, on the shading topic.
 ASK_FOR_SHADING = "shading"
+#: "Cut these lanes out of your materials' textures": answered by the application
+#: whose materials hold the textures, on the inputs topic.
+ASK_FOR_INPUTS = "inputs"
 
 RECORD_FILE_NAME = "record.json"
 #: A rig and its performance, as the animation tools on either side read it.
@@ -197,6 +200,19 @@ def textures(source, document, directory, texture_sets):
         "directory": str(directory),
         "texture_sets": texture_sets,
     })
+    return record
+
+
+def inputs(source, texture_sets):
+    """A material's own textures, cut into the inputs a texturing tool's shader reads.
+
+    Each Texture Set names the material the lanes came from, the shader they were cut
+    for, and one file per input beside the record with the hash of its bytes -- so a
+    reader that already holds those bytes does not take them in twice -- plus the
+    inputs that could not be cut and why.
+    """
+    record = _base("inputs", source)
+    record["texture_sets"] = texture_sets
     return record
 
 

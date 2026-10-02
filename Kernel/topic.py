@@ -88,6 +88,13 @@ TEXTURES = Topic(
     "tex", QUEUED, speaks=host_port.TEXTURE_SETS, hears=host_port.NODE_MATERIALS,
     description="Baked texture channels, per material")
 
+#: The other way: a material's own textures, cut into the inputs a texturing tool's
+#: shader reads, so a Texture Set can start out as the material it stands for. Stated
+#: by the host whose materials hold the textures; taken by the one with texture sets.
+INPUTS = Topic(
+    "inputs", QUEUED, speaks=host_port.NODE_MATERIALS, hears=host_port.TEXTURE_SETS,
+    description="A material's textures, cut into a texturing tool's shader inputs")
+
 #: The rig and what it is doing. Both ends need an animation surface, and a
 #: texturing tool has none -- it says so rather than being special-cased.
 #:
@@ -124,7 +131,7 @@ REQUEST = Topic(
     "ask", QUEUED,
     description="A request aimed at another application")
 
-TOPICS = (MESH, TEXTURES, ANIMATION, SHADING, PRESENCE, REQUEST)
+TOPICS = (MESH, TEXTURES, INPUTS, ANIMATION, SHADING, PRESENCE, REQUEST)
 
 #: What answering each errand takes. A request is published to the room and every
 #: application hears it, so an application seeing one it cannot answer is the
@@ -138,6 +145,7 @@ ANSWERED_WITH = {
     record_module.ASK_TO_BIND: host_port.SCENE_GRAPH,
     record_module.ASK_TO_RENAME: host_port.TEXTURE_SETS,
     record_module.ASK_FOR_SHADING: host_port.SCENE_GRAPH,
+    record_module.ASK_FOR_INPUTS: host_port.NODE_MATERIALS,
 }
 
 

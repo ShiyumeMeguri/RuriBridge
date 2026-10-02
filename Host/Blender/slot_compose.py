@@ -29,65 +29,16 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
-import struct
-import zlib
 
 import bpy
 import numpy
 
 from ...Kernel.log import logger
+from . import pixels
 
 LOG = logger("blender.slots")
 
 _LANE_LETTERS = "rgba"
-_PNG_COLOUR_TYPES = {1: 0, 2: 4, 3: 2, 4: 6}
-
-
-def _read(path, size=None):
-    """A file's stored values, (height, width, 4) float32, rows bottom first; and whether
-    they are wider than eight bits. ``size`` resamples it to (width, height)."""
-    image = bpy.data.images.load(path, check_existing=False)
-    try:
-        image.colorspace_settings.name = "Non-Color"
-        image.reload()
-        if size is not None and tuple(image.size) != tuple(size):
-            image.scale(int(size[0]), int(size[1]))
-        width, height = image.size
-        values = numpy.empty(width * height * 4, dtype=numpy.float32)
-        image.pixels.foreach_get(values)
-        return values.reshape(height, width, 4), bool(image.is_float)
-    finally:
-        bpy.data.images.remove(image)
-
-
-def _file_of(image):
-    """The file an image datablock reads, or empty when it reads none."""
-    if image is None or image.packed_file is not None or not image.filepath:
-        return ""
-    path = os.path.abspath(bpy.path.abspath(image.filepath, library=image.library))
-    return path if os.path.isfile(path) else ""
-
-
-def _png(lanes, wide):
-    """A PNG of these lanes, (height, width, n) in [0, 1], rows bottom first."""
-    height, width, count = lanes.shape
-    top_first = numpy.clip(lanes[::-1], 0.0, 1.0)
-    if wide:
-        stored = numpy.rint(top_first * 65535.0).astype(">u2")
-    else:
-        stored = numpy.rint(top_first * 255.0).astype(numpy.uint8)
-    rows = stored.reshape(height, -1).view(numpy.uint8)
-    raw = numpy.zeros((height, rows.shape[1] + 1), dtype=numpy.uint8)
-    raw[:, 1:] = rows
-
-    def chunk(kind, payload):
-        return (struct.pack(">I", len(payload)) + kind + payload
-                + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF))
-
-    header = struct.pack(">IIBBBBB", width, height, 16 if wide else 8,
-                         _PNG_COLOUR_TYPES[count], 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
-            + chunk(b"IDAT", zlib.compress(raw.tobytes(), 6)) + chunk(b"IEND", b""))
 
 
 def _relative(path):
@@ -104,7 +55,7 @@ def _image_on(path, colour_space):
     current pixels and the colour space the slot reads it in."""
     wanted = os.path.normcase(os.path.abspath(path))
     image = next((one for one in bpy.data.images
-                  if _file_of(one) and os.path.normcase(_file_of(one)) == wanted), None)
+                  if pixels.file_of(one) and os.path.normcase(pixels.file_of(one)) == wanted), None)
     if image is None:
         image = bpy.data.images.load(path, check_existing=False)
         image.filepath = _relative(path)
@@ -127,7 +78,7 @@ class _Painter:
             if len(entry["files"]) != 1:
                 raise RuntimeError("{0} is tiled; a generated material samples one texture".format(
                     key))
-            values, _wide = _read(os.path.join(self.directory, entry["files"][0]))
+            values, _wide = pixels.read(os.path.join(self.directory, entry["files"][0]))
             self.read[key] = values
         return self.read[key]
 
@@ -222,12 +173,12 @@ def compose(entry, directory, materials, declaration_key):
             original_image = held.get(slot)
             original = None
             if _needs_original(recipe) and original_image is not None:
-                path = _file_of(original_image)
+                path = pixels.file_of(original_image)
                 if not path:
                     report["refused"][slot] = "{0} keeps lanes of {1}, which is not a file".format(
                         material.name, original_image.name)
                     continue
-                original = _read(path, size)
+                original = pixels.read(path, size)
             key = (slot, original_image.name_full if original_image is not None else "")
             if key not in written:
                 stem = "{0}_{1}".format(name, slot.lstrip("_"))
@@ -243,7 +194,7 @@ def compose(entry, directory, materials, declaration_key):
             plans.append((material, group, slot, key,
                           _colour_space(recipe, painter, original_image)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
-        encoded = list(pool.map(lambda job: (job[0], _png(job[1], job[2])), jobs))
+        encoded = list(pool.map(lambda job: (job[0], pixels.png(job[1], job[2])), jobs))
     for path, payload in encoded:
         with open(path, "wb") as handle:
             handle.write(payload)

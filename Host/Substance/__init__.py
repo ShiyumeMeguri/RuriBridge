@@ -43,7 +43,7 @@ from ...Kernel import record as record_module
 from ...Kernel import session as session_module
 from ...Kernel import topic as topic_module
 
-from . import mesh_ingest, shader_state, texture_publish
+from . import held_imports, material_seed, mesh_ingest, shader_state, texture_publish
 
 LOG = log_module.logger("painter")
 
@@ -195,18 +195,69 @@ def _ask(what, **details):
         record_module.request(HOST.name, what, **details))
 
 
-def shaders_by_texture_set(rows):
-    """Which generated shader each Texture Set's Blender materials run, as the material
-    that speaks for the set says it: the one named like the set, else the first by name
-    -- the same rule the shading row follows."""
-    speakers = {}
+def speakers(rows):
+    """The Blender material that speaks for each Texture Set its generated materials paint:
+    the one named like the set, else the first by name -- the rule the shading row follows."""
+    found = {}
     for row in sorted(rows, key=lambda one: one["name"]):
         texture_set = row["texture_set"]
         if not texture_set or not row["shader"]:
             continue
-        if texture_set not in speakers or row["name"] == texture_set:
-            speakers[texture_set] = {"name": row["shader"], "identity": row["identity"]}
-    return speakers
+        if texture_set not in found or row["name"] == texture_set:
+            found[texture_set] = row
+    return found
+
+
+def shaders_by_texture_set(rows):
+    """Which generated shader each Texture Set's Blender materials run, and its identity."""
+    return {texture_set: {"name": row["shader"], "identity": row["identity"]}
+            for texture_set, row in speakers(rows).items()}
+
+
+def ask_for_inputs(texture_sets):
+    """Ask Blender to cut its materials' textures into what these Texture Sets' shader
+    reads -- the Texture Sets that now run the very shader their material was made for.
+    Returns how many were asked about."""
+    rows = speakers(blender_state().get("materials") or [])
+    requests = []
+    for texture_set in sorted(texture_sets):
+        row = rows.get(texture_set)
+        if row is None:
+            continue
+        manifest = shader_state.shader_manifest(row["shader"])
+        if manifest is None:
+            continue
+        wanted = material_seed.jobs(manifest, row["images"])
+        if wanted:
+            requests.append({"name": texture_set, "material": row["name"],
+                             "shader": row["shader"], "jobs": wanted})
+    if requests:
+        _ask(record_module.ASK_FOR_INPUTS, texture_sets=requests)
+    return len(requests)
+
+
+def take_inputs(generation):
+    """Put a delivery of cut textures in place. Returns one line about it."""
+    reports = {}
+    failed = {}
+    for entry in generation.record["texture_sets"]:
+        try:
+            reports[entry["name"]] = material_seed.apply(entry, str(generation.directory))
+        except Exception as error:
+            LOG.error("%s could not be set up from Blender: %s", entry["name"], error)
+            failed[entry["name"]] = str(error)
+    channels = sum(len(report["channels"]) for report in reports.values())
+    mesh_maps = sum(len(report["mesh_maps"]) for report in reports.values())
+    parameters = sum(len(report["parameters"]) for report in reports.values())
+    missing = sum(len(report["missing"]) for report in reports.values())
+    line = ("set up {0} Texture Set(s) from Blender: {1} channel(s) in the Blender layer, "
+            "{2} mesh map(s), {3} shader texture(s)".format(len(reports), channels, mesh_maps,
+                                                            parameters))
+    if missing:
+        line += "; {0} input(s) not set (see the log)".format(missing)
+    if failed:
+        line += "; failed: " + ", ".join(sorted(failed))
+    return line
 
 
 def send_textures(layer=False, directory=None):
@@ -261,12 +312,25 @@ def images_for_active_texture_set():
     return found
 
 
-def _selected_layer():
-    stack = substance_painter.textureset.get_active_stack()
+def _selection(stack):
+    """The one node selected in this stack, or None when it is not exactly one."""
     selected = substance_painter.layerstack.get_selected_nodes(stack)
-    if len(selected) != 1:
-        raise RuntimeError("select exactly one layer (or one effect in its mask)")
-    return selected[0]
+    return selected[0] if len(selected) == 1 else None
+
+
+def _new_layer(stack, near, path):
+    """A fresh fill layer for an image, above the selected layer (on top when none is),
+    showing nothing but base colour -- so it covers no channel of the layers below
+    with a default nobody chose -- and selected, so the next pull lands in it."""
+    layerstack = substance_painter.layerstack
+    position = (layerstack.InsertPosition.above_node(near)
+                if isinstance(near, layerstack.LayerNode)
+                else layerstack.InsertPosition.from_textureset_stack(stack))
+    layer = layerstack.insert_fill(position)
+    layer.set_name(os.path.splitext(os.path.basename(path))[0])
+    layer.active_channels = {substance_painter.textureset.ChannelType.BaseColor}
+    layerstack.set_selected_nodes([layer])
+    return layer
 
 
 def pull_into_selected_layer(path, as_mask):
@@ -275,27 +339,35 @@ def pull_into_selected_layer(path, as_mask):
     Nothing else in the stack is touched. As a mask, the layer gets a mask if it
     has none, and the image fills it; a fill effect already selected in a mask has
     its source replaced instead. As a reference, the selected fill layer's base
-    colour comes from the image.
+    colour comes from the image. When what is selected cannot take the image that
+    way -- nothing, several things, a paint layer for a reference -- a new fill
+    layer takes it instead.
     """
-    node = _selected_layer()
-    resource = _resource_for(path)
     layerstack = substance_painter.layerstack
+    stack = substance_painter.textureset.get_active_stack()
+    node = _selection(stack)
+    resource = _resource_for(path)
+    image = os.path.basename(path)
     if as_mask:
         if isinstance(node, layerstack.FillEffectNode) and node.is_in_mask_stack():
             node.set_source(None, resource)
-            return "the selected mask fill now reads {0}".format(os.path.basename(path))
-        if not isinstance(node, layerstack.LayerNode):
-            raise RuntimeError("select a layer, or a fill effect inside its mask")
+            return "the selected mask fill now reads {0}".format(image)
+        made = not isinstance(node, layerstack.LayerNode)
+        if made:
+            node = _new_layer(stack, node, path)
         if not node.has_mask():
             node.add_mask(layerstack.MaskBackground.Black)
         fill = layerstack.insert_fill(
             layerstack.InsertPosition.inside_node(node, layerstack.NodeStack.Mask))
         fill.set_source(None, resource)
-        return "{0} is now masked by {1}".format(node.get_name(), os.path.basename(path))
-    if not isinstance(node, layerstack.FillLayerNode):
-        raise RuntimeError("select a fill layer to take the image as its reference")
-    node.set_source(substance_painter.textureset.ChannelType.BaseColor, resource)
-    return "{0} now shows {1}".format(node.get_name(), os.path.basename(path))
+        return "{0}{1} is now masked by {2}".format(
+            "new layer " if made else "", node.get_name(), image)
+    if isinstance(node, layerstack.FillLayerNode):
+        node.set_source(substance_painter.textureset.ChannelType.BaseColor, resource)
+        return "{0} now shows {1}".format(node.get_name(), image)
+    layer = _new_layer(stack, node, path)
+    layer.set_source(substance_painter.textureset.ChannelType.BaseColor, resource)
+    return "new layer {0} shows {1}".format(layer.get_name(), image)
 
 
 # -- the panel -------------------------------------------------------------------------
@@ -552,6 +624,9 @@ def apply_shading(record):
         LOG.info("%s takes same-named parameters only: %s", texture_set, why)
     for texture_set, problems in sorted(report["mismatched"].items()):
         LOG.warning("%s: not written, %s", texture_set, "; ".join(problems))
+    asked = ask_for_inputs(report["same_shader"])
+    if asked:
+        parts.append("asked Blender for the textures of {0} Texture Set(s)".format(asked))
     return "; ".join(parts)
 
 
@@ -573,6 +648,13 @@ def _handle(topic, generation):
             "creating the project" if what == "create" else "swapping the mesh in",
             mesh_ingest.describe_scene(generation)))
         return True
+    if topic is topic_module.INPUTS:
+        if not substance_painter.project.is_open():
+            _panel.set_status("textures arrived from Blender and no project is open")
+            return False
+        _panel.set_status(take_inputs(generation))
+        _presence_due[0] = True
+        return False
     if topic is topic_module.REQUEST:
         asked = generation.record.get("for")
         if not topic_module.can_answer(asked, HOST.capabilities):
@@ -660,6 +742,11 @@ def _on_project_changed(_event):
     _presence_due[0] = True
 
 
+def _on_project_closed(_event):
+    held_imports.release()
+    _presence_due[0] = True
+
+
 def show_panel():
     """Bring the dock back, from a menu item that is always there."""
     if _dock is None:
@@ -686,7 +773,7 @@ def _rest_in_the_strip(_event=None):
 
 _EVENTS = (
     (substance_painter.event.ProjectEditionEntered, _on_project_ready),
-    (substance_painter.event.ProjectClosed, _on_project_changed),
+    (substance_painter.event.ProjectClosed, _on_project_closed),
     (substance_painter.event.ProjectSaved, _on_project_changed),
     (substance_painter.event.LayerStacksModelDataChanged, _on_project_changed),
     (substance_painter.event.GraphicalUserInterfaceStarted, _rest_in_the_strip),

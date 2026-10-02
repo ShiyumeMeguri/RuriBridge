@@ -35,13 +35,13 @@ from ...Kernel import session as session_module
 from ...Kernel import summon as summon_module
 from ...Kernel import topic as topic_module
 
-from . import glb_ingest, mesh_publish, slot_compose, texture_ingest
+from . import glb_ingest, material_inputs, mesh_publish, pixels, slot_compose, texture_ingest
 
 # Kernel.host is deliberately absent: it holds the bound driver, and reloading it
 # would clear the binding while everything that already imported it kept the old
 # module object -- "no application is bound", from the next call on.
 for _module in (arena_module, record_module, topic_module, session_module,
-                glb_ingest, mesh_publish, slot_compose, texture_ingest):
+                glb_ingest, mesh_publish, pixels, slot_compose, texture_ingest, material_inputs):
     importlib.reload(_module)
 
 LOG = log_module.logger("blender")
@@ -418,6 +418,10 @@ def _receive(topic, generation):
             return bind(generation.record["texture_set"], generation.record["material"])
         if asked == record_module.ASK_FOR_SHADING:
             return sorted(sync_material(bpy.context))
+        if asked == record_module.ASK_FOR_INPUTS:
+            return material_inputs.bake(
+                CONNECTION.session.publisher(topic_module.INPUTS), generation.record,
+                mesh_publish.worn_materials(mesh_publish.scope(bpy.context.view_layer)))
     raise RuntimeError(
         "nothing here receives {0!r} yet, and the topic says this application "
         "hears it".format(topic.key))
