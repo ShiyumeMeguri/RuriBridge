@@ -7,12 +7,13 @@ one table:
 * **Update Mesh** -- Blender sends the surface, and it is swapped in under every
   layer the project already has; nothing else changes. A Texture Set with layers
   that nothing in the payload paints into stops the swap instead of being dropped.
-* **Sync All Material / Sync Selected Material** -- every Texture Set, or only the
+* **Pull All Material / Pull Selected Material** -- every Texture Set, or only the
   selected one, takes the shader, values and textures of the Blender material that
-  paints it.
-* **Send All Textures / Send Selected Textures** -- every Texture Set, or only the
+  paints it. Blender's Push Material does the same from there.
+* **Push All Material / Push Selected Material** -- every Texture Set, or only the
   selected one, is exported into the Blender document's own textures folder, and
-  Blender puts the files into its materials.
+  Blender puts the files into its materials. Blender's Pull Material does the same
+  from there; **Push Selected Layer** is its Pull Selected Layer.
 * **Pull Into Selected Layer** -- one of the images a Blender material samples
   becomes the mask, or the reference fill, of the layer selected here. Blender has
   no layers, so that is the only shape anything coming this way can take, and it
@@ -218,11 +219,17 @@ def shaders_by_texture_set(rows):
             for texture_set, row in speakers(rows).items()}
 
 
-def ask_for_material(selected_only):
-    """Ask Blender for the materials that paint the Texture Set selected here, or every
-    Texture Set here, and for no other. Returns the Texture Sets asked about."""
+def selected_texture_set():
+    """The Texture Set selected here -- the one whose layers are showing."""
+    return substance_painter.textureset.get_active_stack().material().name
+
+
+def pull_material(selected_only):
+    """Pull the Blender materials that paint the Texture Set selected here, or every
+    Texture Set here, and no other: their shader, values and textures. Returns the
+    Texture Sets asked about."""
     if selected_only:
-        wanted = [substance_painter.textureset.get_active_stack().material().name]
+        wanted = [selected_texture_set()]
     else:
         wanted = sorted(one.name for one in substance_painter.textureset.all_texture_sets())
     painted = speakers(blender_state().get("materials") or [])
@@ -280,9 +287,10 @@ def take_inputs(generation):
     return line
 
 
-def send_textures(layer=False, directory=None, selected_only=False):
-    """Export into the folder Blender named, and say so on the session: every Texture
-    Set, or the one selected here, or the layer selected in it."""
+def push_material(layer=False, directory=None, texture_sets=None):
+    """Push what is painted here into the Blender materials painting it: every Texture
+    Set, or these by name, exported into the folder Blender named; or the layer selected
+    here alone, which Blender keeps out of its materials."""
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
     blender = blender_state()
@@ -294,8 +302,9 @@ def send_textures(layer=False, directory=None, selected_only=False):
         CONNECTION.session.publisher(topic_module.TEXTURES), target,
         texture_publish.DEFAULT_PRESET_NAME, layer=layer,
         shaders=shaders_by_texture_set(blender.get("materials") or []),
-        texture_sets=([substance_painter.textureset.get_active_stack().material()]
-                      if selected_only else None))
+        texture_sets=(None if texture_sets is None else
+                      [substance_painter.textureset.TextureSet.from_name(name)
+                       for name in texture_sets]))
 
 
 # -- pulling an image into the selected layer ----------------------------------------
@@ -444,27 +453,31 @@ class RuriBridgePanel(QtWidgets.QWidget):
         self.mesh_button.setToolTip(
             "Swap Blender's mesh in under the layers the project already has; nothing else "
             "changes")
-        self.sync_all_button = QtWidgets.QPushButton("Sync All Material")
-        self.sync_all_button.setToolTip(
+        self.pull_all_button = QtWidgets.QPushButton("Pull All Material")
+        self.pull_all_button.setToolTip(
             "Every Texture Set takes the shader, values and textures of the Blender material "
             "that paints it")
-        self.sync_selected_button = QtWidgets.QPushButton("Sync Selected Material")
-        self.sync_selected_button.setToolTip(
+        self.pull_selected_button = QtWidgets.QPushButton("Pull Selected Material")
+        self.pull_selected_button.setToolTip(
             "Only the selected Texture Set takes the shader, values and textures of the "
             "Blender material that paints it")
-        self.send_all_button = QtWidgets.QPushButton("Send All Textures")
-        self.send_all_button.setToolTip(
-            "Export every Texture Set into the Blender document's textures folder")
-        self.send_selected_button = QtWidgets.QPushButton("Send Selected Textures")
-        self.send_selected_button.setToolTip(
-            "Export only the selected Texture Set into the Blender document's textures folder")
+        self.push_all_button = QtWidgets.QPushButton("Push All Material")
+        self.push_all_button.setToolTip(
+            "Every Texture Set's paint goes into the Blender materials painting it")
+        self.push_selected_button = QtWidgets.QPushButton("Push Selected Material")
+        self.push_selected_button.setToolTip(
+            "Only the selected Texture Set's paint goes into the Blender materials painting it")
+        self.push_layer_button = QtWidgets.QPushButton("Push Selected Layer")
+        self.push_layer_button.setToolTip(
+            "Only the selected layer goes to Blender, as images kept out of the materials")
         layout.addWidget(self.mesh_button)
-        for left, right in ((self.sync_all_button, self.sync_selected_button),
-                            (self.send_all_button, self.send_selected_button)):
+        for left, right in ((self.pull_all_button, self.pull_selected_button),
+                            (self.push_all_button, self.push_selected_button)):
             pair = QtWidgets.QHBoxLayout()
             pair.addWidget(left)
             pair.addWidget(right)
             layout.addLayout(pair)
+        layout.addWidget(self.push_layer_button)
 
         pull = QtWidgets.QHBoxLayout()
         self.image_box = QtWidgets.QComboBox()
@@ -483,12 +496,13 @@ class RuriBridgePanel(QtWidgets.QWidget):
         layout.addWidget(self.status_label)
 
         self.mesh_button.clicked.connect(self._ask_for_mesh)
-        self.sync_all_button.clicked.connect(lambda: self._sync(False))
-        self.sync_selected_button.clicked.connect(lambda: self._sync(True))
-        self.send_all_button.clicked.connect(lambda: self._send_textures(False))
-        self.send_selected_button.clicked.connect(lambda: self._send_textures(True))
-        self.mask_button.clicked.connect(lambda: self._pull(True))
-        self.reference_button.clicked.connect(lambda: self._pull(False))
+        self.pull_all_button.clicked.connect(lambda: self._pull_material(False))
+        self.pull_selected_button.clicked.connect(lambda: self._pull_material(True))
+        self.push_all_button.clicked.connect(lambda: self._push(None))
+        self.push_selected_button.clicked.connect(lambda: self._push([selected_texture_set()]))
+        self.push_layer_button.clicked.connect(lambda: self._push(None, layer=True))
+        self.mask_button.clicked.connect(lambda: self._pull_image(True))
+        self.reference_button.clicked.connect(lambda: self._pull_image(False))
         self._shown = None
 
     def _themed_body(self):
@@ -604,27 +618,27 @@ class RuriBridgePanel(QtWidgets.QWidget):
             return
         self.set_status("asked Blender for the mesh")
 
-    def _sync(self, selected_only):
+    def _pull_material(self, selected_only):
         try:
-            asked = ask_for_material(selected_only)
+            asked = pull_material(selected_only)
         except Exception as error:
-            self.set_status("could not ask: {0}".format(error))
+            self.set_status("could not pull: {0}".format(error))
             return
-        self.set_status("asked Blender for the material of {0}".format(
+        self.set_status("pulling the material of {0} from Blender".format(
             asked[0] if len(asked) == 1 else "{0} Texture Set(s)".format(len(asked))))
 
-    def _send_textures(self, selected_only):
+    def _push(self, texture_sets, layer=False):
         try:
-            send_textures(selected_only=selected_only)
+            push_material(layer=layer, texture_sets=texture_sets)
         except Exception as error:
-            LOG.error("texture export failed: %s", error)
-            self.set_status("export failed: {0}".format(error))
+            LOG.error("push failed: %s", error)
+            self.set_status("push failed: {0}".format(error))
             return
-        self.set_status("sent the textures of {0} to Blender".format(
-            substance_painter.textureset.get_active_stack().material().name if selected_only
-            else "every Texture Set"))
+        self.set_status("pushed {0} to Blender".format(
+            "the selected layer" if layer else
+            "the material of " + texture_sets[0] if texture_sets else "every material"))
 
-    def _pull(self, as_mask):
+    def _pull_image(self, as_mask):
         path = self.image_box.currentData()
         if not path:
             self.set_status("no Blender image to pull for this Texture Set")
@@ -672,7 +686,7 @@ def apply_shading(record):
         LOG.info("%s takes same-named parameters only: %s", texture_set, why)
     for texture_set, problems in sorted(report["mismatched"].items()):
         LOG.warning("%s: not written, %s", texture_set, "; ".join(problems))
-    asked = ask_for_inputs([one for one in report["same_shader"] if one in record["requested"]])
+    asked = ask_for_inputs([one for one in report["same_shader"] if one not in report["unmapped"]])
     if asked:
         parts.append("asked Blender for the textures of {0} Texture Set(s)".format(asked))
     return "; ".join(parts)
@@ -708,10 +722,13 @@ def _handle(topic, generation):
         if not topic_module.can_answer(asked, HOST.capabilities):
             return False
         if asked == record_module.ASK_FOR_TEXTURES:
-            send_textures(layer=bool(generation.record.get("layer")),
-                          directory=generation.record.get("directory"))
+            record = generation.record
+            push_material(layer=record["layer"], directory=record["directory"],
+                          texture_sets=record["texture_sets"])
             _panel.set_status("sent {0} to Blender".format(
-                "the selected layer" if generation.record.get("layer") else "the textures"))
+                "the selected layer" if record["layer"] else
+                "the textures of " + ", ".join(record["texture_sets"]) if record["texture_sets"]
+                else "every Texture Set's textures"))
             return False
         if asked == record_module.ASK_TO_RENAME:
             renamed = texture_publish.rename(generation.record.get("renames") or {})

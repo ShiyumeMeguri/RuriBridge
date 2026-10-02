@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """The Blender driver: everything this add-on does that only Blender can do.
 
-Three verbs and one table, nothing else.
+The same verbs as Painter's end, from this side, and one table:
 
-* **Send Mesh** sends the model -- the surface somebody paints on -- and Painter
-  swaps it in under every layer it already has.
-* **Pull Textures** asks Painter to render its channels into this document's
-  textures folder, and puts them into the materials that paint into each
-  Texture Set.
+* **Update Mesh** sends the model -- the surface somebody paints on -- and Painter
+  swaps it in under every layer it already has; nothing else changes.
+* **Push All Material / Push Selected Material** put every Texture Set, or the one
+  the active material paints into, on the shader of the material that paints it in
+  Painter, with its values and, for the same shader, its textures (Painter's Pull).
+* **Pull All Material / Pull Selected Material** ask Painter to render every Texture
+  Set, or that one, into this document's textures folder, and put them into the
+  materials that paint into it (Painter's Push).
 * **Pull Selected Layer** asks Painter for the one layer selected over there, on
   its own, as images in the same folder.
 * **The table** says which material paints into which Texture Set, and is the one
@@ -303,33 +306,39 @@ def send_mesh(context):
     return generation
 
 
-def sync_material(context, requested=()):
-    """State Texture Sets' shading on the session: the shader, that shader's identity,
-    and the row of the material that speaks for each.
+def selected_texture_set(context):
+    """The Texture Set the active object's active material paints into."""
+    material = context.object.active_material if context.object is not None else None
+    if material is None:
+        raise RuntimeError("the active object has no active material")
+    texture_set = mesh_publish.texture_set_of(material)
+    if not texture_set:
+        raise RuntimeError("{0} paints into no Texture Set".format(material.name))
+    return texture_set
+
+
+def push_material(context, texture_sets=None):
+    """Push materials into Painter -- every Texture Set's, or these: the shader, that
+    shader's identity, and the row of the material that speaks for each.
 
     Painter decides what it can take: the same shader by identity takes the whole
-    row, any other shader only the parameters both name.
-
-    ``requested`` is what Painter asked about -- every Texture Set it has, or the one
-    selected there -- and the statement is then theirs alone, marked as asked for, so
-    Painter stands their textures up as well. Stated from here, it is every Texture Set's
-    shading and only that.
+    row and stands the material's textures up too, any other shader only the
+    parameters both name. Painter's Pull Material asks for exactly this.
     """
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
     rows = mesh_publish.shading_rows(mesh_publish.scope(context.view_layer))
-    if requested:
-        rows = {texture_set: row for texture_set, row in rows.items() if texture_set in requested}
+    if texture_sets is not None:
+        rows = {texture_set: row for texture_set, row in rows.items() if texture_set in texture_sets}
     if not rows:
         raise RuntimeError("no material painting into {0} declares its shading".format(
-            ", ".join(sorted(requested)) if requested else "a Texture Set"))
+            ", ".join(sorted(texture_sets)) if texture_sets is not None else "a Texture Set"))
     CONNECTION.session.writer(topic_module.SHADING).write(record_module.shading(
         HOST.name,
         {texture_set: row["parameters"] for texture_set, row in rows.items()},
         vocabulary_by_texture_set={texture_set: row["shader"] for texture_set, row in rows.items()},
         shader_name_by_texture_set={texture_set: row["name"] for texture_set, row in rows.items()},
-        identity_by_texture_set={texture_set: row["identity"] for texture_set, row in rows.items()},
-        requested=requested))
+        identity_by_texture_set={texture_set: row["identity"] for texture_set, row in rows.items()}))
     return rows
 
 
@@ -340,13 +349,16 @@ def _ask(what, **details):
         record_module.request(HOST.name, what, **details))
 
 
-def pull_textures():
-    """Ask Painter to render every Texture Set into this document's textures folder."""
+def pull_material(texture_sets=None):
+    """Pull what is painted in Painter into the materials here: every Texture Set, or
+    these, rendered into this document's textures folder. Painter's Push Material does
+    exactly this."""
     directory = textures_directory()
     if not directory:
         raise RuntimeError("save the .blend first: its textures folder is where "
                            "Painter writes them")
-    return _ask(record_module.ASK_FOR_TEXTURES, directory=directory, layer=False)
+    return _ask(record_module.ASK_FOR_TEXTURES, directory=directory, layer=False,
+                texture_sets=texture_sets)
 
 
 def pull_selected_layer():
@@ -355,7 +367,8 @@ def pull_selected_layer():
     if not directory:
         raise RuntimeError("save the .blend first: its textures folder is where "
                            "Painter writes them")
-    return _ask(record_module.ASK_FOR_TEXTURES, directory=directory, layer=True)
+    return _ask(record_module.ASK_FOR_TEXTURES, directory=directory, layer=True,
+                texture_sets=None)
 
 
 def bind(texture_set, material_name):
@@ -426,7 +439,7 @@ def _receive(topic, generation):
         if asked == record_module.ASK_TO_BIND:
             return bind(generation.record["texture_set"], generation.record["material"])
         if asked == record_module.ASK_FOR_SHADING:
-            return sorted(sync_material(bpy.context, generation.record["texture_sets"]))
+            return sorted(push_material(bpy.context, generation.record["texture_sets"]))
         if asked == record_module.ASK_FOR_INPUTS:
             return material_inputs.bake(
                 CONNECTION.session.publisher(topic_module.INPUTS), generation.record,
@@ -616,10 +629,10 @@ class RuriBridgePreferences(bpy.types.AddonPreferences):
 
 class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
     bl_idname = "ruri_bridge.send_mesh"
-    bl_label = "Send Mesh"
-    bl_description = ("Send every visible mesh to Painter as the surface to paint on. "
-                      "Painter swaps it in under the layers it already has; a Texture "
-                      "Set with layers that nothing here paints into stops the swap")
+    bl_label = "Update Mesh"
+    bl_description = ("Update only the mesh in Painter: every visible mesh is swapped in "
+                      "under the layers Painter already has, and nothing else changes. A "
+                      "Texture Set with layers that nothing here paints into stops the swap")
 
     def invoke(self, context, event):
         refresh_view()
@@ -627,11 +640,11 @@ class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
         if not fresh:
             return self.execute(context)
         return context.window_manager.invoke_confirm(
-            self, event, title="Send Mesh",
+            self, event, title="Update Mesh",
             message=("Painter gets {0} new Texture Set(s) with nothing painted on them: {1}. "
                      "Faces that move into one leave their paint behind in the Texture Set "
                      "they came from".format(len(fresh), ", ".join(fresh))),
-            confirm_text="Send")
+            confirm_text="Update")
 
     def execute(self, context):
         try:
@@ -645,37 +658,52 @@ class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class RURIBRIDGE_OT_sync_material(bpy.types.Operator):
-    bl_idname = "ruri_bridge.sync_material"
-    bl_label = "Sync Material"
-    bl_description = ("Put each Texture Set's shader and parameters on it in Painter. The "
-                      "same shader by identity takes the whole row; another shader only the "
-                      "parameters both name. Textures come over only when Painter asks "
-                      "(Sync All Material or Sync Selected Material there)")
+class RURIBRIDGE_OT_push_material(bpy.types.Operator):
+    bl_idname = "ruri_bridge.push_material"
+    bl_label = "Push Material"
+    selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
+
+    @classmethod
+    def description(cls, _context, properties):
+        return ("Put {0} on the shader of the material that paints it in Painter, with its "
+                "values. The same shader by identity also takes the material's textures, in "
+                "a layer of its own under every other; another shader only the parameters "
+                "both name".format("the active material's Texture Set" if properties.selected
+                                   else "every Texture Set"))
 
     def execute(self, context):
         try:
-            rows = sync_material(context)
+            rows = push_material(context, [selected_texture_set(context)] if self.selected
+                                 else None)
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        say("stated the shading of {0} Texture Set(s)".format(len(rows)))
+        say("pushed the material of {0}".format(
+            next(iter(rows)) if len(rows) == 1 else "{0} Texture Set(s)".format(len(rows))))
         return {"FINISHED"}
 
 
-class RURIBRIDGE_OT_pull_textures(bpy.types.Operator):
-    bl_idname = "ruri_bridge.pull_textures"
-    bl_label = "Pull Textures"
-    bl_description = ("Have Painter export every Texture Set into this document's "
-                      "textures folder, then put them into the materials painting them")
+class RURIBRIDGE_OT_pull_material(bpy.types.Operator):
+    bl_idname = "ruri_bridge.pull_material"
+    bl_label = "Pull Material"
+    selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
+
+    @classmethod
+    def description(cls, _context, properties):
+        return ("Pull what is painted in Painter on {0} into the materials painting it: "
+                "exported into this document's textures folder and put into those "
+                "materials".format("the active material's Texture Set" if properties.selected
+                                   else "every Texture Set"))
 
     def execute(self, context):
         try:
-            pull_textures()
+            texture_sets = [selected_texture_set(context)] if self.selected else None
+            pull_material(texture_sets)
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        say("asked Painter for its textures")
+        say("pulling the material of {0} from Painter".format(
+            texture_sets[0] if texture_sets else "every Texture Set"))
         return {"FINISHED"}
 
 
@@ -994,12 +1022,18 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         column = layout.column(align=True)
         column.enabled = attached
         column.scale_y = 1.3
+        column.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
         row = column.row(align=True)
-        row.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
-        row.operator(RURIBRIDGE_OT_sync_material.bl_idname, icon="MATERIAL")
+        row.operator(RURIBRIDGE_OT_push_material.bl_idname, text="Push All Material",
+                     icon="MATERIAL").selected = False
+        row.operator(RURIBRIDGE_OT_push_material.bl_idname,
+                     text="Push Selected Material").selected = True
         row = column.row(align=True)
-        row.operator(RURIBRIDGE_OT_pull_textures.bl_idname, icon="IMPORT")
-        row.operator(RURIBRIDGE_OT_pull_selected_layer.bl_idname, icon="RENDERLAYERS")
+        row.operator(RURIBRIDGE_OT_pull_material.bl_idname, text="Pull All Material",
+                     icon="IMPORT").selected = False
+        row.operator(RURIBRIDGE_OT_pull_material.bl_idname,
+                     text="Pull Selected Material").selected = True
+        column.operator(RURIBRIDGE_OT_pull_selected_layer.bl_idname, icon="RENDERLAYERS")
         if attached:
             _draw_table(layout)
         if _status[0]:
@@ -1023,7 +1057,7 @@ class RURIBRIDGE_PT_cascadeur(bpy.types.Panel):
 
 
 _CLASSES = (RuriBridgePreferences,
-            RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_sync_material, RURIBRIDGE_OT_pull_textures,
+            RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_push_material, RURIBRIDGE_OT_pull_material,
             RURIBRIDGE_OT_pull_selected_layer, RURIBRIDGE_OT_bind, RURIBRIDGE_OT_exclude,
             RURIBRIDGE_OT_follow_rename, RURIBRIDGE_OT_start_painter, RURIBRIDGE_OT_reattach,
             RURIBRIDGE_OT_locate_painter, RURIBRIDGE_OT_locate_cascadeur,

@@ -30,28 +30,32 @@ Cascadeur 收一份生成的入口脚本。一份代码,不复制、不分叉。
 
 **什么都不会自己发生。** 每一次过桥都是有人在某一边按了按钮。
 
-Blender:3D 视图 N 面板 → `RuriBridge` 页
+两边的按钮完全对称:同一件事从哪边按,结果都一样,只是一边叫推送、另一边叫拉取。
+**选中**在 Painter 里是当前选中的纹理集,在 Blender 里是活动物体的活动材质画进的那个纹理集;
+**全部**是每个纹理集。
 
-- **Send Mesh**:把绘制表面发给 Painter。Painter 没开工程就用它新建一个;开着就换网格,
-  每个纹理集的图层一层不动。这一发会在已经画过的工程里**新建纹理集**时先问一句:新集上什么都没画,
-  如果是某个材质改画进了新集,它的面在原来那个集里的画就不再显示(图层还在)。
+| 做什么 | Blender | Painter |
+|---|---|---|
+| 网格:只换网格本身 | Update Mesh | Update Mesh |
+| Blender 的材质 → Painter(着色器、参数、贴图) | Push All / Selected Material | Pull All / Selected Material |
+| Painter 画的 → Blender 的材质 | Pull All / Selected Material | Push All / Selected Material |
+| Painter 选中的那一层 → Blender(只是图片) | Pull Selected Layer | Push Selected Layer |
+
+- **Update Mesh**:把绘制表面发给 Painter。Painter 没开工程就用它新建一个;开着就换网格,
+  每个纹理集的图层一层不动,别的什么都不改。这一发会在已经画过的工程里**新建纹理集**时先问一句:
+  新集上什么都没画,如果是某个材质改画进了新集,它的面在原来那个集里的画就不再显示(图层还在)。
   没有材质的面不发 —— 桥不替你建材质(建出来的名字没人起过,还会改掉物体的渲染);面板列出这些物体。
-- **Sync Material**:把每个纹理集的着色器和参数交给 Painter(见下文「材质:身份决定搬多少」)。
-  只给着色器和参数,不给贴图;要连贴图一起,在 Painter 里按 Sync All Material / Sync Selected Material。
-- **Pull Textures**:请 Painter 把所有纹理集导出到这个 .blend 的 `textures` 文件夹,并接进
-  画进那个纹理集的材质里;生成材质按它自己着色器的贴图布局重新拼好再换进它的记录(见下文「贴图」)。
-- **Pull Selected Layer**:只要 Painter 里选中的那一层,单独导出。进来的是图片,不接进材质 ——
-  一层不是材质该显示的全部,接进去就把完整结果顶掉了。
-- **一张表**:每个材质画进哪个纹理集,两边都能改。
+- **Blender 的材质 → Painter**:纹理集换上画它的那个材质的着色器,写入参数;着色器身份相同
+  (同一代生成器)时连材质的贴图一起铺好(见下文「材质:身份决定搬多少」)。没有图层的纹理集
+  (比如补回一张脸)就靠这一下初始化,然后在上面补画。
+- **Painter 画的 → Blender 的材质**:导出到 .blend 旁边的 `textures` 文件夹,接进画进那个纹理集的
+  材质里;生成材质按它自己着色器的贴图布局重新拼好再换进它的记录(见下文「贴图」)。
+- **选中的那一层**:单独导出,进来的是图片,不接进材质 —— 一层不是材质该显示的全部,接进去就把
+  完整结果顶掉了。
+- **一张表**(Blender 面板):每个材质画进哪个纹理集,两边都能改。
 
-Painter:停靠面板 `RuriBridge`
+Painter 另有:
 
-- **Update Mesh**:只更新网格本身 —— 请 Blender 发表面过来换进去,图层不动,别的什么都不改
-  (和 Blender 那边按 Send Mesh 一样)。
-- **Sync All Material** / **Sync Selected Material**:请 Blender 交出画纹理集的材质 —— 着色器、参数,身份相同时连贴图
-  一起(见下文)。All 是这个工程里每个纹理集;Selected **只管当前选中的那一个**,别的一个都不碰。
-- **Send All Textures** / **Send Selected Textures**:把每个纹理集 / 只把选中的那个纹理集导出到 Blender
-  文档的 `textures` 文件夹,Blender 把它们接进画那些纹理集的材质。
 - **Pull a Blender image into the selected layer**:把 Blender 材质用到的一张图放进选中的图层,
   作为遮罩或参考填充。Blender 没有图层,所以从那边来的东西只可能是这两种形状,而且只碰选中的那一层。
   选中的接不了(没选、选了好几个、参考却选了绘画层)就**新建一个填充层**装它,放在选中层上方
@@ -110,8 +114,8 @@ Painter:停靠面板 `RuriBridge`
 货架上的着色器和清单是一个产物,由导入器一起同步进货架;只同步了着色器、清单还是旧的,身份就对不上,
 桥会退回只写同名参数并说明原因。
 
-**从 Painter 要(Sync All Material / Sync Selected Material)、且身份相同时,材质的贴图也一起过来**(也是给新纹理集
-打底的办法,比如补回一张脸用 Sync Selected Material 只动那一个集):清单的 `inputs` 写着
+**Blender 的材质 → Painter 时,身份相同的话材质的贴图也一起过来**(也是给新纹理集打底的办法,
+比如补回一张脸,选中那一个集推送 / 拉取):清单的 `inputs` 写着
 着色器的每个输入是材质哪张贴图的哪几个分量、过什么运算 —— 导入器把游戏材质导进 Painter 读的也是这张表。
 Painter 的 Python 做不了逐像素运算,所以按表开单请 Blender 切图(分量拷贝、取反、Unity 法线解包),
 回来的图这样落地,**一层不删**:

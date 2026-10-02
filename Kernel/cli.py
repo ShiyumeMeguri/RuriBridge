@@ -318,15 +318,15 @@ def _body(*lines):
 def command_publish_mesh(arguments):
     lines = ["generation = module.send_mesh(bpy.context)",
              "print({0!r}, 'published', generation.number)".format(MARKER)]
-    if arguments.then_pull_textures:
-        lines += ["generation = module.pull_textures()",
+    if arguments.then_pull_material:
+        lines += ["generation = module.pull_material()",
                   "print({0!r}, 'requested', generation.number)".format(MARKER)]
     return _run_blender(arguments, _body(*lines))
 
 
 def command_request_export(arguments):
     return _run_blender(arguments, _body(
-        "generation = module.pull_textures()",
+        "generation = module.pull_material()",
         "print({0!r}, 'requested', generation.number)".format(MARKER)))
 
 
@@ -349,10 +349,10 @@ def command_shaders(arguments):
     return 0
 
 
-def command_pull_textures(arguments):
+def command_pull_material(arguments):
     """Ask Painter for its textures and wait for them to land in the materials."""
     lines = [
-        "module.{0}()".format("pull_selected_layer" if arguments.layer else "pull_textures"),
+        "module.{0}()".format("pull_selected_layer" if arguments.layer else "pull_material"),
         "deadline = time.time() + {0}".format(arguments.timeout),
         "received = []",
         "while time.time() < deadline and not received:",
@@ -556,7 +556,7 @@ def build_parser():
 
     publish = subparsers.add_parser("publish-mesh")
     add_blender_arguments(publish)
-    publish.add_argument("--then-pull-textures", action="store_true",
+    publish.add_argument("--then-pull-material", action="store_true",
                          help="ask for the textures right behind the mesh, from the same "
                               "Blender run, so both reach Painter in one batch")
     publish.set_defaults(handler=command_publish_mesh)
@@ -569,13 +569,13 @@ def build_parser():
     shaders.add_argument("--name", default=None, help="only parameters containing this text")
     shaders.set_defaults(handler=command_shaders)
 
-    pull = subparsers.add_parser("pull-textures")
+    pull = subparsers.add_parser("pull-material")
     add_blender_arguments(pull)
     pull.add_argument("--layer", action="store_true",
                       help="only the layer selected in Painter")
     pull.add_argument("--timeout", type=float, default=180.0)
     pull.add_argument("--save", action="store_true", help="save the blend after ingesting")
-    pull.set_defaults(handler=command_pull_textures)
+    pull.set_defaults(handler=command_pull_material)
 
     install = subparsers.add_parser("install")
     install.add_argument("--cascadeur",

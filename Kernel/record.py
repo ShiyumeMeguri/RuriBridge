@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 5
+FORMAT_VERSION = 6
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -243,22 +243,18 @@ def presence(source, document, texture_sets=(), materials=(), textures_directory
 
 def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
             vocabulary_by_texture_set=None, shader_name_by_texture_set=None,
-            lookups_by_texture_set=None, identity_by_texture_set=None, requested=()):
-    """The current value of every shading parameter, per Texture Set.
+            lookups_by_texture_set=None, identity_by_texture_set=None):
+    """The current value of every shading parameter, per Texture Set synced.
 
     State and not an event, so it rides in the control block: a value that has
-    already been replaced has nothing to say.
+    already been replaced has nothing to say. It names the Texture Sets being synced
+    -- every one, or the one selected on whichever side asked -- and nothing else.
 
     ``identity_by_texture_set`` is the shader's own identity -- the one hash its
     generator stamped into every application's copy of it. Two equal identities
-    mean the two sides run the same shader, so every value crosses as it is; two
-    different ones mean only the names both shaders share can be trusted to mean
-    the same thing.
-
-    ``requested`` names the Texture Sets the reader asked about -- every one it has, or
-    the one selected there -- when this is the answer: the statement is then theirs
-    alone, and the reader stands their textures up too. Empty when the material's side stated its
-    shading of its own accord, which is every Texture Set's, and only the shading.
+    mean the two sides run the same shader, so every value crosses as it is and the
+    material's textures follow; two different ones mean only the names both shaders
+    share can be trusted to mean the same thing.
     """
     record = _base("shade", source)
     record.update({
@@ -268,7 +264,6 @@ def shading(source, values_by_texture_set, shader_url_by_texture_set=None,
         "shader_name_by_texture_set": shader_name_by_texture_set or {},
         "lookups_by_texture_set": lookups_by_texture_set or {},
         "identity_by_texture_set": identity_by_texture_set or {},
-        "requested": sorted(requested),
     })
     return record
 
