@@ -214,6 +214,17 @@ def shaders_by_texture_set(rows):
             for texture_set, row in speakers(rows).items()}
 
 
+def ask_for_material():
+    """Ask Blender for the material that paints the Texture Set selected here, and for
+    nothing else. Returns that Texture Set's name."""
+    texture_set = substance_painter.textureset.get_active_stack().material().name
+    if texture_set not in speakers(blender_state().get("materials") or []):
+        raise RuntimeError("no Blender material with a generated shader paints into "
+                           "{0}".format(texture_set))
+    _ask(record_module.ASK_FOR_SHADING, texture_sets=[texture_set])
+    return texture_set
+
+
 def ask_for_inputs(texture_sets):
     """Ask Blender to cut its materials' textures into what these Texture Sets' shader
     reads -- the Texture Sets that now run the very shader their material was made for.
@@ -418,7 +429,10 @@ class RuriBridgePanel(QtWidgets.QWidget):
         layout.addWidget(self.table, 1)
 
         self.mesh_button = QtWidgets.QPushButton("Ask Blender For The Mesh")
-        self.material_button = QtWidgets.QPushButton("Ask Blender For The Material")
+        self.material_button = QtWidgets.QPushButton("Ask Blender For The Selected Set's Material")
+        self.material_button.setToolTip(
+            "Put the selected Texture Set on the shader of the Blender material that paints "
+            "it, with that material's values and textures. No other Texture Set is touched")
         self.textures_button = QtWidgets.QPushButton("Send Textures To Blender")
         layout.addWidget(self.mesh_button)
         layout.addWidget(self.material_button)
@@ -562,11 +576,11 @@ class RuriBridgePanel(QtWidgets.QWidget):
 
     def _ask_for_material(self):
         try:
-            _ask(record_module.ASK_FOR_SHADING)
+            texture_set = ask_for_material()
         except Exception as error:
             self.set_status("could not ask: {0}".format(error))
             return
-        self.set_status("asked Blender for the material")
+        self.set_status("asked Blender for the material of {0}".format(texture_set))
 
     def _send_textures(self):
         try:
@@ -601,7 +615,8 @@ _presence_due = [False]
 
 
 def apply_shading(record):
-    """Put Blender's shading on the Texture Sets it names. Returns one line about it."""
+    """Put Blender's shading on the Texture Sets it names, and stand up the textures of
+    the ones asked about from here. Returns one line about it."""
     if not substance_painter.project.is_open():
         return "a material arrived and no project is open"
     report = shader_state.apply_by_texture_set(
@@ -624,7 +639,7 @@ def apply_shading(record):
         LOG.info("%s takes same-named parameters only: %s", texture_set, why)
     for texture_set, problems in sorted(report["mismatched"].items()):
         LOG.warning("%s: not written, %s", texture_set, "; ".join(problems))
-    asked = ask_for_inputs(report["same_shader"])
+    asked = ask_for_inputs([one for one in report["same_shader"] if one in record["requested"]])
     if asked:
         parts.append("asked Blender for the textures of {0} Texture Set(s)".format(asked))
     return "; ".join(parts)

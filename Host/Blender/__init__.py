@@ -303,24 +303,32 @@ def send_mesh(context):
     return generation
 
 
-def sync_material(context):
-    """State every Texture Set's shading on the session: its shader, that shader's
-    identity, and the row of the material that speaks for it.
+def sync_material(context, requested=()):
+    """State Texture Sets' shading on the session: the shader, that shader's identity,
+    and the row of the material that speaks for each.
 
     Painter decides what it can take: the same shader by identity takes the whole
     row, any other shader only the parameters both name.
+
+    ``requested`` is what Painter asked about -- the Texture Set selected there -- and
+    the statement is then that set's alone, marked as asked for, so Painter stands its
+    textures up as well. Stated from here, it is every Texture Set's shading and only that.
     """
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
     rows = mesh_publish.shading_rows(mesh_publish.scope(context.view_layer))
+    if requested:
+        rows = {texture_set: row for texture_set, row in rows.items() if texture_set in requested}
     if not rows:
-        raise RuntimeError("no material painting into a Texture Set declares its shading")
+        raise RuntimeError("no material painting into {0} declares its shading".format(
+            ", ".join(sorted(requested)) if requested else "a Texture Set"))
     CONNECTION.session.writer(topic_module.SHADING).write(record_module.shading(
         HOST.name,
         {texture_set: row["parameters"] for texture_set, row in rows.items()},
         vocabulary_by_texture_set={texture_set: row["shader"] for texture_set, row in rows.items()},
         shader_name_by_texture_set={texture_set: row["name"] for texture_set, row in rows.items()},
-        identity_by_texture_set={texture_set: row["identity"] for texture_set, row in rows.items()}))
+        identity_by_texture_set={texture_set: row["identity"] for texture_set, row in rows.items()},
+        requested=requested))
     return rows
 
 
@@ -417,7 +425,7 @@ def _receive(topic, generation):
         if asked == record_module.ASK_TO_BIND:
             return bind(generation.record["texture_set"], generation.record["material"])
         if asked == record_module.ASK_FOR_SHADING:
-            return sorted(sync_material(bpy.context))
+            return sorted(sync_material(bpy.context, generation.record["texture_sets"]))
         if asked == record_module.ASK_FOR_INPUTS:
             return material_inputs.bake(
                 CONNECTION.session.publisher(topic_module.INPUTS), generation.record,
@@ -641,7 +649,8 @@ class RURIBRIDGE_OT_sync_material(bpy.types.Operator):
     bl_label = "Sync Material"
     bl_description = ("Put each Texture Set's shader and parameters on it in Painter. The "
                       "same shader by identity takes the whole row; another shader only the "
-                      "parameters both name")
+                      "parameters both name. Textures come over only when Painter asks for "
+                      "the material of the Texture Set selected there")
 
     def execute(self, context):
         try:
