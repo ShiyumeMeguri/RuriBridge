@@ -59,6 +59,9 @@ PRESENCE_TICKS = 4
 
 PEER = peers_module.BLENDER
 PAINTER = peers_module.SUBSTANCE
+#: The add-on's own module, two packages above this driver. Blender files an add-on's
+#: preferences under it; a class keyed by this driver's package is never attached.
+ADDON = __package__.rsplit(".", 2)[0]
 
 
 class BlenderHost(host_port.Host):
@@ -152,17 +155,15 @@ def say(message):
 # -- what this document has -------------------------------------------------------
 
 def preferences():
-    entry = bpy.context.preferences.addons.get(__package__)
-    return entry.preferences if entry else None
+    """What is set for this add-on on this computer."""
+    return bpy.context.preferences.addons[ADDON].preferences
 
 
 def textures_directory():
-    """The document's textures folder, or empty while the document has no home."""
+    """The document's textures folder, or empty while the document has never been saved."""
     if not bpy.data.filepath:
         return ""
-    stored = preferences()
-    folder = stored.textures_folder if stored is not None else ""
-    return bpy.path.abspath("//" + folder) if folder else ""
+    return bpy.path.abspath("//" + preferences().textures_folder)
 
 
 def _image_path(image):
@@ -359,8 +360,8 @@ def push_shader(context, texture_sets=None):
 def _textures_folder():
     directory = textures_directory()
     if not directory:
-        raise RuntimeError("save the .blend first: its textures folder is where "
-                           "Painter writes them")
+        raise RuntimeError("this .blend has never been saved, so it has no textures folder "
+                           "beside it for Painter to write into")
     return directory
 
 
@@ -597,14 +598,14 @@ def _stop_timer():
 def painter_executable():
     """The configured path, or whatever Windows recorded about the install."""
     stored = preferences()
-    if stored is not None and stored.painter_executable:
+    if stored.painter_executable:
         return bpy.path.abspath(stored.painter_executable)
     return painter_host.discover_executable()
 
 
 def remember_painter_executable(path):
     stored = preferences()
-    if stored is not None and path and not stored.painter_executable:
+    if path and not stored.painter_executable:
         stored.painter_executable = path
         LOG.info("learned where Painter lives: %s", path)
 
@@ -624,14 +625,13 @@ def _start_painter():
 
 def _cascadeur_hint():
     stored = preferences()
-    return (bpy.path.abspath(stored.cascadeur_executable)
-            if stored is not None and stored.cascadeur_executable else "")
+    return bpy.path.abspath(stored.cascadeur_executable) if stored.cascadeur_executable else ""
 
 
 class RuriBridgePreferences(bpy.types.AddonPreferences):
     """What is true of this computer, not of the file being worked on."""
 
-    bl_idname = __package__
+    bl_idname = ADDON
 
     painter_executable: bpy.props.StringProperty(
         name="Painter",
