@@ -444,6 +444,85 @@ def follow_rename(material_name):
     refresh_view(force=True)
 
 
+# -- where a material nobody generated takes Painter's maps --------------------------------
+
+#: What a node or a lane is pointed at to take nothing from Painter. Never a map's name:
+#: those come from file names, which keep no lone separator.
+NOTHING = "-"
+
+
+def painter_maps(texture_set):
+    """The maps Painter says a whole export of this Texture Set writes, and why it cannot
+    say when it cannot."""
+    if not painter_is_attached():
+        return [], "Painter is not attached, so its maps are not known"
+    for entry in painter_state().get("texture_sets") or []:
+        if entry["name"] == texture_set:
+            return list(entry.get("maps") or []), str(entry.get("maps_refused") or "")
+    return [], "Painter has no Texture Set {0}".format(texture_set)
+
+
+def texture_nodes(material):
+    """The material's Image Texture nodes, the textures a table can point at."""
+    if material.node_tree is None:
+        return []
+    return [node for node in material.node_tree.nodes if node.type == "TEX_IMAGE"]
+
+
+def _material(material_name):
+    material = bpy.data.materials.get(material_name)
+    if material is None:
+        raise RuntimeError("there is no material called {0!r} here".format(material_name))
+    return material
+
+
+def _table_to_edit(material):
+    """The material's table; the first time it is edited, the one that says what landing
+    by name already does, so taking one node in hand changes nothing about the others."""
+    table = texture_ingest.mapping_of(material)
+    if table:
+        return table
+    maps, _why = painter_maps(mesh_publish.texture_set_of(material))
+    return {node_name: slot_compose.whole(map_name)
+            for node_name, map_name in texture_ingest.landing_by_name(material, maps).items()}
+
+
+def map_texture(material_name, node_name, lane, choice):
+    """Point a texture node at a Painter map whole, or one of its lanes at one component
+    of a map; ``NOTHING`` takes nothing there."""
+    material = _material(material_name)
+    table = _table_to_edit(material)
+    if lane < 0:
+        table[node_name] = ([slot_compose.keep_lane() for _ in slot_compose.LANES]
+                            if choice == NOTHING else slot_compose.whole(choice))
+    else:
+        lanes = table.get(node_name) or [slot_compose.keep_lane() for _ in slot_compose.LANES]
+        if choice == NOTHING:
+            lanes[lane] = slot_compose.keep_lane()
+        else:
+            map_name, component = choice.rsplit(":", 1)
+            lanes[lane] = {"map": map_name, "component": int(component), "invert": False}
+        table[node_name] = lanes
+    texture_ingest.set_mapping(material, table)
+
+
+def invert_lane(material_name, node_name, lane):
+    """Take one minus what a lane takes, or stop doing so."""
+    material = _material(material_name)
+    table = _table_to_edit(material)
+    lanes = table.get(node_name)
+    if not lanes or not lanes[lane]["map"]:
+        raise RuntimeError("lane {0} of {1} takes nothing to invert".format(
+            slot_compose.LANES[lane], node_name))
+    lanes[lane]["invert"] = not lanes[lane]["invert"]
+    texture_ingest.set_mapping(material, table)
+
+
+def reset_mapping(material_name):
+    """Drop the material's table: Painter's maps land in the nodes named after them again."""
+    texture_ingest.set_mapping(_material(material_name), {})
+
+
 # -- what arrives -------------------------------------------------------------------------
 
 def _receive(topic, generation):
@@ -491,7 +570,7 @@ def _describe(report):
         if stood_up:
             took = {material: slots for entry in stood_up
                     for material, slots in entry["stood_up"]["taken"].items()}
-            parts.append("{0} generated material(s) took {1} texture(s) from Painter".format(
+            parts.append("{0} material(s) took {1} texture(s) from Painter".format(
                 len(took), sum(len(slots) for slots in took.values())))
         flat = [entry["texture_set"] for entry in stood_up if entry["stood_up"]["flat"]]
         if flat:
@@ -889,6 +968,105 @@ class RURIBRIDGE_OT_follow_rename(bpy.types.Operator):
         return {"FINISHED"}
 
 
+#: The texture nodes whose four lanes are open in Pull Mapping, by (material, node): how
+#: the panel is folded, not a fact of the document, so it is written nowhere.
+_open_lanes = set()
+_MAP_ITEMS = []
+
+
+def _map_items(operator, _context):
+    """Painter's maps for the Texture Set the operator's material paints into: whole maps
+    for a node, map components for a lane. Kept alive on purpose (see ``_material_items``)."""
+    material = bpy.data.materials.get(operator.material)
+    maps = painter_maps(mesh_publish.texture_set_of(material))[0] if material is not None else []
+    if operator.lane < 0:
+        items = [(NOTHING, "Not pulled", "This texture takes nothing from Painter")]
+        items.extend((name, name, "All of {0}, unchanged".format(name)) for name in maps)
+    else:
+        items = [(NOTHING, "Keep its own", "This lane keeps what the texture has there")]
+        items.extend(("{0}:{1}".format(name, index), "{0}.{1}".format(name, letter),
+                      "Lane {0} of {1}".format(letter, name))
+                     for name in maps for index, letter in enumerate(slot_compose.LANES))
+    _MAP_ITEMS[:] = items
+    return _MAP_ITEMS
+
+
+class _OnTextureNode:
+    material: bpy.props.StringProperty()
+    node: bpy.props.StringProperty()
+    lane: bpy.props.IntProperty(default=-1)
+
+
+class RURIBRIDGE_OT_map_texture(_OnTextureNode, bpy.types.Operator):
+    bl_idname = "ruri_bridge.map_texture"
+    bl_label = "Take From Painter"
+    bl_description = "Choose which of Painter's maps this texture takes, or this lane of it"
+    bl_property = "choice"
+
+    choice: bpy.props.EnumProperty(items=_map_items)
+
+    def invoke(self, context, event):
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        try:
+            map_texture(self.material, self.node, self.lane, self.choice)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_invert_lane(_OnTextureNode, bpy.types.Operator):
+    bl_idname = "ruri_bridge.invert_lane"
+    bl_label = "Invert Lane"
+    bl_description = "Take one minus what this lane takes, as smoothness is of roughness"
+
+    def execute(self, context):
+        try:
+            invert_lane(self.material, self.node, self.lane)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_open_lanes(_OnTextureNode, bpy.types.Operator):
+    bl_idname = "ruri_bridge.open_lanes"
+    bl_label = "Lanes"
+    bl_description = "Show or hide this texture's four lanes"
+
+    def execute(self, context):
+        key = (self.material, self.node)
+        if key in _open_lanes:
+            _open_lanes.discard(key)
+        else:
+            _open_lanes.add(key)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class RURIBRIDGE_OT_reset_mapping(bpy.types.Operator):
+    bl_idname = "ruri_bridge.reset_mapping"
+    bl_label = "Land By Name"
+    bl_description = ("Drop this material's table: Painter's maps land in the texture nodes "
+                      "named after them again, and the missing ones are made")
+
+    material: bpy.props.StringProperty()
+
+    def execute(self, context):
+        try:
+            reset_mapping(self.material)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        _tag_redraw()
+        return {"FINISHED"}
+
+
 class RURIBRIDGE_OT_start_painter(bpy.types.Operator):
     bl_idname = "ruri_bridge.start_painter"
     bl_label = "Start Painter"
@@ -1139,6 +1317,103 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
             layout.label(text=_status[0], icon="INFO")
 
 
+def _lane_text(lane):
+    if not lane["map"]:
+        return "keep"
+    text = "{0}.{1}".format(lane["map"], slot_compose.LANES[lane["component"]])
+    return "1 - " + text if lane["invert"] else text
+
+
+def _node_text(lanes):
+    whole_map = slot_compose.whole_map_of(lanes)
+    if whole_map:
+        return whole_map
+    if not any(lane["map"] for lane in lanes):
+        return "not pulled"
+    return "  ".join("{0} {1}".format(letter, _lane_text(lane))
+                     for letter, lane in zip(slot_compose.LANES, lanes) if lane["map"])
+
+
+def _on_node(operator, material, node, lane=-1):
+    operator.material, operator.node, operator.lane = material.name, node.name, lane
+
+
+def _draw_mapping(layout, material, texture_set):
+    """One material's table: each texture node, what it takes, and its lanes when open."""
+    box = layout.box()
+    header = box.row(align=True)
+    header.label(text="{0} -> {1}".format(material.name, texture_set), icon="MATERIAL")
+    try:
+        table = texture_ingest.mapping_of(material)
+    except RuntimeError as error:
+        box.label(text=str(error), icon="ERROR")
+        header.operator(RURIBRIDGE_OT_reset_mapping.bl_idname, text="",
+                        icon="LOOP_BACK").material = material.name
+        return
+    if table:
+        header.operator(RURIBRIDGE_OT_reset_mapping.bl_idname, text="",
+                        icon="LOOP_BACK").material = material.name
+    maps, why = painter_maps(texture_set)
+    if why:
+        box.label(text=why, icon="INFO")
+    landing = {} if table else texture_ingest.landing_by_name(material, maps)
+    nodes = texture_nodes(material)
+    if not nodes:
+        box.label(text="No Image Texture node: maps land by name, in nodes made for them",
+                  icon="INFO")
+    for node in nodes:
+        if node.name in table:
+            lanes = table[node.name]
+        elif node.name in landing:
+            lanes = slot_compose.whole(landing[node.name])
+        else:
+            lanes = [slot_compose.keep_lane() for _ in slot_compose.LANES]
+        opened = (material.name, node.name) in _open_lanes
+        line = box.row(align=True)
+        _on_node(line.operator(RURIBRIDGE_OT_open_lanes.bl_idname, text="", emboss=False,
+                               icon="DOWNARROW_HLT" if opened else "RIGHTARROW"), material, node)
+        line.label(text=node.label or node.name, icon="IMAGE_DATA")
+        text = _node_text(lanes)
+        if node.name in landing:
+            text = "by name: " + text
+        _on_node(line.operator(RURIBRIDGE_OT_map_texture.bl_idname, text=text,
+                               icon="DOWNARROW_HLT"), material, node)
+        if not opened:
+            continue
+        for index, letter in enumerate(slot_compose.LANES):
+            lane_line = box.row(align=True)
+            lane_line.separator(factor=3.0)
+            lane_line.label(text=letter)
+            _on_node(lane_line.operator(RURIBRIDGE_OT_map_texture.bl_idname,
+                                        text=_lane_text(lanes[index])), material, node, index)
+            _on_node(lane_line.operator(RURIBRIDGE_OT_invert_lane.bl_idname, text="",
+                                        icon="ARROW_LEFTRIGHT", depress=lanes[index]["invert"]),
+                     material, node, index)
+
+
+class RURIBRIDGE_PT_pull_mapping(bpy.types.Panel):
+    bl_label = "Pull Mapping"
+    bl_idname = "RURIBRIDGE_PT_pull_mapping"
+    bl_parent_id = "RURIBRIDGE_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "RuriBridge"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        rows = [row for row in _view["materials"] if row["texture_set"]]
+        generated = [row for row in rows if row["shader"]]
+        if generated:
+            layout.label(text="{0} generated material(s) take Painter's maps one to one".format(
+                len(generated)), icon="CHECKMARK")
+        for row in rows:
+            material = bpy.data.materials.get(row["name"])
+            if row["shader"] or material is None:
+                continue
+            _draw_mapping(layout, material, row["texture_set"])
+
+
 class RURIBRIDGE_PT_cascadeur(bpy.types.Panel):
     bl_label = "Cascadeur"
     bl_idname = "RURIBRIDGE_PT_cascadeur"
@@ -1159,10 +1434,12 @@ _CLASSES = (RuriBridgePreferences,
             RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_push_shader, RURIBRIDGE_OT_pull_shader,
             RURIBRIDGE_OT_push_textures, RURIBRIDGE_OT_pull_textures,
             RURIBRIDGE_OT_pull_selected_layer, RURIBRIDGE_OT_bind, RURIBRIDGE_OT_exclude,
-            RURIBRIDGE_OT_follow_rename, RURIBRIDGE_OT_start_painter, RURIBRIDGE_OT_reattach,
+            RURIBRIDGE_OT_follow_rename, RURIBRIDGE_OT_map_texture, RURIBRIDGE_OT_invert_lane,
+            RURIBRIDGE_OT_open_lanes, RURIBRIDGE_OT_reset_mapping,
+            RURIBRIDGE_OT_start_painter, RURIBRIDGE_OT_reattach,
             RURIBRIDGE_OT_locate_painter, RURIBRIDGE_OT_locate_cascadeur,
             RURIBRIDGE_OT_send_animation, RURIBRIDGE_OT_fetch_animation,
-            RURIBRIDGE_PT_panel, RURIBRIDGE_PT_cascadeur)
+            RURIBRIDGE_PT_panel, RURIBRIDGE_PT_pull_mapping, RURIBRIDGE_PT_cascadeur)
 
 
 def register():

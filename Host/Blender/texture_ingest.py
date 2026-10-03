@@ -15,10 +15,17 @@ gamma curve.
 Which materials a Texture Set belongs to is the material's own statement (see
 ``mesh_publish.texture_set_of``): every material that paints into it receives
 its channels, which is what one material split in two across one UV layout
-needs. Inside a material, a channel lands in the Image Texture node labelled
-after it, or in one created for it and wired to the shader input of that name. A
-generated material takes no loose channels: its own textures are stood up from them
-and go into its record (see ``slot_compose``).
+needs. How they land inside it:
+
+* a generated material takes no loose channels: its own textures are stood up from
+  them, the way its shader's manifest reads them, and go into its record (see
+  ``slot_compose``) -- one to one, with no table;
+* a material that keeps a table (``CHANNEL_MAP_PROPERTY``, edited in the panel's
+  Pull Mapping) takes exactly what the table says, texture node by texture node and
+  lane by lane -- what a hand-made shader with a packed mask needs, whatever its
+  workflow calls things;
+* any other material takes a channel into the Image Texture node labelled after it,
+  or into one created for it and wired to the shader input of that name.
 """
 
 from __future__ import annotations
@@ -33,6 +40,11 @@ from . import mesh_publish, slot_compose
 
 LOG = logger("blender.textures")
 
+#: A material's own table of where Painter's maps land: ``{Image Texture node name:
+#: [lane, lane, lane, lane]}``, lane by lane R, G, B, A of the node's texture. A lane is
+#: ``{"map": name, "component": 0-3, "invert": bool}`` -- that component of that exported
+#: map, or one minus it -- or ``{"map": ""}``, which keeps what the texture has there. A
+#: key written into .blend files, so it never changes spelling.
 CHANNEL_MAP_PROPERTY = "ruri_bridge_channels"
 UDIM_TOKEN = "<UDIM>"
 _TILE_PATTERN = re.compile(r"^(?P<stem>.*?)(?P<tile>1[0-9]{3})(?P<suffix>\.[^.]+)$")
@@ -147,27 +159,66 @@ def _connect(tree, node, socket):
     tree.links.new(node.outputs["Color"], socket)
 
 
-def channel_map_of(material):
-    """The material's own say in where a channel belongs, if it has one."""
+def _lane(material, lane):
+    if not hasattr(lane, "get"):
+        raise RuntimeError("{0}'s {1} holds a lane that is not a mapping; set its Pull Mapping "
+                           "again".format(material.name, CHANNEL_MAP_PROPERTY))
+    map_name = str(lane.get("map", ""))
+    if not map_name:
+        return slot_compose.keep_lane()
+    component = int(lane.get("component", 0))
+    if not 0 <= component < len(slot_compose.LANES):
+        raise RuntimeError("{0}'s {1} takes component {2} of {3}, which has none".format(
+            material.name, CHANNEL_MAP_PROPERTY, component, map_name))
+    return {"map": map_name, "component": component, "invert": bool(lane.get("invert", False))}
+
+
+def mapping_of(material):
+    """The material's own table, ``{node name: [lane] * 4}``; empty when it keeps none."""
     declared = material.get(CHANNEL_MAP_PROPERTY)
-    if not declared:
+    if declared is None:
         return {}
-    try:
-        return {_comparable(key): str(value) for key, value in dict(declared).items()}
-    except (TypeError, ValueError):
-        LOG.warning("%r carries a %s that is not a mapping; ignoring it",
-                    material.name, CHANNEL_MAP_PROPERTY)
-        return {}
+    table = {}
+    for node_name, lanes in dict(declared).items():
+        if (isinstance(lanes, str) or not hasattr(lanes, "__len__")
+                or len(lanes) != len(slot_compose.LANES)):
+            raise RuntimeError("{0}'s {1} is not four lanes per texture node; set its Pull "
+                               "Mapping again".format(material.name, CHANNEL_MAP_PROPERTY))
+        table[str(node_name)] = [_lane(material, lane) for lane in lanes]
+    return table
+
+
+def set_mapping(material, table):
+    """Write the material's table; an empty one removes it, and channels land by name again."""
+    if not table:
+        if CHANNEL_MAP_PROPERTY in material.keys():
+            del material[CHANNEL_MAP_PROPERTY]
+        return
+    material[CHANNEL_MAP_PROPERTY] = {node_name: [dict(lane) for lane in lanes]
+                                      for node_name, lanes in table.items()}
+
+
+def landing_by_name(material, map_names):
+    """Which texture node a map lands in when the material keeps no table: the node
+    labelled after it. ``{node name: map name}``."""
+    by_comparable = {_comparable(name): name for name in map_names}
+    landing = {}
+    if material.node_tree is None:
+        return landing
+    for node in material.node_tree.nodes:
+        if node.type == "TEX_IMAGE" and _comparable(node.label) in by_comparable:
+            landing[node.name] = by_comparable[_comparable(node.label)]
+    return landing
 
 
 def bind_into_material(material, images_by_channel):
-    """Give every received channel a home in this material, creating what is missing.
+    """Give every received channel a home in a material that keeps no table, creating
+    what is missing.
 
-    In order of how much the material has already said: the mapping it declares,
-    then a texture node already labelled with the channel's name, then a node
-    created for it and wired to the shader input of that name. A channel that
-    matches none of them still arrives as a labelled node -- delivered and
-    waiting, rather than silently absent.
+    A texture node already labelled with the channel's name takes it; otherwise a node
+    is created for it and wired to the shader input of that name. A channel that
+    matches neither still arrives as a labelled node -- delivered and waiting, rather
+    than silently absent.
     """
     if not material.use_nodes or material.node_tree is None:
         material.use_nodes = True
@@ -181,19 +232,12 @@ def bind_into_material(material, images_by_channel):
                 "label cannot name one of them".format(by_comparable[key][0], channel))
         by_comparable[key] = (channel, image)
 
-    declared = channel_map_of(material)
     landed = 0
     placed = set()
     for node in tree.nodes:
         if node.type != "TEX_IMAGE":
             continue
-        wanted = _comparable(node.label)
-        entry = by_comparable.get(wanted)
-        if entry is None:
-            for channel_key, target in declared.items():
-                if _comparable(target) == wanted and channel_key in by_comparable:
-                    entry = by_comparable[channel_key]
-                    break
+        entry = by_comparable.get(_comparable(node.label))
         if entry is None:
             continue
         node.image = entry[1]
@@ -209,10 +253,6 @@ def bind_into_material(material, images_by_channel):
     for key, (channel, image) in sorted(by_comparable.items()):
         if channel in placed:
             continue
-        if key in declared:
-            socket_name = _comparable(declared[key])
-            if socket_name in inputs_by_comparable:
-                key = socket_name
         node = tree.nodes.new("ShaderNodeTexImage")
         node.label = channel
         node.name = channel
@@ -247,6 +287,7 @@ def ingest(generation):
         materials = [] if layer else materials_painting(name)
         placed = {"landed": 0, "created": 0, "connected": 0}
         generated = []
+        tables = {}
         for material in materials:
             if material.get(mesh_publish.SHADING_DECLARATION) is not None:
                 # A generated material's images are named by its own record and
@@ -255,17 +296,24 @@ def ingest(generation):
                 # from the maps and go into that record instead.
                 generated.append(material)
                 continue
+            table = mapping_of(material)
+            if table:
+                tables[material] = table
+                continue
             for key, value in bind_into_material(material, images).items():
                 placed[key] += value
-        stood_up = None
+        parts = []
         if generated:
             if "slots" in texture_set:
-                stood_up = slot_compose.compose(texture_set, directory, generated,
-                                                mesh_publish.SHADING_DECLARATION)
+                parts.append(slot_compose.compose(texture_set, directory, generated,
+                                                  mesh_publish.SHADING_DECLARATION))
             else:
-                stood_up = {"taken": {}, "flat": False, "refused": dict(
+                parts.append({"taken": {}, "flat": False, "refused": dict(
                     texture_set.get("slots_refused")
-                    or {"": "Painter sent no recipe for their shader"})}
+                    or {"": "Painter sent no recipe for their shader"})})
+        if tables:
+            parts.append(slot_compose.compose_mapped(texture_set, directory, tables, images))
+        stood_up = slot_compose.merged(parts) if parts else None
         if not materials and not layer:
             LOG.warning("Texture Set %r has no material here that paints into it; its %d "
                         "channel(s) are in the textures folder and nothing shows them",
@@ -278,6 +326,7 @@ def ingest(generation):
             "images": sorted(image.name for image in images.values()),
             "placed": placed,
             "generated": [material.name for material in generated],
+            "mapped": sorted(material.name for material in tables),
             "stood_up": stood_up,
         })
     return report

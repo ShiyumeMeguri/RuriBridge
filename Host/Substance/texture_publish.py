@@ -443,13 +443,34 @@ def rename(renames):
     return wanted
 
 
+def map_names(texture_set):
+    """The maps a whole export of this Texture Set writes, by name, in the preset's order:
+    what a material that is not generated takes its textures from, mapped on the Blender
+    side by the material's own table."""
+    names = []
+    for stack in texture_set.all_stacks():
+        for planned in plan_stack(DEFAULT_PRESET_NAME, texture_set, stack):
+            if planned.key not in names:
+                names.append(planned.key)
+    return names
+
+
+def _texture_set_state(texture_set):
+    state = {"name": texture_set.name, "layers": mesh_ingest.layer_count(texture_set)}
+    try:
+        state["maps"] = map_names(texture_set)
+    except TexturePublishError as error:
+        state["maps"] = []
+        state["maps_refused"] = str(error)
+    return state
+
+
 def current_project_state():
-    """What Painter has open: the project file, every Texture Set with its layers,
-    and the frame its surface lives in."""
+    """What Painter has open: the project file, every Texture Set with its layers and the
+    maps an export of it writes, and the frame its surface lives in."""
     if not substance_painter.project.is_open():
         return record_module.presence("Substance", "")
-    texture_sets = [{"name": texture_set.name,
-                     "layers": mesh_ingest.layer_count(texture_set)}
+    texture_sets = [_texture_set_state(texture_set)
                     for texture_set in substance_painter.textureset.all_texture_sets()]
     return record_module.presence(
         "Substance", substance_painter.project.file_path() or "(unsaved project)",

@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 7
+FORMAT_VERSION = 8
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -227,10 +227,11 @@ def presence(source, document, texture_sets=(), materials=(), textures_directory
 
     Everybody publishes it and everybody reads everybody else's, which is how a
     side stops guessing whether the other one is there and what it is holding.
-    A texturing tool fills ``texture_sets`` and the frame its project's surface
-    lives in -- None for a project the bridge did not start and nobody has
-    measured; a modelling tool fills ``materials`` and says where the textures of
-    its document live. A material row names the generated shader the material runs
+    A texturing tool fills ``texture_sets`` -- each with its layer count and the
+    maps a whole export of it writes, or why it cannot say -- and the frame its
+    project's surface lives in -- None for a project the bridge did not start and
+    nobody has measured; a modelling tool fills ``materials`` and says where the
+    textures of its document live. A material row names the generated shader the material runs
     and that shader's identity, empty for a material nobody generated.
     ``document`` is empty when nothing is open, which is an answer and not a
     missing one.
