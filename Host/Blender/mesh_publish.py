@@ -443,6 +443,16 @@ def _linear(value):
     return one ** 2.2
 
 
+def _authored(value):
+    """The way back from ``_linear``: a channel as the shader read it, as it is authored."""
+    one = float(value)
+    if one <= 0.04045 / 12.92:
+        return one * 12.92
+    if one < 1.0:
+        return 1.055 * one ** (1.0 / 2.4) - 0.055
+    return one ** (1.0 / 2.2)
+
+
 def _plain(value):
     """One custom property value as something that can cross."""
     if isinstance(value, (bool, int, float, str)):
@@ -450,6 +460,29 @@ def _plain(value):
     if hasattr(value, "to_list"):
         return value.to_list()
     return [_plain(entry) for entry in value]
+
+
+def _shaped_like(held, offered):
+    """An offered value in the shape the material holds that property in."""
+    if isinstance(held, list):
+        if not isinstance(offered, (list, tuple)):
+            raise ValueError("it holds {0} numbers and was offered one".format(len(held)))
+        taken = [float(one) for one in offered][:len(held)]
+        return taken + [float(one) for one in held[len(taken):]]
+    if isinstance(offered, (list, tuple)):
+        raise ValueError("it holds one number and was offered {0}".format(len(offered)))
+    if isinstance(held, bool):
+        return bool(offered)
+    if isinstance(held, int):
+        return int(round(float(offered)))
+    return float(offered)
+
+
+def _same(held, offered):
+    """Whether a value already holds what is offered, across a 32-bit round trip."""
+    if isinstance(held, list):
+        return len(held) == len(offered) and all(_same(one, other) for one, other in zip(held, offered))
+    return abs(float(held) - float(offered)) <= 1e-6 * max(1.0, abs(float(held)), abs(float(offered)))
 
 
 def declared_row(material):
@@ -488,6 +521,56 @@ def declared_row(material):
             "parameters": row}
 
 
+def write_row(material, values):
+    """The way back from ``declared_row``: values spelled the shader's way, written into
+    the property groups the declaration names, authored the way the material keeps them.
+
+    Only what the material holds is written, and only where it differs: a constant of
+    the material, or a name it has no property for, is left as it is. Returns the names
+    written, the names it holds no property for, and the ones offered in a shape it
+    cannot hold, with why.
+    """
+    declaration = material.get(SHADING_DECLARATION)
+    if declaration is None:
+        raise RuntimeError("{0} declares no shading".format(material.name))
+    gamma = {str(name) for name in declaration.get("gamma") or []}
+    constants = set(dict(declaration.get("constants") or {}))
+    places = {}
+    for group_name, spelling in dict(declaration.get("values") or {}).items():
+        group = material.get(group_name)
+        if group is None:
+            continue
+        for key in group.keys():
+            places[key if spelling == "{0}" else spelling.format(key)] = (group_name, key)
+    groups = {}
+    written, unheld, refused = [], [], {}
+    for name, value in sorted(values.items()):
+        if name in constants:
+            continue
+        place = places.get(name)
+        if place is None:
+            unheld.append(name)
+            continue
+        group_name, key = place
+        group = groups.setdefault(group_name, {one: _plain(held)
+                                               for one, held in material[group_name].items()})
+        if name in gamma:
+            value = ([_authored(one) for one in value[:3]] + list(value[3:])
+                     if isinstance(value, (list, tuple)) else _authored(value))
+        try:
+            shaped = _shaped_like(group[key], value)
+        except (TypeError, ValueError) as error:
+            refused[name] = str(error)
+            continue
+        if _same(group[key], shaped):
+            continue
+        group[key] = shaped
+        written.append(name)
+    for group_name in sorted({places[name][0] for name in written}):
+        material[group_name] = groups[group_name]
+    return written, unheld, refused
+
+
 #: The names the far side's shader exposes for the object's axes. Three columns
 #: rather than a matrix because a shader parameter is a vector.
 OBJECT_BASIS_PARAMETERS = ("i_ObjectToWorld0", "i_ObjectToWorld1", "i_ObjectToWorld2")
@@ -500,25 +583,33 @@ _OBJECT_AXIS_SWAP = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0),
                                       (0.0, 0.0, 0.0, 1.0)))
 
 
-def shading_rows(objects):
-    """What each Texture Set's shading is, as the material that speaks for it states it.
+def speakers(objects):
+    """The material that speaks for each Texture Set, and one object wearing it.
 
     The material named like the Texture Set speaks for it; a Texture Set painted by
     materials none of which carries that name is spoken for by the first of them
     in name order. Several materials painting into one Texture Set share one
     shader instance over there, so only one row can be its row, and the rule has
-    to be one a person can predict. A material whose shading nobody declared has
-    no row: its shader is not something this side knows how to describe.
+    to be one a person can predict -- the same rule both ways.
     """
-    speakers = {}
+    found = {}
     for name, (material, wearing) in wearers(objects).items():
         texture_set = texture_set_of(material)
         if not texture_set:
             continue
-        if texture_set not in speakers or name == texture_set:
-            speakers[texture_set] = (material, wearing[0])
+        if texture_set not in found or name == texture_set:
+            found[texture_set] = (material, wearing[0])
+    return dict(sorted(found.items()))
+
+
+def shading_rows(objects):
+    """What each Texture Set's shading is, as the material that speaks for it states it.
+
+    A material whose shading nobody declared has no row: its shader is not something
+    this side knows how to describe.
+    """
     rows = {}
-    for texture_set, (material, wearer) in sorted(speakers.items()):
+    for texture_set, (material, wearer) in speakers(objects).items():
         declared = declared_row(material)
         if declared is None:
             continue

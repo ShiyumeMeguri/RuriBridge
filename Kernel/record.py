@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 6
+FORMAT_VERSION = 7
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -32,12 +32,17 @@ ASK_TO_BIND = "bind"
 #: "Call this Texture Set by that name": answered by the application that owns
 #: the Texture Sets. A rename there is the only edit that keeps every layer.
 ASK_TO_RENAME = "rename"
-#: "State your materials' shading": answered by the application that owns the
-#: materials, on the shading topic.
+#: "State your shading for these Texture Sets": answered by whichever side holds
+#: shading parameters and was not the one asking, on the shading topic -- the same
+#: errand pulls a shader either way.
 ASK_FOR_SHADING = "shading"
 #: "Cut these lanes out of your materials' textures": answered by the application
 #: whose materials hold the textures, on the inputs topic.
 ASK_FOR_INPUTS = "inputs"
+#: "Stand these Texture Sets up from my materials' textures": answered by the
+#: application with Texture Sets, which knows what its shader reads and asks for
+#: exactly that.
+ASK_TO_TAKE_TEXTURES = "take_textures"
 
 RECORD_FILE_NAME = "record.json"
 #: A rig and its performance, as the animation tools on either side read it.

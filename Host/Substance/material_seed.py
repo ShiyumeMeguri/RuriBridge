@@ -182,9 +182,12 @@ def apply(entry, directory):
         state["layer"] = layer.uid()
         report["channels"] = sorted(str(one).split(".")[-1] for one in channels)
     if parameters:
-        identifier = shader_state.Layout().instance_by_texture_set.get(name)
-        if identifier is None:
-            report["missing"].update({key: "the Texture Set has no shader instance"
+        layout = shader_state.Layout()
+        identifier = layout.instance_by_texture_set.get(name)
+        running = layout.shader_by_instance.get(identifier, "") if identifier is not None else ""
+        if running != entry["shader"]:
+            report["missing"].update({key: "the Texture Set runs {0}, not {1}: pull the shader "
+                                           "first".format(running or "no shader", entry["shader"])
                                       for key in parameters})
         else:
             shader_state.set_parameters(identifier, parameters)
