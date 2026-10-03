@@ -853,6 +853,16 @@ class RURIBRIDGE_OT_exclude(bpy.types.Operator):
     material: bpy.props.StringProperty()
     excluded: bpy.props.BoolProperty()
 
+    @classmethod
+    def description(cls, context, properties):
+        if properties.excluded:
+            return ("Keep {0}'s faces out of Painter: Update Mesh stops sending them. A "
+                    "Texture Set that still has layers and nothing left painting into it "
+                    "stops the swap until it is deleted in Painter or this is let back "
+                    "in".format(properties.material))
+        return "Let {0}'s faces back into Painter with the next Update Mesh".format(
+            properties.material)
+
     def execute(self, context):
         try:
             exclude(self.material, self.excluded)
@@ -1060,6 +1070,10 @@ def _draw_table(layout):
             operator = line.operator(RURIBRIDGE_OT_bind.bl_idname, text=label,
                                      icon="DOWNARROW_HLT")
             operator.texture_set = name
+            for painter in painters:
+                operator = line.operator(RURIBRIDGE_OT_exclude.bl_idname, text="",
+                                         icon="HIDE_OFF")
+                operator.material, operator.excluded = painter, True
     known = {entry["name"] for entry in sets}
     fresh = [row for row in rows if row["texture_set"] and row["texture_set"] not in known]
     renamed = [row for row in rows if row["texture_set"] and row["texture_set"] != row["name"]
