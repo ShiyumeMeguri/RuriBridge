@@ -53,6 +53,13 @@ IDENTITY_PROPERTY = "ruri_bridge_identity"
 #: The custom property a generated material uses to say what its shading row
 #: is. Written by whatever generated the material; the bridge only reads it.
 SHADING_DECLARATION = "ruri_shading"
+#: What the generated shading stacks state about the scene's main light, each time
+#: they pick it: on the scene, the direction toward it in Blender's world (w = 0; a
+#: position when w = 1); on every light, whether it is the one (the last component).
+#: Written by the stacks; the bridge only reads them, so it shades with the light
+#: Blender shades with rather than choosing one of its own.
+MAIN_LIGHT_VECTOR = "ruri_main_light_vector"
+LIGHT_STATE = "ruri_light_state"
 #: Modifier types whose output belongs to the render and not to the surface: an
 #: armature poses the surface, and geometry nodes in this toolchain grow render
 #: geometry -- outline shells, fur layers -- on top of it.
@@ -574,6 +581,9 @@ def write_row(material, values):
 #: The names the far side's shader exposes for the object's axes. Three columns
 #: rather than a matrix because a shader parameter is a vector.
 OBJECT_BASIS_PARAMETERS = ("i_ObjectToWorld0", "i_ObjectToWorld1", "i_ObjectToWorld2")
+#: The names the far side's shader exposes for the main light: the direction toward
+#: it in the far side's world, its colour, and its strength.
+MAIN_LIGHT_PARAMETERS = ("v_MainLightDirection", "v_MainLightColor", "f_MainLightIntensity")
 
 #: What the shading language calls object space, relative to Blender's: Y and Z
 #: swapped. A reflection, not a rotation -- the two handedness conventions differ.
@@ -609,15 +619,46 @@ def shading_rows(objects):
     this side knows how to describe.
     """
     rows = {}
+    light = None
+    scene = bpy.context.scene
     for texture_set, (material, wearer) in speakers(objects).items():
         declared = declared_row(material)
         if declared is None:
             continue
         for parameter, column in zip(OBJECT_BASIS_PARAMETERS, object_basis(wearer)):
             declared["parameters"][parameter] = column
+        light = light or main_light(scene)
+        declared["parameters"].update(zip(MAIN_LIGHT_PARAMETERS, light))
+        declared["parameters"].update(engine_state(scene, material))
         declared["material"] = material.name
         rows[texture_set] = declared
     return rows
+
+
+def engine_state(scene, material):
+    """The engine globals a material's shader reads from the scene, as they stand in it now.
+
+    The material declares them with their defaults; the scene's world holds what a level or a
+    volume stack states for each as its difference from the default, and the shader reads the
+    sum -- so a scene with nothing stated answers the defaults. They travel with every row
+    because the far side keeps a value for each on every shader instance and keeps it across
+    shader generations: left alone, it shades with whatever defaults the instance was first
+    given."""
+    declaration = material[SHADING_DECLARATION]
+    if "engine" not in declaration:
+        raise RuntimeError("{0} was built by a shading stack that does not declare the engine globals its "
+                           "shader reads; it is rebuilt with the current one when the file is opened again"
+                           .format(material.name))
+    declared = dict(declaration["engine"])
+    world = scene.world
+    values = {}
+    for name, base in declared.items():
+        delta = world.get(name) if world is not None else None
+        value = [float(component) for component in base]
+        if delta is not None:
+            value = [component + float(offset) for component, offset in zip(value, delta)]
+        values[str(name)] = value[0] if len(value) == 1 else value
+    return values
 
 
 def object_basis(object_reference):
@@ -625,3 +666,28 @@ def object_basis(object_reference):
     root = mathutils.Matrix(PAINTER_AXES.tolist()).to_4x4()
     matrix = root @ object_reference.matrix_world @ _OBJECT_AXIS_SWAP
     return [[matrix[row][column] for row in range(3)] + [0.0] for column in range(3)]
+
+
+def main_light(scene):
+    """The main light the shading stacks shade this scene with, as the far side takes it: the
+    direction toward it in the far side's world, its colour, its strength.
+
+    The far side takes a direction only. A main light stated as a position -- a lamp, not a
+    sun -- has a different direction at every point it lights, so it is refused rather than
+    flattened into one."""
+    vector = scene.get(MAIN_LIGHT_VECTOR)
+    chosen = [obj for obj in scene.objects
+              if obj.type == "LIGHT" and len(obj.get(LIGHT_STATE) or ()) == 4 and obj[LIGHT_STATE][3] == 1.0]
+    if vector is None or len(chosen) != 1:
+        raise RuntimeError("the shading stacks have stated no main light for this scene yet "
+                           "({0} light(s) marked as it)".format(len(chosen)))
+    if float(vector[3]) != 0.0:
+        raise RuntimeError("the main light {0} is a {1} light; Painter's shader takes only a direction "
+                           "toward a sun".format(chosen[0].name, chosen[0].data.type.lower()))
+    toward = PAINTER_AXES @ numpy.array([float(value) for value in vector[:3]])
+    toward /= numpy.linalg.norm(toward)
+    data = chosen[0].data
+    if data.specular_factor != 1.0:
+        LOG.warning("the main light %s scales its specular by %.3f; Painter's shader has no such "
+                    "factor and lights at 1", chosen[0].name, data.specular_factor)
+    return [float(value) for value in toward], [float(value) for value in data.color], float(data.energy)
