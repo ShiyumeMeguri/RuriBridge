@@ -49,7 +49,8 @@ from ...Kernel import record as record_module
 from ...Kernel import session as session_module
 from ...Kernel import topic as topic_module
 
-from . import held_imports, material_seed, mesh_ingest, shader_state, texture_publish
+from . import (held_imports, material_seed, mesh_ingest, project_imports, shader_state,
+               texture_publish)
 
 LOG = log_module.logger("painter")
 
@@ -383,15 +384,15 @@ def _resource_for(path):
 
     Imported once per version of the file: an image Blender saved again since the
     last pull is a new picture, and handing back the resource of the old one would
-    pull what was there before without a word.
+    pull what was there before without a word. One a save took out because nothing
+    used it any more is imported again.
     """
     status = os.stat(path)
     key = (os.path.normcase(os.path.abspath(path)), status.st_mtime_ns, status.st_size)
     known = _IMPORTED.get(key)
-    if known is not None:
+    if known is not None and substance_painter.resource.Resource.retrieve(known):
         return known
-    resource = substance_painter.resource.import_project_resource(
-        path, substance_painter.resource.Usage.TEXTURE)
+    resource = project_imports.take_in(path, substance_painter.resource.Usage.TEXTURE)
     _IMPORTED[key] = resource.identifier()
     return _IMPORTED[key]
 
@@ -874,6 +875,7 @@ def pump():
 
 def _on_timer():
     try:
+        project_imports.settle_due(project_is_locked)
         if _presence_due[0] and not substance_painter.project.is_busy():
             _presence_due[0] = False
             publish_presence()
@@ -890,6 +892,7 @@ def _on_timer():
 
 def _on_project_ready(_event):
     _IMPORTED.clear()
+    project_imports.forget()
     mesh_ingest.settle_new_project()
     _mesh_finished()
 
@@ -900,6 +903,7 @@ def _on_project_changed(_event):
 
 def _on_project_closed(_event):
     held_imports.release()
+    project_imports.forget()
     _presence_due[0] = True
 
 
@@ -930,6 +934,8 @@ def _rest_in_the_strip(_event=None):
 _EVENTS = (
     (substance_painter.event.ProjectEditionEntered, _on_project_ready),
     (substance_painter.event.ProjectClosed, _on_project_closed),
+    (substance_painter.event.ProjectAboutToSave, project_imports.before_save),
+    (substance_painter.event.ProjectSaved, project_imports.after_save),
     (substance_painter.event.ProjectSaved, _on_project_changed),
     (substance_painter.event.LayerStacksModelDataChanged, _on_project_changed),
     (substance_painter.event.GraphicalUserInterfaceStarted, _rest_in_the_strip),

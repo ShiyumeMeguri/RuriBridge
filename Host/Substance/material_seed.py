@@ -22,9 +22,12 @@ Nothing is removed:
 * a channel the stack lacks is added, in the format the manifest states and, for a user
   channel, labelled with the input's semantic name -- the label the importer gives it,
   and the one Painter's export names the channel's file after;
-* a mesh map is set only where the Texture Set has none: a bake somebody made is not the
-  bridge's to replace;
+* a mesh map is set where the Texture Set has none and refreshed where it is the one the
+  bridge set; a bake somebody made is not the bridge's to replace, and nothing is imported
+  for it;
 * a texture already taken in with the same bytes is used again rather than imported twice;
+  one whose bytes changed comes in anew, and the one it replaced leaves the project at the
+  next save (``project_imports``);
 * a texture is imported from where it is held until the project closes (``held_imports``),
   never from the delivery, which the transport retires before Painter may have read it.
 """
@@ -40,11 +43,11 @@ import substance_painter.textureset as textureset
 
 from ...Kernel.log import logger
 
-from . import held_imports, shader_state
+from . import held_imports, project_imports, shader_state
+from .mesh_ingest import METADATA_CONTEXT
 
 LOG = logger("painter.seed")
 
-METADATA_CONTEXT = "RuriBridge"
 #: Per Texture Set: the uid of the bridge's layer, and per input the hash of the bytes
 #: taken in and the resource they became.
 SEED_KEY = "seed"
@@ -92,6 +95,12 @@ def _remember(seeded):
     substance_painter.project.Metadata(METADATA_CONTEXT).set(SEED_KEY, seeded)
 
 
+def _is_record(identifier, record):
+    """Whether a resource is the one a record says the bridge took in."""
+    return (record is not None and identifier.name == record.get("name")
+            and identifier.version == record.get("version"))
+
+
 def _resource(item, directory, known, label):
     """The project resource for one delivered file: the one already taken in when the
     bytes are the same, else a fresh import named after it. Returns its url.
@@ -104,7 +113,7 @@ def _resource(item, directory, known, label):
             held["name"], held.get("version"))
         if substance_painter.resource.Resource.retrieve(identifier):
             return identifier.url()
-    resource = substance_painter.resource.import_project_resource(
+    resource = project_imports.take_in(
         held_imports.hold(os.path.join(directory, item["file"]), item["hash"]),
         substance_painter.resource.Usage.TEXTURE, name=label)
     identifier = resource.identifier()
@@ -153,19 +162,24 @@ def apply(entry, directory):
         if input_entry is None:
             report["missing"][item["input"]] = "the manifest on this shelf declares no such input"
             continue
-        url = _resource(item, directory, known, "{0}_{1}".format(name, item["input"]))
-        if input_entry["Kind"] == "RawTexture":
-            parameters[item["input"]] = url
-            continue
+        resource_name = "{0}_{1}".format(name, item["input"])
         baked = input_entry.get("MeshMap") or ""
         if baked:
             usage = getattr(textureset.MeshMapUsage, baked)
-            if texture_set.get_mesh_map_resource(usage) is None:
+            held = texture_set.get_mesh_map_resource(usage)
+            if held is not None and not _is_record(held, known.get(item["input"])):
+                known.pop(item["input"], None)
+                report["kept_mesh_maps"].append(baked)
+                continue
+            url = _resource(item, directory, known, resource_name)
+            if held is None or not _is_record(held, known[item["input"]]):
                 texture_set.set_mesh_map_resource(
                     usage, substance_painter.resource.ResourceID.from_url(url))
-                report["mesh_maps"].append(baked)
-            else:
-                report["kept_mesh_maps"].append(baked)
+            report["mesh_maps"].append(baked)
+            continue
+        url = _resource(item, directory, known, resource_name)
+        if input_entry["Kind"] == "RawTexture":
+            parameters[item["input"]] = url
             continue
         channel_type = _channel_type(input_entry["Id"])
         if not stack.has_channel(channel_type):
