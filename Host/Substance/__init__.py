@@ -49,8 +49,8 @@ from ...Kernel import record as record_module
 from ...Kernel import session as session_module
 from ...Kernel import topic as topic_module
 
-from . import (held_imports, material_seed, mesh_ingest, project_imports, shader_state,
-               texture_publish)
+from . import (held_imports, layout_state, material_seed, mesh_ingest, project_imports,
+               shader_state, texture_publish)
 
 LOG = log_module.logger("painter")
 
@@ -294,11 +294,10 @@ def push_shader(texture_sets=None):
     return sorted(values)
 
 
-def pull_textures(texture_sets=None):
-    """Pull the Blender materials' own textures into every Texture Set here, or these: each
-    stood up from its material where this shelf has that very shader (``material_seed``).
-    Blender's Push Textures asks for exactly this. Returns the Texture Sets asked about,
-    and the ones that cannot be, with why."""
+def _stand_up_requests(texture_sets, kinds):
+    """What to ask Blender for to stand every Texture Set here, or these, up from its
+    material: the inputs of these kinds, per Texture Set; and the ones that cannot be,
+    with why."""
     rows = speakers(blender_state().get("materials") or [])
     requests, skipped = [], {}
     for texture_set in _texture_sets(texture_sets):
@@ -314,13 +313,22 @@ def pull_textures(texture_sets=None):
             skipped[texture_set] = "{0} on this shelf is another generation than {1}'s".format(
                 row["shader"], row["name"])
             continue
-        jobs = material_seed.jobs(manifest, row["images"])
+        jobs = material_seed.jobs(manifest, row["images"], kinds)
         if not jobs:
             skipped[texture_set] = "{0} holds none of the textures {1} reads".format(
                 row["name"], row["shader"])
             continue
         requests.append({"name": texture_set, "material": row["name"],
                          "shader": row["shader"], "jobs": jobs})
+    return requests, skipped
+
+
+def pull_textures(texture_sets=None):
+    """Pull the Blender materials' own textures into every Texture Set here, or these: each
+    stood up from its material where this shelf has that very shader (``material_seed``).
+    Blender's Push Textures asks for exactly this. Returns the Texture Sets asked about,
+    and the ones that cannot be, with why."""
+    requests, skipped = _stand_up_requests(texture_sets, material_seed.FED_KINDS)
     _say_skipped("textures", skipped)
     if not requests:
         raise RuntimeError("no textures to pull: " + "; ".join(
@@ -775,9 +783,32 @@ def apply_shading(record):
     return "; ".join(parts)
 
 
-def _mesh_finished(_status=None):
+def _mesh_finished(_status=None, applied=None):
     _mesh_deadline[0] = None
     _presence_due[0] = True
+    if applied is not None and applied.relaid:
+        _follow_layouts(applied)
+
+
+def _follow_layouts(applied):
+    """After a layout change, the shader textures of the bridge's own stand-up of a
+    material are taken again from Blender, where the material's pictures were laid out
+    again with the surface: a shader reads its textures in the Texture Set's layout, and
+    Painter cannot hand over a texture's pixels to lay them out again itself. The rest of
+    the stand-up stays as it is, read through the old layout like any other fill."""
+    material_seed.follow_mesh_maps(applied.replaced)
+    stood_up = material_seed.seeded(applied.relaid)
+    if not stood_up:
+        return
+    requests, skipped = _stand_up_requests(stood_up, material_seed.SHADER_KINDS)
+    if skipped:
+        LOG.info("no shader textures to take again for %s", ", ".join(
+            "{0} ({1})".format(texture_set, why) for texture_set, why in sorted(skipped.items())))
+    if not requests:
+        return
+    _ask(record_module.ASK_FOR_INPUTS, texture_sets=requests)
+    _panel.set_status("taking the shader textures of {0} again from Blender for the new "
+                      "layout".format(_named([request["name"] for request in requests])))
 
 
 def _handle(topic, generation):
@@ -821,6 +852,11 @@ def _handle(topic, generation):
             pulled, skipped = pull_textures(record["texture_sets"])
             _panel.set_status(_with_skipped(
                 "pulling the textures of {0} from Blender".format(_named(pulled)), skipped))
+            return False
+        if asked == record_module.ASK_FOR_LAYOUT:
+            _panel.set_status(layout_state.answer(
+                CONNECTION.session.publisher(topic_module.TEXTURES), record["texture_set"],
+                generation.number))
             return False
         if asked == record_module.ASK_TO_RENAME:
             renamed = texture_publish.rename(generation.record.get("renames") or {})

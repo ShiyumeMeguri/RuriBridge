@@ -43,8 +43,7 @@ import substance_painter.textureset as textureset
 
 from ...Kernel.log import logger
 
-from . import held_imports, project_imports, shader_state
-from .mesh_ingest import METADATA_CONTEXT
+from . import held_imports, layout_state, project_facts, project_imports, shader_state
 
 LOG = logger("painter.seed")
 
@@ -52,7 +51,12 @@ LOG = logger("painter.seed")
 #: taken in and the resource they became.
 SEED_KEY = "seed"
 #: The kinds of manifest input a material's texture can feed.
-_FED_KINDS = ("NativeChannel", "OverflowChannel", "RawTexture")
+FED_KINDS = ("NativeChannel", "OverflowChannel", "RawTexture")
+#: The inputs that become parameters of the Texture Set's shader, which the shader reads
+#: in the Texture Set's own layout: the one part of a stand-up a layout change does not
+#: carry by itself -- its channels read their pictures through the UV set holding the old
+#: layout, its mesh maps are laid out again with the surface.
+SHADER_KINDS = ("RawTexture",)
 
 
 def _wide(entry):
@@ -61,12 +65,13 @@ def _wide(entry):
         width in str(entry.get("Format") or "") for width in ("16", "32"))
 
 
-def jobs(manifest, images):
-    """What to ask Blender to cut: one job per input the manifest declares that one of
-    the material's textures feeds -- through the first of its sources the material has."""
+def jobs(manifest, images, kinds):
+    """What to ask Blender to cut: one job per input of these kinds the manifest declares
+    that one of the material's textures feeds -- through the first of its sources the
+    material has."""
     found = []
     for entry in manifest.get("inputs") or []:
-        if entry["Kind"] not in _FED_KINDS:
+        if entry["Kind"] not in kinds:
             continue
         source = next((one for one in entry.get("Sources") or [] if one["Source"] in images), None)
         if source is None:
@@ -87,12 +92,38 @@ def _channel_type(identifier):
 
 
 def _remembered():
-    metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
-    return dict(metadata.get(SEED_KEY) or {}) if SEED_KEY in metadata.list() else {}
+    return dict(project_facts.read(SEED_KEY) or {})
 
 
 def _remember(seeded):
-    substance_painter.project.Metadata(METADATA_CONTEXT).set(SEED_KEY, seeded)
+    project_facts.write(SEED_KEY, seeded)
+
+
+def seeded(names):
+    """Of these Texture Sets, the ones the bridge stood up from a Blender material."""
+    remembered = _remembered()
+    return sorted(name for name in names if name in remembered)
+
+
+def follow_mesh_maps(replaced):
+    """A mesh map the bridge set and a layout change replaced with the same map laid out
+    anew stays the bridge's: its record follows, so the next delivery replaces it as it
+    would have replaced the old one. ``replaced`` is ``layout_state.Applied.replaced``."""
+    seeded_now = _remembered()
+    changed = False
+    for name, maps in replaced.items():
+        state = seeded_now.get(name)
+        if not state:
+            continue
+        known = dict(state.get("inputs") or {})
+        for key, record in known.items():
+            for old, new in maps.values():
+                if record.get("name") == old["name"] and record.get("version") == old["version"]:
+                    known[key] = {"hash": "", "name": new["name"], "version": new["version"]}
+                    changed = True
+        state["inputs"] = known
+    if changed:
+        _remember(seeded_now)
 
 
 def _is_record(identifier, record):
@@ -190,6 +221,8 @@ def apply(entry, directory):
         channels[channel_type] = url
     if channels:
         layer = _bridge_layer(stack, state.get("layer"), entry["material"])
+        # The material's textures are laid out in its current layout, which is set 0.
+        layout_state.read_layout(layer)
         layer.active_channels = set(channels)
         for channel_type, url in channels.items():
             layer.set_source(channel_type, substance_painter.resource.ResourceID.from_url(url))

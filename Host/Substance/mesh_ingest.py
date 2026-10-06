@@ -3,7 +3,7 @@
 
 Painter's project API accepts geometry only as a file path -- ``project.create``
 and ``project.reload_mesh`` both take one -- which is why the arena hands Painter
-a real path to the OBJ Blender wrote.
+a real path to the FBX Blender wrote.
 
 **Every layer stays.** A reload matches the project's Texture Sets to the
 incoming materials by name, keeps every one that matches with its whole stack,
@@ -43,14 +43,14 @@ import substance_painter.layerstack
 import substance_painter.project
 import substance_painter.textureset
 
+from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
+from . import layout_state, project_facts
+
 LOG = logger("painter.mesh")
 
-#: Where the bridge keeps its facts about a project, inside the project. The keys
-#: are saved with the .spp, so they never change spelling.
-METADATA_CONTEXT = "RuriBridge"
 FRAME_KEY = "frame"
 
 
@@ -61,9 +61,11 @@ class MeshIngestError(RuntimeError):
 #: Texture Sets somebody said may go on the next swap, by name. The only way a
 #: Texture Set with layers is ever dropped: by name, by hand, for one swap.
 _allowed_drops = set()
-#: The frame a project being created from a payload will live in, written onto it
+#: The frame a project being created from a payload will live in, and the record of
+#: the surface it came with, whose chart tables and fingerprints are written onto it
 #: once it is open.
 _frame_of_new_project = [None]
+_surface_of_new_project = [None]
 
 
 def allow_dropping(name, allowed):
@@ -81,15 +83,12 @@ def project_frame():
     """The frame the open project's surface lives in; None if nobody knows it."""
     if not substance_painter.project.is_open():
         return None
-    metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
-    if FRAME_KEY not in metadata.list():
-        return None
-    return metadata.get(FRAME_KEY)
+    return project_facts.read(FRAME_KEY)
 
 
 def write_frame(frame_of_project):
     """State the open project's frame. Done once, when the frame becomes known."""
-    substance_painter.project.Metadata(METADATA_CONTEXT).set(FRAME_KEY, frame_of_project)
+    project_facts.write(FRAME_KEY, frame_of_project)
 
 
 def settle_new_project():
@@ -99,6 +98,9 @@ def settle_new_project():
         return False
     _frame_of_new_project[0] = None
     write_frame(pending)
+    surface = _surface_of_new_project[0] or {}
+    layout_state.adopt(surface.get("layouts") or {}, surface.get("fingerprints") or {})
+    _surface_of_new_project[0] = None
     LOG.info("the new project lives in frame %s", pending)
     return True
 
@@ -139,9 +141,10 @@ def would_lose(record):
 def apply(generation, texture_resolution, on_finished=None):
     """Queue this generation's surface into Painter. Returns what it will do.
 
-    ``on_finished`` hears the end of a swap. A new project says it is ready the
-    way every project does, with ``ProjectEditionEntered`` -- creating returns
-    long before the project can be asked anything.
+    ``on_finished`` hears the end of a swap, with what it changed of the layouts
+    (``layout_state.Applied``) when it went in. A new project says it is ready the
+    way every project does, with ``ProjectEditionEntered`` -- creating returns long
+    before the project can be asked anything.
     """
     record = generation.record
     scene_path = generation.path(record["scene_file"])
@@ -156,6 +159,7 @@ def apply(generation, texture_resolution, on_finished=None):
                 default_texture_resolution=texture_resolution,
                 import_cameras=False)
             _frame_of_new_project[0] = frame_of_surface
+            _surface_of_new_project[0] = record
             substance_painter.project.create(mesh_file_path=str(scene_path),
                                              settings=settings)
             LOG.info("mesh generation %d is becoming a new project", generation.number)
@@ -188,17 +192,26 @@ def apply(generation, texture_resolution, on_finished=None):
     if dropping:
         LOG.warning("dropping %s on this swap, as asked", ", ".join(dropping))
 
+    try:
+        chosen = layout_state.plan(record, str(generation.directory))
+    except layout_module.LayoutError as error:
+        raise MeshIngestError("{0}. The mesh was not swapped".format(error)) from error
+
     def finished(status):
         _allowed_drops.clear()
+        applied = None
         if status == substance_painter.project.ReloadMeshStatus.SUCCESS:
             LOG.info("mesh generation %d swapped in", generation.number)
+            applied = layout_state.after_surface(chosen)
+            LOG.info("layouts: %s", applied.line)
         else:
             LOG.error("Painter refused mesh generation %d (%s); its log says why",
                       generation.number, status)
         if on_finished is not None:
-            on_finished(str(status))
+            on_finished(str(status), applied)
 
     def reload():
+        layout_state.before_surface(chosen)
         settings = substance_painter.project.MeshReloadingSettings(
             import_cameras=False, preserve_strokes=True)
         substance_painter.project.reload_mesh(str(scene_path), settings, finished)

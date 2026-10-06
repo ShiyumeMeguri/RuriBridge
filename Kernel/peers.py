@@ -29,9 +29,10 @@ application will reveal them:
 **One payload format per crossing, the one the reader takes without side
 effects.** A rig and its performance cross as glTF binary, which both animation
 tools read and write natively. The surface a texturing tool paints on crosses as
-an OBJ in the project's own frame: a glTF material description is what that
-tool's importer turns into a layer nobody painted, and the frame is a fact of the
-project it has to match to the last bit.
+an FBX in the project's own frame, with every UV set its Texture Sets read: a glTF
+material description is what that tool's importer turns into a layer nobody
+painted, an OBJ carries one UV set, and the frame is a fact of the project it has
+to match to the last bit.
 """
 
 from __future__ import annotations

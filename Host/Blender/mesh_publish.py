@@ -16,13 +16,15 @@ written into it: a project the bridge starts measures in centimetres, and one th
 began as somebody else's file keeps whatever frame that file had. A surface sent
 in any other frame is, to Painter, a different object.
 
-**It is an OBJ of the polygons as they are.** Painter triangulates on import, and
-the triangulation it chose is part of what a stroke or a selection is recorded
-against; handing it Blender's own triangles would be handing it a second opinion.
-The format carries one UV set and no material description at all -- the UV set
-Painter paints is the one Blender renders with, and a material description is
-exactly what a glTF import turns into an unasked-for layer on every new Texture
-Set.
+**It is an FBX of the polygons as they are** (see ``fbx_surface``). Painter
+triangulates on import, and the triangulation it chose is part of what a stroke or
+a selection is recorded against; handing it Blender's own triangles would be
+handing it a second opinion. UV set 0 is the one Blender renders with -- the layout
+a Texture Set is painted in -- and the sets after it are the charts the Texture
+Set's tables name (see ``layouts``): earlier layouts that content in Painter still
+reads through. Materials are names and nothing else, because a material
+description is exactly what an importer turns into an unasked-for layer on every
+new Texture Set.
 
 **Which Texture Set a material paints into** is the one fact this side keeps
 about the other. It is a name, written on the material the first time it crosses
@@ -35,14 +37,18 @@ name none, which keeps its faces out of the texturing tool entirely.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 
 import bpy
 import mathutils
 import numpy
 
 from ...Kernel import arena as arena_module
+from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
+
+from . import fbx_surface, layouts
 
 LOG = logger("blender.mesh")
 
@@ -207,33 +213,33 @@ def surface_only(objects):
 # -- reading one object ----------------------------------------------------------
 
 class SurfacePart:
-    """One object's paintable faces, already in the project's frame.
+    """One object's paintable polygons, already in the project's frame, at the precision
+    they cross at (32-bit floats, written to the last bit).
 
-    The corner arrays index this object's own vertex, UV and normal lists; the
-    writer moves them past whatever was written before. ``faces`` names, per
-    Texture Set, the polygons that paint into it as slices of the corner arrays.
+    ``corner_vertex`` indexes ``positions``; ``corner_normal`` and every array of
+    ``uv_sets`` hold one row per corner, polygon after polygon (``polygon_totals``).
+    Each polygon paints into ``texture_sets[polygon_texture_set]``.
     """
 
-    __slots__ = ("name", "positions", "texcoords", "normals",
-                 "corner_vertex", "corner_texcoord", "corner_normal", "faces")
+    __slots__ = ("name", "positions", "corner_vertex", "corner_normal", "polygon_totals",
+                 "polygon_texture_set", "texture_sets", "uv_sets")
 
-    def __init__(self, name, positions, texcoords, normals,
-                 corner_vertex, corner_texcoord, corner_normal, faces):
+    def __init__(self, name, positions, corner_vertex, corner_normal, polygon_totals,
+                 polygon_texture_set, texture_sets, uv_sets):
         self.name = name
         self.positions = positions
-        self.texcoords = texcoords
-        self.normals = normals
         self.corner_vertex = corner_vertex
-        self.corner_texcoord = corner_texcoord
         self.corner_normal = corner_normal
-        self.faces = faces
+        self.polygon_totals = polygon_totals
+        self.polygon_texture_set = polygon_texture_set
+        self.texture_sets = texture_sets
+        self.uv_sets = uv_sets
 
 
-def _render_uv_layer(mesh, name):
+def render_uv_layer(mesh):
     """The UV map Blender renders with -- the one the far side paints in."""
     layers = list(mesh.uv_layers)
     if not layers:
-        LOG.warning("%s has no UV map; Painter will have to unwrap it", name)
         return None
     return next((layer for layer in layers if layer.active_render), layers[0])
 
@@ -245,11 +251,26 @@ def _corner_order(starts, totals):
             - numpy.repeat(offsets, totals) + numpy.repeat(starts, totals))
 
 
-def gather_object(object_reference, depsgraph, frame_of_project):
+def _layer_values(mesh, name, object_name, texture_set):
+    layer = mesh.uv_layers.get(name)
+    if layer is None:
+        raise RuntimeError(
+            "{0} has no UV map {1!r}, which holds a layout {2} is painted in; it was renamed "
+            "or removed after a retarget".format(object_name, name, texture_set))
+    values = numpy.empty(len(mesh.loops) * 2, dtype=numpy.float32)
+    layer.uv.foreach_get("vector", values)
+    return values.reshape(-1, 2)
+
+
+def gather_object(object_reference, depsgraph, frame_of_project, tables, uv_set_count):
     """Read one evaluated object into the project's frame.
 
-    None when nothing of it crosses: no faces, or every face wears a material that
-    paints into no Texture Set.
+    ``tables`` is every Texture Set's chart table; each UV set a polygon carries is
+    read from the layer its Texture Set's table names for it. Polygons cross grouped
+    by Texture Set, in their own order within one: the order a texturing tool
+    rasterises them in, which decides what a texel two overlapping triangles share
+    holds. None when nothing of the object crosses: no faces, or every face wears a
+    material that paints into no Texture Set.
     """
     texture_sets = [texture_set_of(slot.material) if slot.material is not None else ""
                     for slot in object_reference.material_slots]
@@ -266,9 +287,13 @@ def gather_object(object_reference, depsgraph, frame_of_project):
         polygon_material = numpy.empty(polygon_count, dtype=numpy.int32)
         mesh.polygons.foreach_get("material_index", polygon_material)
         slot_of_polygon = numpy.minimum(polygon_material, len(texture_sets) - 1)
-        crossing = numpy.array([bool(name) for name in texture_sets])[slot_of_polygon]
-        if not crossing.any():
+        name_of_polygon = numpy.array(texture_sets, dtype=object)[slot_of_polygon]
+        crossing = sorted({name for name in texture_sets if name})
+        groups = [numpy.flatnonzero(name_of_polygon == name) for name in crossing]
+        present = [(name, polygons) for name, polygons in zip(crossing, groups) if len(polygons)]
+        if not present:
             return None
+        ordered = numpy.concatenate([polygons for _name, polygons in present])
         starts = numpy.empty(polygon_count, dtype=numpy.int64)
         mesh.polygons.foreach_get("loop_start", starts)
         totals = numpy.empty(polygon_count, dtype=numpy.int64)
@@ -281,10 +306,12 @@ def gather_object(object_reference, depsgraph, frame_of_project):
         mesh.vertices.foreach_get("co", positions)
         normal_of_loop = numpy.empty(corner_count * 3, dtype=numpy.float32)
         mesh.corner_normals.foreach_get("vector", normal_of_loop)
-        layer = _render_uv_layer(mesh, object_reference.name)
+        render = render_uv_layer(mesh)
+        if render is None:
+            raise RuntimeError("{0} has no UV map, so it has no layout to paint in".format(
+                object_reference.name))
 
-        kept = numpy.flatnonzero(crossing)
-        corners = _corner_order(starts[kept], totals[kept])
+        corners = _corner_order(starts[ordered], totals[ordered])
         used, corner_vertex = numpy.unique(vertex_of_loop[corners], return_inverse=True)
 
         world = numpy.array(object_reference.matrix_world, dtype=numpy.float64)
@@ -299,130 +326,127 @@ def gather_object(object_reference, depsgraph, frame_of_project):
         turned = normal_of_loop.reshape(-1, 3)[corners].astype(numpy.float64) @ (
             PAINTER_AXES @ normal_matrix).T
         turned /= numpy.maximum(numpy.linalg.norm(turned, axis=1, keepdims=True), 1e-30)
-        normals, corner_normal = numpy.unique(turned.astype(numpy.float32), axis=0,
-                                              return_inverse=True)
-        texcoords = numpy.empty((0, 2), dtype=numpy.float32)
-        corner_texcoord = None
-        if layer is not None:
-            uv_of_loop = numpy.empty(corner_count * 2, dtype=numpy.float32)
-            layer.uv.foreach_get("vector", uv_of_loop)
-            texcoords, corner_texcoord = numpy.unique(uv_of_loop.reshape(-1, 2)[corners],
-                                                      axis=0, return_inverse=True)
-            corner_texcoord = corner_texcoord.reshape(-1)
 
-        boundaries = numpy.concatenate(([0], numpy.cumsum(totals[kept])))
-        slot_of_kept = slot_of_polygon[kept]
-        faces = []
-        # Two materials painting into one Texture Set are one surface over there,
-        # so their faces cross under one name rather than two that happen to match.
-        for name in sorted({name for name in texture_sets if name}):
-            slots = [index for index, one in enumerate(texture_sets) if one == name]
-            polygons = numpy.flatnonzero(numpy.isin(slot_of_kept, slots))
-            if len(polygons):
-                faces.append((name, boundaries[polygons], boundaries[polygons + 1]))
-        return SurfacePart(object_reference.name, placed, texcoords, normals,
-                           corner_vertex.reshape(-1), corner_texcoord,
-                           corner_normal.reshape(-1), faces)
+        read = {}
+        uv_sets = [numpy.empty((len(corners), 2), dtype=numpy.float32) for _ in range(uv_set_count)]
+        corner_start = 0
+        polygon_texture_set = []
+        for index, (name, polygons) in enumerate(present):
+            span = int(totals[polygons].sum())
+            block = corners[corner_start:corner_start + span]
+            layers = layouts.layers_of(tables[name], render.name, uv_set_count)
+            for uv_set, layer_name in enumerate(layers):
+                if layer_name not in read:
+                    read[layer_name] = _layer_values(mesh, layer_name, object_reference.name, name)
+                uv_sets[uv_set][corner_start:corner_start + span] = read[layer_name][block]
+            polygon_texture_set.append(numpy.full(len(polygons), index, dtype=numpy.int64))
+            corner_start += span
+        return SurfacePart(object_reference.name, placed.astype(numpy.float32), corner_vertex.reshape(-1),
+                           turned.astype(numpy.float32), totals[ordered],
+                           numpy.concatenate(polygon_texture_set),
+                           [name for name, _polygons in present], uv_sets)
     finally:
         evaluated.to_mesh_clear()
 
 
 # -- writing ---------------------------------------------------------------------
 
-def _corner_tokens(part, vertex_base, texcoord_base, normal_base):
-    """Every corner as an OBJ face token, numbered past the parts written before."""
-    vertices = (part.corner_vertex + (vertex_base + 1)).tolist()
-    normals = (part.corner_normal + (normal_base + 1)).tolist()
-    if part.corner_texcoord is None:
-        return ["{0}//{1}".format(vertex, normal) for vertex, normal in zip(vertices, normals)]
-    texcoords = (part.corner_texcoord + (texcoord_base + 1)).tolist()
-    return ["{0}/{1}/{2}".format(vertex, texcoord, normal)
-            for vertex, texcoord, normal in zip(vertices, texcoords, normals)]
-
-
-def write_material_library(path, names):
-    """Name every material the surface uses, and say nothing else about them.
-
-    The importer reports each name it cannot find in a library as an error, and
-    anything a library did say -- a colour, a shininess -- is what an importer
-    would turn into layers nobody painted.
-    """
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("".join("newmtl {0}\n".format(name) for name in sorted(names)))
-
-
-def write_obj(path, parts):
-    """Write every part into one OBJ, beside the library naming its materials.
-
-    Returns the scene the record describes it as.
-    """
-    library = path.with_name(record_module.SURFACE_MATERIALS_FILE_NAME)
-    write_material_library(library, {name for part in parts for name, _firsts, _ends
-                                     in part.faces})
-    lines = ["mtllib " + library.name]
-    scene = []
-    vertex_base = texcoord_base = normal_base = 0
-    for part in parts:
-        lines.append("o " + part.name)
-        lines.extend("v {0!r} {1!r} {2!r}".format(*row) for row in part.positions.tolist())
-        lines.extend("vt {0!r} {1!r}".format(*row) for row in
-                     part.texcoords.astype(numpy.float64).tolist())
-        lines.extend("vn {0!r} {1!r} {2!r}".format(*row) for row in
-                     part.normals.astype(numpy.float64).tolist())
-        tokens = _corner_tokens(part, vertex_base, texcoord_base, normal_base)
-        counts = {}
-        for name, firsts, ends in part.faces:
-            lines.append("usemtl " + name)
-            lines.extend("f " + " ".join(tokens[first:end])
-                         for first, end in zip(firsts.tolist(), ends.tolist()))
-            counts[name] = len(firsts)
-        scene.append({
-            "name": part.name,
-            "texture_sets": counts,
-            "bounds_min": part.positions.min(axis=0).tolist(),
-            "bounds_max": part.positions.max(axis=0).tolist(),
-        })
-        vertex_base += len(part.positions)
-        texcoord_base += len(part.texcoords)
-        normal_base += len(part.normals)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("\n".join(lines))
-        handle.write("\n")
-    return scene
-
-
-def publish(publisher, objects, frame_of_project):
-    """Gather, write and publish the surface in the project's frame. Returns the generation."""
-    bare = bare_objects(objects)
-    if bare:
-        LOG.info("faces that wear no material stay out of Painter: %s", ", ".join(bare))
+def texture_set_tables(objects):
+    """Every crossing Texture Set's chart table, as the materials painting it state it."""
+    painting = {}
     for material in worn_materials(objects).values():
-        settle(material)
+        name = texture_set_of(material)
+        if name:
+            painting.setdefault(name, []).append(material)
+    return {name: layouts.table_of_texture_set(name, materials)
+            for name, materials in sorted(painting.items())}
+
+
+def _scene_entry(part):
+    counts = {name: int((part.polygon_texture_set == index).sum())
+              for index, name in enumerate(part.texture_sets)}
+    return {"name": part.name, "texture_sets": counts,
+            "bounds_min": part.positions.min(axis=0).tolist(),
+            "bounds_max": part.positions.max(axis=0).tolist()}
+
+
+def gather(objects, frame_of_project):
+    """Every object's paintable polygons in the project's frame, each Texture Set's UV
+    sets read from the layers its table names. Returns the parts, the tables and the
+    number of UV sets."""
+    tables = texture_set_tables(objects)
+    uv_set_count = layout_module.uv_set_count(tables.values())
     with surface_only(objects):
         depsgraph = bpy.context.evaluated_depsgraph_get()
         depsgraph.update()
         parts = []
         for object_reference in objects:
-            part = gather_object(object_reference, depsgraph, frame_of_project)
+            part = gather_object(object_reference, depsgraph, frame_of_project, tables,
+                                 uv_set_count)
             if part is None:
                 LOG.info("%s has no face that paints into a Texture Set; not sent",
                          object_reference.name)
                 continue
             parts.append(part)
+    return parts, tables, uv_set_count
+
+
+def layout_fingerprints(parts):
+    """Per Texture Set, a digest of the polygons it paints and their coordinates in its
+    layout (UV set 0), in the order they cross: what its mesh maps are laid out on."""
+    digests = {}
+    for part in parts:
+        offsets = numpy.concatenate(([0], numpy.cumsum(part.polygon_totals)))
+        for index, name in enumerate(part.texture_sets):
+            polygons = numpy.flatnonzero(part.polygon_texture_set == index)
+            first, last = int(polygons[0]), int(polygons[-1]) + 1
+            digest = digests.setdefault(name, hashlib.sha1())
+            digest.update(numpy.ascontiguousarray(part.polygon_totals[first:last], dtype="<i8").tobytes())
+            digest.update(numpy.ascontiguousarray(part.uv_sets[0][offsets[first]:offsets[last]],
+                                                  dtype="<f4").tobytes())
+    return {name: digest.hexdigest() for name, digest in sorted(digests.items())}
+
+
+def publish(publisher, objects, frame_of_project, relaid=None):
+    """Gather, write and publish the surface in the project's frame. Returns the generation.
+
+    ``relaid`` is ``{Texture Set: {"chart": chart, "mesh_maps": {usage: (file name,
+    bytes)}, "fills": {uid: {"path": path}}}}``: mesh maps laid out in a chart that
+    becomes a Texture Set's layout with this surface, written beside it, and pictures
+    of tangent normals carried into its frames, where they lie on disk.
+    """
+    bare = bare_objects(objects)
+    if bare:
+        LOG.info("faces that wear no material stay out of Painter: %s", ", ".join(bare))
+    for material in worn_materials(objects).values():
+        settle(material)
+    parts, tables, uv_set_count = gather(objects, frame_of_project)
     if not parts:
         raise RuntimeError("nothing to send: no visible object has a face that paints "
                            "into a Texture Set")
     with publisher.staging() as staging:
         path = staging.path(record_module.SURFACE_FILE_NAME)
-        scene = write_obj(path, parts)
+        fbx_surface.write(path, parts, ["UVSet{0}".format(index) for index in range(uv_set_count)])
         arena_module.keep_in_memory(path)
-        arena_module.keep_in_memory(staging.path(record_module.SURFACE_MATERIALS_FILE_NAME))
+        payload = {}
+        for texture_set, entry in sorted((relaid or {}).items()):
+            files = {}
+            for usage, (file_name, data) in sorted(entry["mesh_maps"].items()):
+                with open(staging.path(file_name), "wb") as handle:
+                    handle.write(data)
+                files[usage] = {"file": file_name, "hash": hashlib.sha1(data).hexdigest()}
+            payload[texture_set] = {"chart": entry["chart"], "mesh_maps": files,
+                                    "fills": dict(entry.get("fills") or {})}
         return staging.publish(record_module.mesh(
             source="Blender",
             scene_file=record_module.SURFACE_FILE_NAME,
-            scene=scene,
+            scene=[_scene_entry(part) for part in parts],
             materials=texture_set_rows(objects),
-            frame_of_project=frame_of_project))
+            frame_of_project=frame_of_project,
+            layouts={name: layout_module.charts_only(table) for name, table in tables.items()},
+            uv_sets=uv_set_count,
+            fingerprints=layout_fingerprints(parts),
+            relaid=payload))
 
 
 # -- shading rows ------------------------------------------------------------------

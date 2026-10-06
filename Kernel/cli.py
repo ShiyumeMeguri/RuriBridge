@@ -7,9 +7,10 @@ which is the point of putting the state in mapped files rather than in a socket.
 
 ``verify-mesh`` is the real check: it re-reads the published surface out of the
 arena and asserts the things a consumer depends on (every face corner inside the
-vertex, UV and normal lists, the faces each object paints into each Texture Set
-counted as the record says, the declared bounds actually bounding the positions,
-and a frame to place it in). A publish that passes it is one Painter can open.
+vertex list, a normal and every UV set covering every corner, the faces each object
+paints into each Texture Set counted as the record says, the declared bounds
+actually bounding the positions, and a frame to place it in). A publish that passes
+it is one Painter can open.
 """
 
 from __future__ import annotations
@@ -177,9 +178,50 @@ def command_verify_mesh(arguments):
             for failure in failures:
                 print("FAIL {0}".format(failure))
             return 1
-        print("OK every corner inside its lists, every count as declared, all declared "
-              "bounds hold")
+        print("OK every corner inside its lists, {0} UV set(s) on every corner, every count "
+              "as declared, all declared bounds hold".format(payload.get("uv_sets")))
     return 0
+
+
+def _fbx_objects(path):
+    """The ASCII surface as ``{object id: (kind, name, {array name: [numbers]})}`` and its
+    connections as ``[(child id, parent id)]``."""
+    objects = {}
+    connections = []
+    current = None
+    array = None
+    uv_layer = 0
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if array is not None:
+                if text == "}":
+                    array = None
+                    continue
+                body = text[2:] if text.startswith("a:") else text
+                array.extend(float(value) for value in body.split(",") if value.strip())
+                continue
+            if text.startswith(("Geometry:", "Model:", "Material:")):
+                kind, _, rest = text.partition(":")
+                identifier, name = rest.split(",")[0].strip(), rest.split('"')[1].split("::", 1)[1]
+                current = int(identifier)
+                objects[current] = (kind, name, {})
+                continue
+            if text.startswith('C: "OO",'):
+                child, parent = text.split(",")[1:3]
+                connections.append((int(child), int(parent)))
+                continue
+            if current is not None and text.startswith("LayerElementUV:"):
+                uv_layer = int(text.split(":")[1].split("{")[0])
+                continue
+            if current is not None and ": *" in text and text.endswith("{"):
+                name = text.split(":")[0]
+                if name in ("UV", "UVIndex"):
+                    name = "{0}#{1}".format(name, uv_layer)
+                arrays = objects[current][2]
+                arrays[name] = []
+                array = arrays[name]
+    return objects, connections
 
 
 def verify_surface(path, record):
@@ -187,32 +229,48 @@ def verify_surface(path, record):
     failures = []
     if not record.get("frame"):
         failures.append("the record states no frame to place the surface in")
-    sizes = {"v": 0, "vt": 0, "vn": 0}
-    positions = {}
+    objects, connections = _fbx_objects(path)
+    geometry_of = {}
+    materials_of = {}
+    for child, parent in connections:
+        kind = objects.get(child, (None,))[0]
+        if kind == "Geometry":
+            geometry_of[parent] = child
+        elif kind == "Material":
+            materials_of.setdefault(parent, []).append(objects[child][1])
     counts = {}
-    current_object = None
-    current_set = None
-    with open(path, encoding="utf-8") as handle:
-        for number, line in enumerate(handle, 1):
-            tag, _, rest = line.rstrip("\n").partition(" ")
-            if tag in sizes:
-                sizes[tag] += 1
-                if tag == "v":
-                    positions.setdefault(current_object, []).append(
-                        [float(value) for value in rest.split()])
-            elif tag == "o":
-                current_object = rest
-            elif tag == "usemtl":
-                current_set = rest
-            elif tag == "f":
-                key = (current_object, current_set)
-                counts[key] = counts.get(key, 0) + 1
-                for token in rest.split():
-                    parts = token.split("/")
-                    for kind, value in zip(("v", "vt", "vn"), parts):
-                        if value and not 1 <= int(value) <= sizes[kind]:
-                            failures.append("line {0}: {1} index {2} outside its {3} "
-                                            "entries".format(number, kind, value, sizes[kind]))
+    positions = {}
+    for model, (kind, name, _arrays) in objects.items():
+        if kind != "Model":
+            continue
+        arrays = objects[geometry_of[model]][2]
+        vertices = len(arrays["Vertices"]) // 3
+        corners = [int(value) for value in arrays["PolygonVertexIndex"]]
+        indices = [value if value >= 0 else -value - 1 for value in corners]
+        if indices and not 0 <= min(indices) <= max(indices) < vertices:
+            failures.append("{0}: a corner indexes outside its {1} vertices".format(name, vertices))
+        if len(arrays["Normals"]) != 3 * len(corners):
+            failures.append("{0}: {1} normal values for {2} corners".format(
+                name, len(arrays["Normals"]), len(corners)))
+        uv_sets = sorted(int(key.split("#")[1]) for key in arrays if key.startswith("UVIndex#"))
+        if uv_sets != list(range(int(record.get("uv_sets") or 0))):
+            failures.append("{0}: UV sets {1}, the record says {2}".format(
+                name, uv_sets, record.get("uv_sets")))
+        for uv_index in uv_sets:
+            table = arrays["UV#{0}".format(uv_index)]
+            corner_uv = arrays["UVIndex#{0}".format(uv_index)]
+            if len(corner_uv) != len(corners) or max(corner_uv) >= len(table) // 2:
+                failures.append("{0}: UV set {1} does not cover its corners".format(name, uv_index))
+        polygons = sum(1 for value in corners if value < 0)
+        materials = [int(value) for value in arrays["Materials"]]
+        if len(materials) != polygons:
+            failures.append("{0}: {1} material indices for {2} polygons".format(
+                name, len(materials), polygons))
+        for index in materials:
+            key = (name, materials_of[model][index])
+            counts[key] = counts.get(key, 0) + 1
+        values = arrays["Vertices"]
+        positions[name] = [values[at:at + 3] for at in range(0, len(values), 3)]
     for entry in record.get("scene", []):
         for texture_set, declared in entry.get("texture_sets", {}).items():
             found = counts.get((entry["name"], texture_set), 0)
@@ -222,8 +280,8 @@ def verify_surface(path, record):
         rows = positions.get(entry["name"], [])
         for axis in range(3):
             column = [row[axis] for row in rows]
-            if column and (min(column) < entry["bounds_min"][axis] - 1e-9
-                           or max(column) > entry["bounds_max"][axis] + 1e-9):
+            if column and (min(column) < entry["bounds_min"][axis] - 1e-6
+                           or max(column) > entry["bounds_max"][axis] + 1e-6):
                 failures.append("{0}: axis {1} leaves its declared bounds".format(
                     entry["name"], axis))
     return failures, counts

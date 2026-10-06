@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 8
+FORMAT_VERSION = 9
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -43,14 +43,19 @@ ASK_FOR_INPUTS = "inputs"
 #: application with Texture Sets, which knows what its shader reads and asks for
 #: exactly that.
 ASK_TO_TAKE_TEXTURES = "take_textures"
+#: "These Texture Sets are about to change layout: say which UV sets their content
+#: reads and hand over their mesh maps": answered by the application with Texture
+#: Sets, on the textures topic, so the side that owns the coordinates can lay the
+#: maps out again in the same step that moves the coordinates.
+ASK_FOR_LAYOUT = "layout"
+#: The shape of that answer.
+LAYOUT_ANSWER = "layout"
 
 RECORD_FILE_NAME = "record.json"
 #: A rig and its performance, as the animation tools on either side read it.
 SCENE_FILE_NAME = "scene.glb"
-#: The surface somebody paints on, as the texturing tool reads it, and the library
-#: beside it that names its materials.
-SURFACE_FILE_NAME = "surface.obj"
-SURFACE_MATERIALS_FILE_NAME = "surface.mtl"
+#: The surface somebody paints on, as the texturing tool reads it.
+SURFACE_FILE_NAME = "surface.fbx"
 TEXTURE_DIRECTORY_NAME = "maps"
 
 #: The texturing tool's own length unit, per metre. A project the bridge starts
@@ -140,7 +145,8 @@ def same_frame(first, second, tolerance=1e-9):
                for a, b in zip(first["offset"], second["offset"]))
 
 
-def mesh(source, scene_file, scene, materials, frame_of_project):
+def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_sets,
+         fingerprints, relaid=None):
     """The surface somebody paints on, in the frame of the project it is for.
 
     ``scene`` describes what went into the file (object names, how many faces
@@ -149,6 +155,21 @@ def mesh(source, scene_file, scene, materials, frame_of_project):
     carried verbatim; each names the Texture Set it paints into, which is also the
     material name the file carries, because a texturing tool matches its Texture
     Sets by that name.
+
+    ``layouts`` is every Texture Set's chart table (see ``layout``), the
+    coordinates its ``uv_sets`` UV sets hold; the texturing side keeps everything
+    read through a chart reading the same coordinates. ``relaid`` carries, for a
+    Texture Set whose layout is a chart the texturing side has no mesh maps for
+    yet, those maps laid out in it: ``{Texture Set: {"chart": chart, "mesh_maps":
+    {usage: {"file": name, "hash": sha1}}, "fills": {uid: {"path": path}}}}``, the
+    mesh maps beside the record; ``fills`` are pictures of tangent normals carried into
+    the new layout's frames in place, for the fills reading them, on disk where they
+    stay.
+
+    ``fingerprints`` is, per Texture Set, a digest of its polygons and their layout
+    coordinates as they cross: what its mesh maps are laid out on. The texturing side
+    keeps the one it applied and hands it back with a layout answer, so the side that
+    lays the maps out again knows they were laid out on the coordinates it holds.
     """
     record = _base("mesh", source)
     record.update({
@@ -156,6 +177,10 @@ def mesh(source, scene_file, scene, materials, frame_of_project):
         "scene": scene,
         "materials": materials,
         "frame": frame_of_project,
+        "layouts": layouts,
+        "uv_sets": int(uv_sets),
+        "fingerprints": dict(fingerprints),
+        "relaid": relaid or {},
     })
     return record
 
@@ -204,6 +229,43 @@ def textures(source, document, directory, texture_sets):
         "document": document,
         "directory": str(directory),
         "texture_sets": texture_sets,
+    })
+    return record
+
+
+def layout_answer(source, texture_set, request, fingerprint, uv_sets_used, uv_sets_taken,
+                  mesh_maps, fills, convention, refused):
+    """A Texture Set about to change layout, as the texturing side holds it.
+
+    ``request`` is the generation of the ask it answers. ``fingerprint`` is the
+    Texture Set's from the surface the project holds (see ``mesh``), empty when the
+    surface came without one. ``uv_sets_used`` are the
+    UV sets the Texture Set's content reads, its own and shared with other Texture
+    Sets; ``uv_sets_taken`` every UV set anything in the project reads or any
+    Texture Set declares. ``mesh_maps`` is ``{usage: {"file": name, "kind": kind}}``
+    beside the record, each laid out in the Texture Set's current layout; ``kind``
+    says how its values follow a layout change (``tangent``, ``label`` or ``value``).
+    ``fills`` are the content laying tangent normals through a chart: ``{"uid", "name",
+    "index", "members", "source", "file", "render"}`` -- the UV set it reads, the
+    Texture Sets showing it, ``bitmap`` or ``procedural``, the picture's own file when it
+    is on disk (with ``reading``, a render of the picture alone), else its normals
+    rendered in the current layout beside the record. ``convention`` names the exports
+    that tell which way the stored tangent maps point their green, how the normal channel
+    combines with the mesh map, and -- with ``fresh`` -- a picture Painter had never seen
+    and its render, when there are any. ``refused`` says why the layout cannot change,
+    when it cannot.
+    """
+    record = _base(LAYOUT_ANSWER, source)
+    record.update({
+        "texture_set": texture_set,
+        "request": int(request),
+        "fingerprint": str(fingerprint),
+        "uv_sets_used": sorted(int(index) for index in uv_sets_used),
+        "uv_sets_taken": sorted(int(index) for index in uv_sets_taken),
+        "mesh_maps": mesh_maps,
+        "fills": list(fills),
+        "convention": convention,
+        "refused": refused,
     })
     return record
 

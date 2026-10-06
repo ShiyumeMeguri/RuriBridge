@@ -32,7 +32,7 @@ import substance_painter.resource
 
 from ...Kernel.log import logger
 
-from .mesh_ingest import METADATA_CONTEXT
+from . import project_facts
 
 LOG = logger("painter.imports")
 
@@ -44,12 +44,11 @@ _save = {"target": None, "due": None}
 
 
 def _registered():
-    metadata = substance_painter.project.Metadata(METADATA_CONTEXT)
-    return list(metadata.get(IMPORTS_KEY) or []) if IMPORTS_KEY in metadata.list() else []
+    return list(project_facts.read(IMPORTS_KEY) or [])
 
 
 def _write(entries):
-    substance_painter.project.Metadata(METADATA_CONTEXT).set(IMPORTS_KEY, entries)
+    project_facts.write(IMPORTS_KEY, entries)
 
 
 def take_in(path, usage, name=None):
@@ -62,6 +61,16 @@ def take_in(path, usage, name=None):
         entries.append(entry)
         _write(entries)
     return resource
+
+
+def keep(resources):
+    """Hold these imports out of the sweep while nothing uses them, and let every other go
+    again: ``resources`` is the whole list of ``{"name", "version"}`` worth keeping."""
+    wanted = {(entry["name"], entry["version"]) for entry in resources}
+    entries = _registered()
+    updated = [dict(entry, kept=(entry["name"], entry["version"]) in wanted) for entry in entries]
+    if updated != entries:
+        _write(updated)
 
 
 def sweep():
@@ -77,7 +86,7 @@ def sweep():
             substance_painter.resource.ResourceID.from_project(entry["name"], entry["version"]))
         if not found:
             continue
-        if found[0].identifier().url() in used:
+        if entry.get("kept") or found[0].identifier().url() in used:
             kept.append(entry)
             continue
         native_resource.delete_resource(found[0].handle)

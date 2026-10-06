@@ -15,6 +15,9 @@ The same verbs as Painter's end, from this side, and one table:
   its own, as images in the same folder.
 * **The table** says which material paints into which Texture Set, and is the one
   thing edited by hand -- from here or from Painter.
+* **Retarget Layout** moves the active material's Texture Set to the UV layout another
+  UV map of its meshes holds (``layout_retarget``): Painter keeps every layer, reading
+  what was laid out in the old layout through the map that holds it now.
 
 Nothing is sent on its own. Every crossing is somebody pressing a button, here or
 in Painter, so a timer here only reads a few integers out of the mapped control
@@ -30,6 +33,7 @@ import bpy
 
 from ...Kernel import arena as arena_module
 from ...Kernel import host as host_port
+from ...Kernel import layout as layout_module
 from ...Kernel import log as log_module
 from ...Kernel import painter_host
 from ...Kernel import peers as peers_module
@@ -38,15 +42,17 @@ from ...Kernel import session as session_module
 from ...Kernel import summon as summon_module
 from ...Kernel import topic as topic_module
 
-from . import (glb_ingest, material_inputs, mesh_publish, pixels, shader_ingest, slot_compose,
-               texture_ingest)
+from . import (chart_resample, fbx_surface, glb_ingest, layout_retarget, layout_triangles,
+               layouts, material_inputs, material_relayout, mesh_publish, pixels, shader_ingest,
+               slot_compose, texture_ingest)
 
 # Kernel.host is deliberately absent: it holds the bound driver, and reloading it
 # would clear the binding while everything that already imported it kept the old
 # module object -- "no application is bound", from the next call on.
-for _module in (arena_module, record_module, topic_module, session_module,
-                glb_ingest, mesh_publish, pixels, slot_compose, texture_ingest, material_inputs,
-                shader_ingest):
+for _module in (arena_module, record_module, topic_module, session_module, layout_module,
+                glb_ingest, fbx_surface, layouts, mesh_publish, pixels, slot_compose,
+                texture_ingest, material_inputs, shader_ingest, chart_resample, layout_triangles,
+                material_relayout, layout_retarget):
     importlib.reload(_module)
 
 LOG = log_module.logger("blender")
@@ -433,6 +439,19 @@ def exclude(material_name, excluded):
     refresh_view(force=True)
 
 
+def retarget_layout(context, target_layer):
+    """Move the Texture Set the active material paints to the layout its meshes hold in
+    ``target_layer``: the render map takes that layout and ``target_layer`` the one it has
+    now. Painter is asked first, and the change completes with its answer."""
+    if not painter_is_attached():
+        raise RuntimeError("Painter is not attached, and a layout change keeps its layers "
+                           "only with it")
+    material = context.object.active_material if context.object is not None else None
+    if material is None:
+        raise RuntimeError("the active object has no active material")
+    return layout_retarget.begin(CONNECTION.session, material, target_layer)
+
+
 def follow_rename(material_name):
     """A material renamed here: rename its Texture Set to match, and keep painting it."""
     material = bpy.data.materials.get(material_name)
@@ -528,9 +547,13 @@ def reset_mapping(material_name):
 def _receive(topic, generation):
     """One arrival, dispatched on the topic it arrived on."""
     if topic is topic_module.TEXTURES:
-        report = texture_ingest.ingest(generation)
+        if generation.kind == record_module.LAYOUT_ANSWER:
+            line = layout_retarget.complete(bpy.context, CONNECTION.session, generation,
+                                            project_frame(bpy.context), textures_directory())
+        else:
+            line = texture_ingest.ingest(generation)
         refresh_view(force=True)
-        return report
+        return line
     if topic is topic_module.ANIMATION:
         path = generation.directory / generation.record["scene_file"]
         return glb_ingest.apply_performance(
@@ -604,10 +627,10 @@ def pump():
         try:
             result = _receive(endpoint.topic, generation)
             handled.append((endpoint.topic.key, generation.number, result))
-            if endpoint.topic is topic_module.TEXTURES:
-                say(_describe(result))
-            elif isinstance(result, str):
+            if isinstance(result, str):
                 say(result)
+            elif endpoint.topic is topic_module.TEXTURES:
+                say(_describe(result))
         except Exception as error:
             LOG.error("%s generation %d from %s failed and is being skipped: %s",
                       endpoint.topic.key, generation.number, endpoint.peer, error)
@@ -945,6 +968,39 @@ class RURIBRIDGE_OT_exclude(bpy.types.Operator):
     def execute(self, context):
         try:
             exclude(self.material, self.excluded)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+_TARGET_ITEMS = []
+
+
+def _target_items(_operator, context):
+    """The UV maps every mesh wearing the active material's Texture Set has besides the
+    one it renders with. Kept alive on purpose (see ``_material_items``)."""
+    material = context.object.active_material if context.object is not None else None
+    names = layout_retarget.target_layers(material) if material is not None else []
+    _TARGET_ITEMS[:] = [(name, name, "Lay the Texture Set out as {0} holds it; {0} keeps the "
+                                     "layout it has now".format(name)) for name in names]
+    return _TARGET_ITEMS
+
+
+class RURIBRIDGE_OT_retarget_layout(bpy.types.Operator):
+    bl_idname = "ruri_bridge.retarget_layout"
+    bl_label = "Retarget Layout"
+    bl_description = ("Move the active material's Texture Set to the UV layout another UV map "
+                      "of every mesh wearing it holds: the two maps swap on its faces, Painter "
+                      "keeps every layer and lays its mesh maps out again, and the material's "
+                      "own pictures are laid out again beside them")
+    bl_property = "target"
+
+    target: bpy.props.EnumProperty(items=_target_items)
+
+    def execute(self, context):
+        try:
+            say(retarget_layout(context, self.target))
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
@@ -1414,6 +1470,49 @@ class RURIBRIDGE_PT_pull_mapping(bpy.types.Panel):
             _draw_mapping(layout, material, row["texture_set"])
 
 
+def _chart_text(chart):
+    return chart[:8] if chart else "as first sent"
+
+
+class RURIBRIDGE_PT_layout(bpy.types.Panel):
+    bl_label = "UV Layout"
+    bl_idname = "RURIBRIDGE_PT_layout"
+    bl_parent_id = "RURIBRIDGE_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "RuriBridge"
+
+    def draw(self, context):
+        layout = self.layout
+        material = context.object.active_material if context.object is not None else None
+        if material is None:
+            layout.label(text="No active material", icon="INFO")
+            return
+        texture_set = mesh_publish.texture_set_of(material)
+        if not texture_set:
+            layout.label(text="{0} is kept out of Painter".format(material.name), icon="INFO")
+            return
+        box = layout.box()
+        box.label(text="{0} -> {1}".format(material.name, texture_set), icon="MATERIAL")
+        try:
+            table = layouts.table_of(material)
+        except Exception as error:
+            box.label(text=str(error), icon="ERROR")
+            return
+        box.label(text="Render UV map: layout {0}".format(_chart_text(table["layout"])),
+                  icon="UV")
+        for index, entry in sorted(table["extra"].items(), key=lambda item: int(item[0])):
+            box.label(text="UV set {0}: {1} holds layout {2}".format(
+                index, entry["layer"], _chart_text(entry["chart"])), icon="UV_DATA")
+        if texture_set in layout_retarget.waiting():
+            layout.label(text="Waiting for Painter", icon="SORTTIME")
+            return
+        row = layout.row()
+        row.enabled = CONNECTION.is_open and painter_is_attached()
+        row.operator_menu_enum(RURIBRIDGE_OT_retarget_layout.bl_idname, "target",
+                               text="Retarget Layout To", icon="UV_SYNC_SELECT")
+
+
 class RURIBRIDGE_PT_cascadeur(bpy.types.Panel):
     bl_label = "Cascadeur"
     bl_idname = "RURIBRIDGE_PT_cascadeur"
@@ -1434,12 +1533,14 @@ _CLASSES = (RuriBridgePreferences,
             RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_push_shader, RURIBRIDGE_OT_pull_shader,
             RURIBRIDGE_OT_push_textures, RURIBRIDGE_OT_pull_textures,
             RURIBRIDGE_OT_pull_selected_layer, RURIBRIDGE_OT_bind, RURIBRIDGE_OT_exclude,
-            RURIBRIDGE_OT_follow_rename, RURIBRIDGE_OT_map_texture, RURIBRIDGE_OT_invert_lane,
+            RURIBRIDGE_OT_follow_rename, RURIBRIDGE_OT_retarget_layout,
+            RURIBRIDGE_OT_map_texture, RURIBRIDGE_OT_invert_lane,
             RURIBRIDGE_OT_open_lanes, RURIBRIDGE_OT_reset_mapping,
             RURIBRIDGE_OT_start_painter, RURIBRIDGE_OT_reattach,
             RURIBRIDGE_OT_locate_painter, RURIBRIDGE_OT_locate_cascadeur,
             RURIBRIDGE_OT_send_animation, RURIBRIDGE_OT_fetch_animation,
-            RURIBRIDGE_PT_panel, RURIBRIDGE_PT_pull_mapping, RURIBRIDGE_PT_cascadeur)
+            RURIBRIDGE_PT_panel, RURIBRIDGE_PT_layout, RURIBRIDGE_PT_pull_mapping,
+            RURIBRIDGE_PT_cascadeur)
 
 
 def register():
