@@ -30,16 +30,19 @@ class Triangles:
     """The triangles of some materials' faces: their corners' coordinates in the render
     and the target map, ``(triangles, 3, 2)``, in any further maps asked for (``extra``,
     by name), and when asked for, their normals and the MikkTSpace tangent and bitangent
-    sign the render and the target map give them."""
+    sign the render map, the target map and every further map give them (the further
+    maps' as ``extra_frames``, by name)."""
 
     __slots__ = ("render", "target", "normal", "render_tangent", "render_sign",
-                 "target_tangent", "target_sign", "extra")
+                 "target_tangent", "target_sign", "extra", "extra_frames")
 
-    def __init__(self, parts, extra):
-        for name in self.__slots__[:-1]:
+    def __init__(self, parts, extra, extra_frames):
+        for name in self.__slots__[:-2]:
             values = parts.get(name)
             setattr(self, name, numpy.concatenate(values) if values else None)
         self.extra = {name: numpy.concatenate(values) for name, values in extra.items()}
+        self.extra_frames = {name: tuple(numpy.concatenate(part) for part in zip(*values))
+                             for name, values in extra_frames.items() if values}
 
     def frames(self, layer):
         """The frames a tangent normal decoded in ``layer`` -- ``""`` for the render map,
@@ -49,6 +52,16 @@ class Triangles:
                                          self.target_tangent, self.target_sign)
         return chart_resample.Frames(self.normal, self.target_tangent, self.target_sign,
                                      self.render_tangent, self.render_sign)
+
+    def reading(self, layer):
+        """The frames a tangent normal laid out in the chart ``layer`` holds -- ``""`` for
+        the render map -- is right in, the frames that chart gave the surface when it was
+        the layout, carried into the target map's: what a fill reading that chart lays,
+        where nothing turned it, is read in."""
+        if layer == "":
+            return self.frames("")
+        tangent, sign = self.extra_frames[layer]
+        return chart_resample.Frames(self.normal, tangent, sign, self.target_tangent, self.target_sign)
 
 
 def _coordinates(mesh, uv_map):
@@ -120,11 +133,12 @@ def gather(objects, materials, render_names, target_layer, frames, extra_layers=
 
     ``render_names`` names each mesh's render map, by the pointer of its mesh. The
     surface is read as Painter is given it (``mesh_publish.surface_only``). With
-    ``frames`` the tangent frames come too; ``extra_layers`` are further maps read by
-    name. None when no such face is there."""
+    ``frames`` the tangent frames come too, of every map read; ``extra_layers`` are further
+    maps read by name. None when no such face is there."""
     wanted = {material.as_pointer() for material in materials}
     parts = {name: [] for name in Triangles.__slots__}
     extra = {name: [] for name in extra_layers}
+    extra_frames = {name: [] for name in extra_layers}
     with mesh_publish.surface_only(objects):
         depsgraph = bpy.context.evaluated_depsgraph_get()
         depsgraph.update()
@@ -159,13 +173,16 @@ def gather(objects, materials, render_names, target_layer, frames, extra_layers=
                     mesh.corner_normals.foreach_get("vector", normals)
                     normals = normals.reshape(-1, 3)
                     parts["normal"].append(normals[corners])
-                    found = _frames_of(mesh, loops, normals, [name for _key, name in maps])
+                    found = _frames_of(mesh, loops, normals, [name for _key, name in maps] + list(extra))
                     for key, name in maps:
                         tangent, sign = found[name]
                         parts[key + "_tangent"].append(tangent[chosen])
                         parts[key + "_sign"].append(sign[chosen])
+                    for name in extra:
+                        tangent, sign = found[name]
+                        extra_frames[name].append((tangent[chosen], sign[chosen]))
             finally:
                 evaluated.to_mesh_clear()
     if not parts["render"]:
         return None
-    return Triangles(parts, extra)
+    return Triangles(parts, extra, extra_frames)

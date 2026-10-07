@@ -921,7 +921,7 @@ def answer(publisher, texture_set_name, request_number):
             normal_fills = _normal_fills(fills, texture_set, staging,
                                          dict(project_facts.read(NORMALS_KEY) or {}))
             pictured = [entry for entry in normal_fills if not entry["procedural"]]
-            if pictured or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
+            if normal_fills or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
                 convention = _convention_maps(texture_set, staging.directory)
             if pictured:
                 convention["fresh"] = _readings(texture_set, pictured, fills, staging)

@@ -301,11 +301,13 @@ def _relaid_fills(record, generation, triangles, frames, green, table, texture_s
     Painter takes it, or Painter's render of it, both laid out in that chart, and is written
     the way Painter takes one it has never seen; any other picture is its own file, written
     as it was stored -- one past 0..1 in a channel that holds such values is refused, a
-    picture file holding none. Normals a substance computes stay computed, and pictures other Texture Sets show
-    too stay as they are, their islands not moving: those bending under turning islands are
-    named. Returns the pictures by fill, those names, and the most, in degrees, a picture
-    turned where its texels lie parts from itself at texels two islands of the chart share,
-    which hold the later island's."""
+    picture file holding none. Normals a substance computes stay computed, and pictures
+    other Texture Sets show too stay as they are, their islands not moving: those bending
+    under islands turning from the chart they read -- the layout they were made in -- are
+    named, each with the most, in degrees, its normals point off.
+    Returns the pictures by fill, those names, and the most, in degrees, a picture turned
+    where its texels lie parts from itself at texels two islands of the chart share, which
+    hold the later island's."""
     turning = frames.turning()
     replaced = {}
     kept = []
@@ -325,20 +327,22 @@ def _relaid_fills(record, generation, triangles, frames, green, table, texture_s
         declared = table["extra"].get(str(fill["index"])) if fill["index"] else None
         layout = triangles.extra[declared["layer"]] if declared else triangles.render
         values, _wide = pixels.read(fill["file"] or str(generation.path(fill["render"])))
-        if not _bent(values, layout, turning):
+        unturned = fill["procedural"] or bool(set(fill["members"]) - {texture_set})
+        carried = triangles.reading(declared["layer"] if declared else "") if unturned else frames
+        if not _bent(values, layout, carried.turning() if unturned else turning):
             continue
-        if fill["procedural"] or set(fill["members"]) - {texture_set}:
-            kept.append(fill["name"])
-            continue
-        if not directory:
-            raise RuntimeError("this .blend has never been saved, so the normals of {0} turned into "
-                               "the new frames have no textures folder to go to".format(texture_set))
         taken = 1.0
         if fill["file"]:
             reading, _wide = pixels.read(str(generation.path(fill["reading"])))
             taken = _taken(fill["file"], reading)
         opaque = bool((values[..., 3] == 1.0).all())
         lanes = values[..., :3] if opaque else values
+        if unturned:
+            kept.append((fill["name"], chart_resample.turned_by(lanes, layout, carried, green() * taken)))
+            continue
+        if not directory:
+            raise RuntimeError("this .blend has never been saved, so the normals of {0} turned into "
+                               "the new frames have no textures folder to go to".format(texture_set))
         laid = chart_resample.relaid(lanes, layout, triangles.target if fill["pixels"] else layout, "tangent",
                                      frames, green() * taken, written())
         stem = (os.path.splitext(os.path.basename(fill["file"]))[0] if fill["file"]
@@ -476,7 +480,7 @@ def complete(context, session, generation, frame_of_project, directory):
         if retargeted["layout"] not in record["kept"]:
             relaid = _relaid_mesh_maps(record, generation, triangles, frames,
                                        green() if turning and tangent_maps else 1.0)
-        if turning and record["fills"]:
+        if record["fills"]:
             fills, kept, apart = _relaid_fills(record, generation, triangles, frames, green, table,
                                                texture_set, directory, set(restored))
         if record["pictures"]:
@@ -503,10 +507,11 @@ def complete(context, session, generation, frame_of_project, directory):
                 texture_set, pending.source, target_layer, len(relaid), len(pictures), installed, len(fills),
                 len(restored), sent.number))
     if kept:
+        named = ", ".join("{0} (off by up to {1:.3g} degrees)".format(name, degrees) for name, degrees in kept)
         LOG.info("%s: where islands turned, the normals of %s keep the directions the old islands gave "
-                 "them", texture_set, ", ".join(kept))
-        line += ("; where islands turned, the normals of {0} keep the directions the old islands gave "
-                 "them".format(", ".join(kept)))
+                 "them", texture_set, named)
+        line += "; where islands turned, the normals of {0} keep the directions the old islands gave them".format(
+            named)
     if apart:
         LOG.info("%s: texels two islands of the old layout share part by up to %.3g degrees once turned",
                  texture_set, apart)

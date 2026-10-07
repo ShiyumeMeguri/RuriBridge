@@ -249,6 +249,33 @@ def pad(picture, covered):
     return filled
 
 
+def _decoded(lanes, green):
+    """Stored normal lanes as vectors read with ``green`` -- the first three, premultiplied
+    by a fourth when there is one -- and which of them any coverage holds."""
+    coverage = lanes[:, 3] if lanes.shape[1] > 3 else numpy.ones(len(lanes))
+    covered = coverage > 0.0
+    vectors = numpy.zeros((len(lanes), 3))
+    vectors[covered] = lanes[covered, :3] / coverage[covered, None] * 2.0 - 1.0
+    vectors[:, 1] *= green
+    return vectors, covered
+
+
+def _degrees(first, second):
+    cosine = numpy.clip(numpy.sum(_unit(first) * _unit(second), axis=1), -1.0, 1.0)
+    return float(numpy.degrees(numpy.arccos(cosine)).max()) if len(cosine) else 0.0
+
+
+def turned_by(picture, triangles, frames, green=1.0):
+    """The most, in degrees, the frames after a layout change turn the normals of a tangent
+    picture laid out in ``triangles``: how far those normals point off when they are read in
+    the new frames as they are."""
+    picture = numpy.asarray(picture, dtype=numpy.float64)
+    height, width = picture.shape[:2]
+    texels, owners, weights = rasterize(triangles, width, height, every=True)
+    vectors, covered = _decoded(picture.reshape(-1, picture.shape[2])[texels], green)
+    return _degrees(vectors[covered], _carried(vectors[covered], weights[covered], owners[covered], frames))
+
+
 def turned_apart(picture, triangles, frames, green=1.0):
     """The most, in degrees, a tangent picture laid out in ``triangles`` parts from itself
     once carried into the frames after a layout change, at the texel centres two of its
@@ -257,21 +284,11 @@ def turned_apart(picture, triangles, frames, green=1.0):
     height, width = picture.shape[:2]
     texels, owners, weights = rasterize(triangles, width, height, every=True)
     again = numpy.flatnonzero(texels[1:] == texels[:-1])
-    if not len(again):
-        return 0.0
     pairs = numpy.concatenate((again, again + 1))
-    lanes = picture.reshape(-1, picture.shape[2])[texels[pairs]]
-    coverage = lanes[:, 3] if lanes.shape[1] > 3 else numpy.ones(len(lanes))
-    covered = coverage > 0.0
-    vectors = numpy.zeros((len(lanes), 3))
-    vectors[covered] = lanes[covered, :3] / coverage[covered, None] * 2.0 - 1.0
-    vectors[:, 1] *= green
-    carried = _unit(_carried(vectors, weights[pairs], owners[pairs], frames))
+    vectors, covered = _decoded(picture.reshape(-1, picture.shape[2])[texels[pairs]], green)
+    carried = _carried(vectors, weights[pairs], owners[pairs], frames)
     both = covered[:len(again)] & covered[len(again):]
-    if not both.any():
-        return 0.0
-    cosine = numpy.clip(numpy.sum(carried[:len(again)][both] * carried[len(again):][both], axis=1), -1.0, 1.0)
-    return float(numpy.degrees(numpy.arccos(cosine)).max())
+    return _degrees(carried[:len(again)][both], carried[len(again):][both])
 
 
 def relaid(picture, old_triangles, new_triangles, kind, frames=None, green=1.0, green_after=None, size=None):
