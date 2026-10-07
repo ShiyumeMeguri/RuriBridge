@@ -41,10 +41,19 @@ a fill's does; any other picture goes to Blender, comes back laid out in the new
 and takes its place (``pictures``).
 
 A fill whose UV transformation tiles, turns or offsets its source is a tile: a pattern
-laid in UV space, which keeps tiling the new layout. It is left as it is, because
-Painter's UV-set-to-UV-set projection samples a transformed source with other filtering
-and does not turn the normals of a turned one -- switching it would change the very
-Texture Sets that share it without being retargeted.
+laid across UV space. It reads the old layout like any other fill, its transformation
+kept, so the pattern lies where it lay on the surface; its normals are left as they are.
+Painter turns the normals of a turned tile laid through set 0 and not of one read through
+another UV set, so a turned tile laying normals that other Texture Sets show too stays
+laid through set 0: reading another UV set would turn its normals in them as well.
+
+A generator in a mask computes from the mesh maps of the layout it computes in. One that
+shows every image input its package declares -- none of them bound by Painter itself from
+the layout of set 0, as a UV island mask is -- and that no other Texture Set shows goes on
+computing in the old layout: the bridge lays in its place a fill of the same substance,
+with its inputs, parameters, blending and opacity, read through the old layout, its mesh
+map inputs bound to the old layout's maps (``CARRIED_KEY``). Moving back to that layout
+makes it a generator again. Any other generator computes in the layout of set 0.
 
 Each Texture Set's chart table (``Kernel.layout``) comes from Blender with every
 surface; the tables applied last live in the project, beside the layers they
@@ -60,6 +69,7 @@ before. Maps of a chart the project no longer reads are not kept.
 from __future__ import annotations
 
 import json
+import lzma
 import os
 import struct
 import zlib
@@ -76,7 +86,7 @@ from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import held_imports, project_facts, project_imports
+from . import held_imports, project_facts, project_imports, substance_package
 
 LOG = logger("painter.layout")
 
@@ -93,6 +103,11 @@ SURFACE_KEY = "surface"
 #: "version"}}}`` -- ``pixels`` when the fill took them laid out in the new layout and reads
 #: set 0 for them.
 NORMALS_KEY = "normals"
+
+#: Per fill the bridge laid in a generator's place, by uid, the Texture Set it shows in and
+#: the layout set 0 held when it was a generator, ``{"texture_set", "layout"}``: moving back
+#: to that layout makes it a generator again.
+CARRIED_KEY = "carried"
 
 #: Painter's mesh maps: the name its JavaScript export knows each by, and how its
 #: values change when the layout under them changes -- a tangent-space normal turns
@@ -129,11 +144,14 @@ class Addressed:
     """One fill that reads its source through a chart, every Texture Set showing it, the
     pictures it reads, where its tangent normals come from (``normal_content``) when it
     lays any and whether it lays nothing but pictures and uniform colours through set 0
-    (``pixels``), and the Texture Sets whose own mesh map it reads (``following``)."""
+    (``pixels``), the Texture Sets whose own mesh map it reads (``following``), whether it
+    is a generator the bridge carries as a fill (``generator``), and for a tile the degrees
+    its transformation turns its source by (``tiled``, ``turn``)."""
 
-    __slots__ = ("uid", "name", "index", "members", "layer", "normal", "pixels", "pictures", "following")
+    __slots__ = ("uid", "name", "index", "members", "layer", "normal", "pixels", "pictures", "following",
+                 "generator", "tiled", "turn")
 
-    def __init__(self, uid, name, index, layer, normal, pixels, pictures):
+    def __init__(self, uid, name, index, layer, normal, pixels, pictures, generator, tiled, turn):
         self.uid = uid
         self.name = name
         self.index = index
@@ -143,12 +161,20 @@ class Addressed:
         self.pixels = pixels
         self.pictures = pictures
         self.following = set()
+        self.generator = generator
+        self.tiled = tiled
+        self.turn = turn
+
+
+def _turn(transformation):
+    """The degrees a UV transformation turns its source by, in [-180, 180)."""
+    return ((transformation.rotation or 0.0) + 180.0) % 360.0 - 180.0
 
 
 def _identity(transformation):
     return (transformation.scale_mode == layerstack.ScaleMode.Factors
             and all(abs(value - 1.0) <= _TOLERANCE for value in transformation.scale)
-            and abs(((transformation.rotation or 0.0) + 180.0) % 360.0 - 180.0) <= _TOLERANCE
+            and abs(_turn(transformation)) <= _TOLERANCE
             and all(abs(value) <= _TOLERANCE for value in transformation.offset))
 
 
@@ -186,13 +212,11 @@ def _pictures(source):
 
 def chart_index(node):
     """The UV set a fill reads its source through, or None when it reads no chart: a 3D
-    projection, a tile, a fill of uniform colours, or one reading the stack itself."""
+    projection, a fill of uniform colours, or one reading the stack itself."""
     mode = node.get_projection_mode()
     if mode == layerstack.ProjectionMode.UVSetToUVSet:
         index = int(node.get_projection_parameters().source_uv_set or 0)
     elif mode == layerstack.ProjectionMode.UV:
-        if not _identity(node.get_projection_parameters().uv_transformation):
-            return None
         index = 0
     else:
         return None
@@ -286,6 +310,23 @@ def _laid_normal(node, in_mask):
     return normal
 
 
+def _carriable(node):
+    """Whether a generator can go on computing in another layout: Painter shows every image
+    input its package declares, binding none of them itself from the layout of set 0, and
+    none of them reads the stack."""
+    source = node.get_source()
+    if not isinstance(source, source_module.SourceSubstance) or _reads_stack(source):
+        return False
+    path = _file_of(source.resource_id.url())
+    if not path:
+        return False
+    try:
+        declared = substance_package.image_inputs(path, source.resource_id.name.rsplit("/", 1)[-1])
+    except (ValueError, lzma.LZMAError):
+        return False
+    return declared <= set(source.image_inputs)
+
+
 def _pictures_only(node):
     """Whether a fill lays nothing but pictures and uniform colours: nothing it lays is computed."""
     return all(isinstance(source, (source_module.SourceBitmap, source_module.SourceUniformColor))
@@ -310,14 +351,24 @@ def _visit(nodes, member, found, unplaceable, unprojected, in_mask=False):
                 else:
                     index = chart_index(node)
                     normal = None if index is None else _laid_normal(node, in_mask)
+                    transformation = None if index is None else node.get_projection_parameters().uv_transformation
+                    plain = index is not None and _identity(transformation)
                     found[uid] = None if index is None else Addressed(
                         uid, node.get_name(), index, isinstance(node, layerstack.FillLayerNode), normal,
-                        normal is not None and normal[0] == "bitmap" and index == 0 and _pictures_only(node),
-                        set().union(*(_pictures(source) for source in _sources(node) if source is not None)))
+                        normal is not None and normal[0] == "bitmap" and index == 0 and plain and _pictures_only(node),
+                        set().union(*(_pictures(source) for source in _sources(node) if source is not None)),
+                        False, not plain, 0.0 if plain else _turn(transformation))
             if found[uid] is not None:
                 found[uid].members.add(member)
             elif uid in unplaceable:
                 unplaceable[uid][1].add(member)
+        if in_mask and isinstance(node, layerstack.GeneratorEffectNode):
+            uid = node.uid()
+            if uid not in found:
+                found[uid] = (Addressed(uid, node.get_name(), 0, False, None, False, set(), True, False, 0.0)
+                              if _carriable(node) else None)
+            if found[uid] is not None:
+                found[uid].members.add(member)
         if isinstance(node, layerstack.LayerNode):
             _visit(node.content_effects(), member, found, unplaceable, unprojected, in_mask)
             _visit(node.mask_effects(), member, found, unplaceable, unprojected, True)
@@ -339,9 +390,12 @@ def _mesh_map_pictures(texture_set):
 def readers():
     """Every chart-addressed fill in the project, with the Texture Sets that show it and
     those whose own mesh map it reads -- Painter shows such a picture, in that Texture
-    Set, as whatever its mesh map is, and swaps it along with the map; the fills
-    projected per UV tile, which no chart can carry, with theirs; and every picture an
-    effect reads with no projection of its own."""
+    Set, as whatever its mesh map is, and swaps it along with the map -- and every
+    generator the bridge can carry as such a fill; the fills projected per UV tile, which
+    no chart can carry, with theirs; and every picture an effect it does not carry reads
+    with no projection of its own. A generator other Texture Sets show too stays a
+    generator, its mesh map inputs being each Texture Set's own; so does a turned tile
+    laying normals they show."""
     found = {}
     unplaceable = {}
     unprojected = {}
@@ -350,10 +404,14 @@ def readers():
         mesh_maps[texture_set.name] = _mesh_map_pictures(texture_set)
         for stack in texture_set.all_stacks():
             _visit(layerstack.get_root_layer_nodes(stack), texture_set.name, found, unplaceable, unprojected)
-    fills = [entry for entry in found.values() if entry is not None]
+    fills = [entry for entry in found.values() if entry is not None and not (
+        len(entry.members) > 1 and (entry.generator or (entry.turn and entry.normal is not None)))]
     for fill in fills:
-        fill.following = {member for member in fill.members if fill.pictures & mesh_maps.get(member, set())}
-    return fills, unplaceable, [entry for entries in unprojected.values() for entry in entries]
+        fill.following = (set() if fill.generator else
+                          {member for member in fill.members if fill.pictures & mesh_maps.get(member, set())})
+    carried = {fill.uid for fill in fills if fill.generator}
+    return fills, unplaceable, [entry for uid, entries in unprojected.items() if uid not in carried
+                                for entry in entries]
 
 
 # -- what the project applied last ------------------------------------------------------
@@ -385,10 +443,10 @@ class Plan:
     """What one surface changes, worked out before anything moves."""
 
     __slots__ = ("moves", "desired", "states", "relayouts", "nodes", "fingerprints", "fills", "pictures",
-                 "unprojected", "restored")
+                 "unprojected", "restored", "generators")
 
     def __init__(self, moves, desired, states, relayouts, nodes, fingerprints, fills, pictures, unprojected,
-                 restored):
+                 restored, generators):
         self.moves = moves
         self.desired = desired
         self.states = states
@@ -399,6 +457,7 @@ class Plan:
         self.pictures = pictures
         self.unprojected = unprojected
         self.restored = restored
+        self.generators = generators
 
     @property
     def changes_anything(self):
@@ -480,8 +539,9 @@ def plan(record, directory):
     if problems:
         raise layout_module.LayoutError("; ".join(problems))
     nodes = {fill.uid: fill.name for fill in fills}
+    generators = {fill.uid: next(iter(fill.members)) for fill in fills if fill.generator}
     return Plan(moves, desired, states, relayouts, nodes, dict(record.get("fingerprints") or {}),
-                replaced, pictures, held, restored)
+                replaced, pictures, held, restored, generators)
 
 
 # -- applying it -----------------------------------------------------------------------------
@@ -502,7 +562,7 @@ def _bind(uid, index):
 def before_surface(chosen):
     """Moves that read set 0 again go first: set 0 is on every surface."""
     for uid, index in sorted(chosen.moves.items()):
-        if index == 0:
+        if index == 0 and uid not in chosen.generators:
             _bind(uid, index)
 
 
@@ -572,6 +632,85 @@ def _turned(uid, replacement, records):
         _bind(uid, 0)
 
 
+def _copied(identifier, inner, target):
+    """Give a substance's input ``identifier`` what another's holds."""
+    if isinstance(inner, source_module.SourceUniformColor):
+        target.set_source(identifier, inner.get_color())
+    elif isinstance(inner, source_module.SourceSubstance):
+        nested = target.set_source(identifier, inner.resource_id)
+        for name in inner.image_inputs:
+            _copied(name, inner.get_source(name), nested)
+        nested.set_parameters(inner.get_parameters())
+    elif inner is not None:
+        target.set_source(identifier, inner.resource_id)
+
+
+def _slots(texture_set):
+    """The Texture Set's mesh maps now, by name and version, each with its usage."""
+    found = {}
+    for usage in MESH_MAPS:
+        resource = texture_set.get_mesh_map_resource(usage)
+        if resource is not None:
+            found[(resource.name, resource.version)] = usage.name
+    return found
+
+
+def _carry(uid, index, texture_set, maps, layout, carried):
+    """Lay in a generator's place a fill of the same substance read through UV set ``index``,
+    its mesh map inputs bound to ``maps`` -- the mesh maps of ``layout``, the layout it
+    computed in -- and all else it has as it was."""
+    generator = layerstack.get_node_by_uid(uid)
+    source = generator.get_source()
+    usages = _slots(texture_set)
+    for usage, entry in maps.items():
+        usages[(entry["name"], entry["version"])] = usage
+    fill = layerstack.insert_fill(layerstack.InsertPosition.above_node(generator))
+    procedural = fill.set_source(None, source.resource_id)
+    for identifier in source.image_inputs:
+        inner = source.get_source(identifier)
+        usage = (usages.get((inner.resource_id.name, inner.resource_id.version))
+                 if isinstance(inner, source_module.SourceBitmap) else None)
+        if usage is not None and usage in maps:
+            procedural.set_source(identifier, substance_painter.resource.ResourceID.from_project(
+                maps[usage]["name"], maps[usage]["version"]))
+        else:
+            _copied(identifier, inner, procedural)
+    procedural.set_parameters(source.get_parameters())
+    procedural.resolution = source.resolution
+    fill.set_name(generator.get_name())
+    fill.set_blending_mode(generator.get_blending_mode())
+    fill.set_opacity(generator.get_opacity())
+    fill.set_visible(generator.is_visible())
+    _bind(fill.uid(), index)
+    carried[str(fill.uid())] = {"texture_set": texture_set.name, "layout": layout}
+    layerstack.delete_node(generator)
+
+
+def _uncarry(uid, texture_set, carried):
+    """Make a fill the bridge laid in a generator's place that generator again, now that the
+    layout it computed in is set 0's: the inputs Painter binds to the Texture Set's mesh maps
+    left to it, all else as the fill has it."""
+    carried.pop(str(uid))
+    fill = layerstack.get_node_by_uid(uid)
+    procedural = fill.get_source(None)
+    generator = layerstack.insert_generator_effect(layerstack.InsertPosition.above_node(fill),
+                                                   procedural.resource_id)
+    source = generator.get_source()
+    slots = _slots(texture_set)
+    for identifier in procedural.image_inputs:
+        own = source.get_source(identifier) if identifier in source.image_inputs else None
+        if isinstance(own, source_module.SourceBitmap) and (own.resource_id.name, own.resource_id.version) in slots:
+            continue
+        _copied(identifier, procedural.get_source(identifier), source)
+    source.set_parameters(procedural.get_parameters())
+    source.resolution = procedural.resolution
+    generator.set_name(fill.get_name())
+    generator.set_blending_mode(fill.get_blending_mode())
+    generator.set_opacity(fill.get_opacity())
+    generator.set_visible(fill.is_visible())
+    layerstack.delete_node(fill)
+
+
 def _read_picture(entry, resource_id):
     """Make an effect read another picture where it read ``entry``'s."""
     node = layerstack.get_node_by_uid(entry.uid)
@@ -585,9 +724,10 @@ def _read_picture(entry, resource_id):
 
 def after_surface(chosen):
     """Moves to the other UV sets, the mesh maps of every Texture Set that changed layout,
-    the normals and the effects' pictures laid out anew, and the tables now applied."""
+    the normals and the effects' pictures laid out anew, the generators carried to the
+    layout they computed in or back, and the tables now applied."""
     for uid, index in sorted(chosen.moves.items()):
-        if index != 0:
+        if index != 0 and uid not in chosen.generators:
             _bind(uid, index)
     records = {key: value for key, value in dict(project_facts.read(NORMALS_KEY) or {}).items()
                if int(key) in chosen.nodes}
@@ -611,6 +751,16 @@ def after_surface(chosen):
         state["mesh_maps"][new] = maps
         _assign(texture_set, maps)
         replaced[name] = {usage: (current[usage], maps[usage]) for usage in current if usage in maps}
+    carried = {key: value for key, value in dict(project_facts.read(CARRIED_KEY) or {}).items()
+               if int(key) in chosen.nodes}
+    olds = {name: old for name, (_how, old, _new, _maps) in chosen.relayouts.items()}
+    for uid, index in sorted(chosen.moves.items()):
+        if uid in chosen.generators and index != 0:
+            name = chosen.generators[uid]
+            _carry(uid, index, names[name], states[name]["mesh_maps"][olds[name]], olds[name], carried)
+        elif str(uid) in carried and index == 0:
+            _uncarry(uid, names[carried[str(uid)]["texture_set"]], carried)
+    project_facts.write(CARRIED_KEY, carried)
     for key, replacement in sorted(chosen.pictures.items()):
         resource = project_imports.take_in(replacement["path"], substance_painter.resource.Usage.TEXTURE,
                                            name=os.path.splitext(os.path.basename(replacement["path"]))[0])
@@ -742,7 +892,8 @@ def _normal_fills(fills, texture_set, staging, records):
     """Every fill of the Texture Set laying tangent normals through a chart, with where they
     come from, laid out in the chart the fill reads: a picture's own file while it is on
     disk, else the normals rendered as the fill lays them -- the picture as Painter reads
-    it, or what a substance computes, which Blender only looks at. A fill laying nothing but
+    it, or what a substance computes, which Blender only looks at, as it does at a tile's
+    (``untouched``, with the degrees a tile turns its source by). A fill laying nothing but
     pictures, every other one of them a file on disk, hands over those files too, each with
     whether the channel it is laid in holds values past 0..1 (``pixels``)."""
     stack = texture_set.get_stack()
@@ -760,7 +911,8 @@ def _normal_fills(fills, texture_set, staging, records):
                     and isinstance(node.get_source(channel), source_module.SourceBitmap)]
         moving = fill.pixels and all(picture["file"] for picture in pictures)
         entry = {"uid": fill.uid, "name": fill.name, "index": fill.index, "members": sorted(fill.members),
-                 "procedural": kind != "bitmap", "pixels": moving, "pictures": pictures if moving else [],
+                 "untouched": kind != "bitmap" or fill.tiled, "turn": fill.turn,
+                 "pixels": moving, "pictures": pictures if moving else [],
                  "file": _file_of(url) if kind == "bitmap" else "", "render": "",
                  "restorable": records[str(fill.uid)]["layout"] if str(fill.uid) in records else None}
         if not entry["file"]:
@@ -920,7 +1072,7 @@ def answer(publisher, texture_set_name, request_number):
                 mesh_maps[usage.name] = {"file": file_name, "kind": kind}
             normal_fills = _normal_fills(fills, texture_set, staging,
                                          dict(project_facts.read(NORMALS_KEY) or {}))
-            pictured = [entry for entry in normal_fills if not entry["procedural"]]
+            pictured = [entry for entry in normal_fills if not entry["untouched"]]
             if normal_fills or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
                 convention = _convention_maps(texture_set, staging.directory)
             if pictured:

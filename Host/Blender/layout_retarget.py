@@ -301,8 +301,9 @@ def _relaid_fills(record, generation, triangles, frames, green, table, texture_s
     Painter takes it, or Painter's render of it, both laid out in that chart, and is written
     the way Painter takes one it has never seen; any other picture is its own file, written
     as it was stored -- one past 0..1 in a channel that holds such values is refused, a
-    picture file holding none. Normals a substance computes stay computed, and pictures
-    other Texture Sets show too stay as they are, their islands not moving: those bending
+    picture file holding none. Normals a substance computes stay computed, a tile's stay laid
+    by the tile, and pictures other Texture Sets show too stay as they are, their islands not
+    moving: those bending
     under islands turning from the chart they read -- the layout they were made in -- are
     named, each with the most, in degrees, its normals point off.
     Returns the pictures by fill, those names, and the most, in degrees, a picture turned
@@ -327,7 +328,7 @@ def _relaid_fills(record, generation, triangles, frames, green, table, texture_s
         declared = table["extra"].get(str(fill["index"])) if fill["index"] else None
         layout = triangles.extra[declared["layer"]] if declared else triangles.render
         values, _wide = pixels.read(fill["file"] or str(generation.path(fill["render"])))
-        unturned = fill["procedural"] or bool(set(fill["members"]) - {texture_set})
+        unturned = fill["untouched"] or bool(set(fill["members"]) - {texture_set})
         carried = triangles.reading(declared["layer"] if declared else "") if unturned else frames
         if not _bent(values, layout, carried.turning() if unturned else turning):
             continue
@@ -338,7 +339,8 @@ def _relaid_fills(record, generation, triangles, frames, green, table, texture_s
         opaque = bool((values[..., 3] == 1.0).all())
         lanes = values[..., :3] if opaque else values
         if unturned:
-            kept.append((fill["name"], chart_resample.turned_by(lanes, layout, carried, green() * taken)))
+            kept.append((fill["name"], chart_resample.turned_by(lanes, layout, carried, green() * taken,
+                                                                fill["turn"])))
             continue
         if not directory:
             raise RuntimeError("this .blend has never been saved, so the normals of {0} turned into "

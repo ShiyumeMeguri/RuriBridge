@@ -265,15 +265,20 @@ def _degrees(first, second):
     return float(numpy.degrees(numpy.arccos(cosine)).max()) if len(cosine) else 0.0
 
 
-def turned_by(picture, triangles, frames, green=1.0):
+def turned_by(picture, triangles, frames, green=1.0, turn=0.0):
     """The most, in degrees, the frames after a layout change turn the normals of a tangent
     picture laid out in ``triangles``: how far those normals point off when they are read in
-    the new frames as they are."""
+    the new frames as they are -- turned back by ``turn`` degrees first, for a tile whose
+    normals Painter turns along with its pattern only while it is laid through set 0."""
     picture = numpy.asarray(picture, dtype=numpy.float64)
     height, width = picture.shape[:2]
     texels, owners, weights = rasterize(triangles, width, height, every=True)
     vectors, covered = _decoded(picture.reshape(-1, picture.shape[2])[texels], green)
-    return _degrees(vectors[covered], _carried(vectors[covered], weights[covered], owners[covered], frames))
+    angle = numpy.radians(-turn)
+    shown = vectors[covered].copy()
+    shown[:, 0] = numpy.cos(angle) * vectors[covered, 0] - numpy.sin(angle) * vectors[covered, 1]
+    shown[:, 1] = numpy.sin(angle) * vectors[covered, 0] + numpy.cos(angle) * vectors[covered, 1]
+    return _degrees(shown, _carried(vectors[covered], weights[covered], owners[covered], frames))
 
 
 def turned_apart(picture, triangles, frames, green=1.0):

@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 10
+FORMAT_VERSION = 11
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -248,9 +248,10 @@ def layout_answer(source, texture_set, request, fingerprint, readers, tables, ke
     beside the record, each laid out in the Texture Set's current layout; ``kind``
     says how its values follow a layout change (``tangent``, ``label`` or ``value``).
     ``fills`` are the content laying tangent normals through a chart: ``{"uid", "name",
-    "index", "members", "procedural", "pixels", "file", "render", "pictures"}`` -- the UV set
-    it reads, the Texture Sets showing it, whether a substance computes its normals (they are
-    only looked at, never laid out) or a picture holds them, whether it lays nothing but
+    "index", "members", "untouched", "turn", "pixels", "file", "render", "pictures"}`` -- the
+    UV set it reads, the Texture Sets showing it, whether its normals are only looked at,
+    never laid out -- a substance computes them, or a tile lays them, turning its source by
+    ``turn`` degrees -- or a picture holds them, whether it lays nothing but
     pictures and uniform colours through set 0, and its normals, laid out in that UV set: the
     picture's own file while it is on disk (with ``reading``, a render of the picture alone),
     else a render of them as the fill lays them, beside the record; for a fill laying nothing
