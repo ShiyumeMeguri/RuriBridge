@@ -55,6 +55,12 @@ with its inputs, parameters, blending and opacity, read through the old layout, 
 map inputs bound to the old layout's maps (``CARRIED_KEY``). Moving back to that layout
 makes it a generator again. Any other generator computes in the layout of set 0.
 
+Paint laid out in UV space -- strokes or polygon fills that take where they land from the UVs
+every time Painter casts them again -- cannot follow its islands at all (``paint_pixels``). Blender
+makes it pixels from Painter's own record of it, and a fill of them stands in for it, reading
+the old layout like every other picture; moving back to the layout it was made in gives the
+paint back.
+
 Each Texture Set's chart table (``Kernel.layout``) comes from Blender with every
 surface; the tables applied last live in the project, beside the layers they
 describe. Before a surface goes in, ``plan`` works out where every chart-addressed
@@ -86,7 +92,7 @@ from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import held_imports, project_facts, project_imports, substance_package
+from . import held_imports, paint_pixels, project_facts, project_imports, substance_package
 
 LOG = logger("painter.layout")
 
@@ -440,13 +446,15 @@ def _current_mesh_maps(texture_set):
 # -- planning a surface ------------------------------------------------------------------
 
 class Plan:
-    """What one surface changes, worked out before anything moves."""
+    """What one surface changes, worked out before anything moves: among it the paint Blender
+    made pixels (``frozen``, by uid, each with the UV set its fill reads) and the fills standing
+    in for paint that come away again (``thawed``)."""
 
     __slots__ = ("moves", "desired", "states", "relayouts", "nodes", "fingerprints", "fills", "pictures",
-                 "unprojected", "restored", "generators")
+                 "unprojected", "restored", "generators", "frozen", "thawed")
 
     def __init__(self, moves, desired, states, relayouts, nodes, fingerprints, fills, pictures, unprojected,
-                 restored, generators):
+                 restored, generators, frozen, thawed):
         self.moves = moves
         self.desired = desired
         self.states = states
@@ -458,6 +466,8 @@ class Plan:
         self.unprojected = unprojected
         self.restored = restored
         self.generators = generators
+        self.frozen = frozen
+        self.thawed = thawed
 
     @property
     def changes_anything(self):
@@ -536,12 +546,33 @@ def plan(record, directory):
                                 "reads no picture there any more".format(name, key))
                 continue
             pictures[key] = replacement
+    frozen = {}
+    thawed = []
+    remembered = paint_pixels.remembered()
+    for name, entry in dict(record.get("relaid") or {}).items():
+        layout = (before.get(name) or layout_module.empty())["layout"]
+        for uid, target in dict(entry.get("frozen") or {}).items():
+            problem = paint_pixels.problem(int(uid), target)
+            if problem:
+                problems.append("{0}: {1}".format(name, problem))
+                continue
+            frozen[int(uid)] = dict(target, texture_set=name, layout=layout)
+        for uid in entry.get("thawed") or []:
+            if str(uid) not in remembered:
+                problems.append("{0}: the fill standing in for paint ({1}) is gone".format(name, uid))
+                continue
+            thawed.append(int(uid))
     if problems:
         raise layout_module.LayoutError("; ".join(problems))
+    staying = layout_module.rebind([(uid, 0, {target["texture_set"]}, set()) for uid, target in sorted(frozen.items())
+                                    if not target["moved"]], before, desired, int(record.get("uv_sets") or 1))
+    for uid, target in frozen.items():
+        target["index"] = 0 if target["moved"] else staying.get(uid, 0)
+    moves = {uid: index for uid, index in moves.items() if uid not in thawed}
     nodes = {fill.uid: fill.name for fill in fills}
     generators = {fill.uid: next(iter(fill.members)) for fill in fills if fill.generator}
     return Plan(moves, desired, states, relayouts, nodes, dict(record.get("fingerprints") or {}),
-                replaced, pictures, held, restored, generators)
+                replaced, pictures, held, restored, generators, frozen, thawed)
 
 
 # -- applying it -----------------------------------------------------------------------------
@@ -723,12 +754,18 @@ def _read_picture(entry, resource_id):
 
 
 def after_surface(chosen):
-    """Moves to the other UV sets, the mesh maps of every Texture Set that changed layout,
-    the normals and the effects' pictures laid out anew, the generators carried to the
-    layout they computed in or back, and the tables now applied."""
+    """Moves to the other UV sets, the paint made pixels and given back, the mesh maps of every
+    Texture Set that changed layout, the normals and the effects' pictures laid out anew, the
+    generators carried to the layout they computed in or back, and the tables now applied."""
     for uid, index in sorted(chosen.moves.items()):
         if index != 0 and uid not in chosen.generators:
             _bind(uid, index)
+    standing = paint_pixels.remembered()
+    for uid in chosen.thawed:
+        paint_pixels.thaw(uid, standing)
+    for uid, target in sorted(chosen.frozen.items()):
+        _bind(paint_pixels.freeze(uid, target, standing).uid(), target["index"])
+    project_facts.write(paint_pixels.FROZEN_KEY, standing)
     records = {key: value for key, value in dict(project_facts.read(NORMALS_KEY) or {}).items()
                if int(key) in chosen.nodes}
     for uid in chosen.restored:
@@ -771,11 +808,13 @@ def after_surface(chosen):
     relaid = sorted(name for name in chosen.relayouts if name in names)
     if moved or relaid:
         LOG.info("%d fill(s) now read another UV set, %d took their pictures of normals turned "
-                 "into the new frames and %d their own back, %d effect(s) a picture laid out anew; "
+                 "into the new frames and %d their own back, %d effect(s) a picture laid out anew, "
+                 "%d piece(s) of paint laid out in UV space stand as pixels and %d came back; "
                  "%d Texture Set(s) took the mesh maps of their new layout", moved, len(chosen.fills),
-                 len(chosen.restored), len(chosen.pictures), len(relaid))
-    return Applied("{0} fill(s) rebound, {1} with normals turned, {2} Texture Set(s) relaid".format(
-        moved, len(chosen.fills), len(relaid)), relaid, replaced)
+                 len(chosen.restored), len(chosen.pictures), len(chosen.frozen), len(chosen.thawed), len(relaid))
+    return Applied("{0} fill(s) rebound, {1} with normals turned, {2} piece(s) of paint as pixels, {3} given "
+                   "back, {4} Texture Set(s) relaid".format(moved, len(chosen.fills), len(chosen.frozen),
+                                                            len(chosen.thawed), len(relaid)), relaid, replaced)
 
 
 def _settle(states, desired, names):
@@ -1034,7 +1073,8 @@ def _readings(texture_set, normal_fills, fills, staging):
 
 def answer(publisher, texture_set_name, request_number):
     """Say how a Texture Set reads its charts and hand over its mesh maps, laid out in its
-    current layout. Returns one line about it."""
+    current layout, with Painter's own record of its paint laid out in UV space. Returns one
+    line about it."""
     names = {one.name: one for one in textureset.all_texture_sets()}
     texture_set = names.get(texture_set_name)
     refused = ""
@@ -1053,9 +1093,17 @@ def answer(publisher, texture_set_name, request_number):
         pictures = _unprojected_pictures(unprojected, texture_set, problems)
         if problems:
             refused = "; ".join(problems)
+    found = []
+    if texture_set is not None and not refused:
+        problems = []
+        found = paint_pixels.find(texture_set, problems)
+        if problems:
+            refused = "; ".join(problems)
     readers_here = [{"uid": fill.uid, "index": fill.index, "members": sorted(fill.members),
                      "following": sorted(fill.following)}
                     for fill in fills if texture_set_name in fill.members]
+    readers_here += [{"uid": one.bound.uid, "index": 0, "members": [texture_set_name], "following": []}
+                     for one in found]
     states = applied()
     tables = _tables(states)
     kept = sorted(dict((states.get(texture_set_name) or {}).get("mesh_maps") or {}))
@@ -1063,7 +1111,9 @@ def answer(publisher, texture_set_name, request_number):
         mesh_maps = {}
         convention = {}
         normal_fills = []
+        frozen = []
         if texture_set is not None and not refused:
+            frozen = paint_pixels.capture(found, staging)
             for usage, (identifier, kind) in MESH_MAPS.items():
                 if texture_set.get_mesh_map_resource(usage) is None:
                     continue
@@ -1073,15 +1123,17 @@ def answer(publisher, texture_set_name, request_number):
             normal_fills = _normal_fills(fills, texture_set, staging,
                                          dict(project_facts.read(NORMALS_KEY) or {}))
             pictured = [entry for entry in normal_fills if not entry["untouched"]]
-            if normal_fills or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
+            normal_paint = any(channel["space"] == "normal" for entry in frozen for channel in entry["channels"])
+            if normal_fills or normal_paint or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
                 convention = _convention_maps(texture_set, staging.directory)
             if pictured:
                 convention["fresh"] = _readings(texture_set, pictured, fills, staging)
         fingerprint = dict(project_facts.read(SURFACE_KEY) or {}).get(texture_set_name, "")
         staging.publish(record_module.layout_answer(
             "Substance", texture_set_name, request_number, fingerprint, readers_here, tables,
-            kept, mesh_maps, normal_fills, pictures, convention, refused))
+            kept, mesh_maps, normal_fills, pictures, convention, frozen,
+            paint_pixels.thawing(texture_set_name), refused))
     if refused:
         return "cannot change the layout of {0}: {1}".format(texture_set_name, refused)
-    return "handed {0}'s {1} mesh map(s) to Blender for its new layout".format(
-        texture_set_name, len(mesh_maps))
+    return ("handed {0}'s {1} mesh map(s) and {2} piece(s) of paint laid out in UV space to Blender for its "
+            "new layout".format(texture_set_name, len(mesh_maps), len(frozen)))

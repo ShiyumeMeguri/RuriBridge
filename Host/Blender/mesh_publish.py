@@ -412,12 +412,14 @@ def publish(publisher, objects, frame_of_project, relaid=None):
 
     ``relaid`` is ``{Texture Set: {"chart": chart, "mesh_maps": {usage: (file name,
     bytes)}, "fills": {uid: {"pictures": {channel: path}, "pixels": pixels}}, "pictures": {key:
-    {"path": path}}, "restored": [uid]}}``: mesh maps laid out in a chart that becomes a Texture
-    Set's layout with this surface, written beside it; the pictures fills lay anew -- every one
-    of a fill laying nothing but pictures, laid out in it (``pixels``), else a picture of
-    normals turned into its frames in the chart the fill reads -- and the pictures of effects
-    laid out in it, where they lie on disk; and the fills that take their own pictures back in
-    it.
+    {"path": path}}, "restored": [uid], "frozen": {uid: {"layer", "mask", "own", "name", "moved",
+    "pictures": {channel: {"path", "space"}}}}, "thawed": [uid]}}``: mesh maps laid out in a chart
+    that becomes a Texture Set's layout with this surface, written beside it; the pictures fills
+    lay anew -- every one of a fill laying nothing but pictures, laid out in it (``pixels``), else
+    a picture of normals turned into its frames in the chart the fill reads -- and the pictures
+    of effects laid out in it, where they lie on disk; the fills that take their own pictures
+    back in it; the pictures of paint laid out in UV space, for fills to stand in for it; and
+    the fills standing in for paint that come away again.
     """
     bare = bare_objects(objects)
     if bare:
@@ -442,7 +444,9 @@ def publish(publisher, objects, frame_of_project, relaid=None):
             payload[texture_set] = {"chart": entry["chart"], "mesh_maps": files,
                                     "fills": dict(entry.get("fills") or {}),
                                     "pictures": dict(entry.get("pictures") or {}),
-                                    "restored": list(entry.get("restored") or [])}
+                                    "restored": list(entry.get("restored") or []),
+                                    "frozen": dict(entry.get("frozen") or {}),
+                                    "thawed": list(entry.get("thawed") or [])}
         return staging.publish(record_module.mesh(
             source="Blender",
             scene_file=record_module.SURFACE_FILE_NAME,

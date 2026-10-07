@@ -22,6 +22,13 @@ that now holds it. What a substance computes is never laid out again: it stays c
 read through the old layout, and the line this returns names the fills whose normals
 keep the old islands' directions where islands turn.
 
+Paint Painter holds laid out in UV space -- strokes or polygon fills that take where they land
+from the UVs -- comes with the answer as Painter's own record of it, per channel its colour and
+coverage. It becomes pictures, in the layout it was made in, for fills that stand in for it and
+read that layout like every other picture; where it lays normals the turning islands bend, its
+pictures are laid out in the new layout instead, the normals carried into the new frames. The
+fills come away again when the layout the paint was made in comes back.
+
 Pictures the material itself samples through the swapped maps are laid out again
 beside it (``material_relayout``), so the material looks here as it looked before.
 """
@@ -55,6 +62,8 @@ _REPLACING = "DataBlendingMode_Replace"
 #: How far from flat, in decoded tangent units, a stored normal may lean and still be
 #: flat: two steps of eight bits.
 _FLAT = 2.0 / 255.0
+#: How far past 0..1 a value stored in a picture may lie and still be a float's rounding.
+_STORED = 1e-6
 
 
 class Pending:
@@ -365,6 +374,76 @@ def _relaid_fills(record, generation, triangles, frames, green, table, texture_s
     return replaced, kept, apart
 
 
+def _paint_lanes(channel, generation):
+    """A channel of Painter's record of paint: its colour and coverage, straight. An effect in a
+    mask comes laid over 0 and over 1; its coverage is what the white shows through."""
+    if "zero" in channel:
+        zero, _wide = pixels.read(str(generation.path(channel["zero"])))
+        one, _wide = pixels.read(str(generation.path(channel["one"])))
+        coverage = numpy.clip(1.0 - (one[..., 0].astype(numpy.float64) - zero[..., 0]), 0.0, 1.0)
+        colour = numpy.zeros(zero[..., :3].shape)
+        covered = coverage > 0.0
+        colour[covered] = zero[..., :3][covered] / coverage[covered, None]
+        return colour, coverage
+    values, _wide = pixels.read(str(generation.path(channel["file"])))
+    return values[..., :3].astype(numpy.float64), values[..., 3].astype(numpy.float64)
+
+
+def _frozen_pictures(record, generation, triangles, frames, green, texture_set, directory):
+    """Pictures of the paint Painter holds laid out in UV space, written into ``directory`` under
+    names their bytes give them, for fills that stand in for it: per channel the colour and, as
+    alpha, the coverage, stored the way Painter is told to read them back -- as they are, -1..1
+    as 0..1, tangent normals in the project's own convention. They stay in the layout the paint
+    was made in, unless it lays normals that bend where islands turn: then every picture of it
+    is laid out in the new layout, coverage and all, the normals carried into the new frames. A
+    value past what a picture holds is refused, by name. Returns the pictures by paint and its
+    names, each with why it is laid out in UV space."""
+    if not directory:
+        raise RuntimeError("this .blend has never been saved, so the pictures of {0}'s paint laid out in UV "
+                           "space have no textures folder to go to".format(texture_set))
+    turning = frames.turning() if frames is not None else None
+
+    def stored_as(space):
+        if space != "normal":
+            return space
+        return "normal_opengl" if green() > 0.0 else "normal_directx"
+
+    frozen = {}
+    named = []
+    for entry in record["frozen"]:
+        lanes = {}
+        for channel in entry["channels"]:
+            colour, coverage = _paint_lanes(channel, generation)
+            stored = (colour + 1.0) * 0.5 if channel["space"] == "signed" else colour
+            if stored.min() < -_STORED or stored.max() > 1.0 + _STORED:
+                raise RuntimeError("{0}: its {1} holds values past what a picture can carry, so it cannot "
+                                   "be laid out as pixels".format(entry["name"], channel["channel"]))
+            lanes[channel["channel"]] = (numpy.concatenate((numpy.clip(stored, 0.0, 1.0), coverage[..., None]),
+                                                           axis=-1), stored_as(channel["space"]))
+        moved = False
+        if any(space.startswith("normal") for _values, space in lanes.values()) and turning is not None:
+            checked = next(values for values, space in lanes.values() if space.startswith("normal"))
+            flat = numpy.where(checked[..., 3:4] > 0.0, checked[..., :3], numpy.array([0.5, 0.5, 1.0]))
+            moved = _bent(flat, triangles.render, turning)
+        pictures = {}
+        for name, (values, space) in sorted(lanes.items()):
+            if moved:
+                carried = values.copy()
+                carried[..., :3] *= values[..., 3:4]
+                laid = chart_resample.relaid(carried, triangles.render, triangles.target,
+                                             "tangent" if space.startswith("normal") else "value", frames, green())
+                covered = laid[..., 3] > 0.0
+                values = laid.copy()
+                values[..., :3] = 0.0
+                values[covered, :3] = laid[covered, :3] / laid[covered, 3:4]
+            pictures[name] = {"path": _write_picture(values, True, "{0}_{1}_{2}".format(texture_set, entry["uid"], name),
+                                                     directory), "space": space}
+        frozen[str(entry["uid"])] = {"layer": entry["layer"], "mask": entry["mask"], "own": entry["own"],
+                                     "name": entry["name"], "moved": moved, "pictures": pictures}
+        named.append("{0} ({1})".format(entry["name"], ", ".join(entry["reasons"])))
+    return frozen, named
+
+
 def _write_picture(values, wide, stem, directory):
     """Write lanes in 0..1 as a PNG into ``directory`` under a name its bytes give it."""
     data = pixels.png(numpy.clip(values, 0.0, 1.0), wide)
@@ -459,14 +538,16 @@ def complete(context, session, generation, frame_of_project, directory):
         record["tables"], texture_set)
     render_names = {object_reference.data.as_pointer(): pending.source for object_reference, _polygons in wearers}
     tangent_maps = any(entry["kind"] == "tangent" for entry in record["mesh_maps"].values())
-    relaid, fills, pictures, kept, apart = {}, {}, {}, [], 0.0
-    restored = _restored_fills(record, retargeted["layout"])
-    if record["mesh_maps"] or record["fills"] or record["pictures"]:
+    relaid, fills, pictures, kept, apart, frozen, made_pixels = {}, {}, {}, [], 0.0, {}, []
+    thawed = sorted(int(entry["uid"]) for entry in record["thawing"] if entry["layout"] == retargeted["layout"])
+    restored = [uid for uid in _restored_fills(record, retargeted["layout"]) if uid not in thawed]
+    if record["mesh_maps"] or record["fills"] or record["pictures"] or record["frozen"]:
         extra_layers = sorted({table["extra"][str(fill["index"])]["layer"] for fill in record["fills"]
                                if str(fill["index"]) in table["extra"]})
+        normal_paint = any(channel["space"] == "normal" for entry in record["frozen"] for channel in entry["channels"])
         triangles = layout_triangles.gather(
             _visible_wearers(context.view_layer, wearers), materials, render_names, target_layer,
-            frames=tangent_maps or bool(record["fills"]), extra_layers=extra_layers)
+            frames=tangent_maps or bool(record["fills"]) or normal_paint, extra_layers=extra_layers)
         if triangles is None:
             raise RuntimeError("no visible mesh shows a face of {0}, so there is no surface to lay "
                                "its mesh maps out on".format(texture_set))
@@ -484,7 +565,10 @@ def complete(context, session, generation, frame_of_project, directory):
                                        green() if turning and tangent_maps else 1.0)
         if record["fills"]:
             fills, kept, apart = _relaid_fills(record, generation, triangles, frames, green, table,
-                                               texture_set, directory, set(restored))
+                                               texture_set, directory, set(restored) | set(thawed))
+        if record["frozen"]:
+            frozen, made_pixels = _frozen_pictures(record, generation, triangles, frames, green, texture_set,
+                                                   directory)
         if record["pictures"]:
             if not directory:
                 raise RuntimeError("this .blend has never been saved, so the pictures of {0} laid out "
@@ -498,7 +582,7 @@ def complete(context, session, generation, frame_of_project, directory):
         session.publisher(topic_module.MESH), mesh_publish.scope(context.view_layer),
         frame_of_project, relaid={texture_set: {"chart": retargeted["layout"], "mesh_maps": relaid,
                                                 "fills": fills, "pictures": pictures,
-                                                "restored": restored}})
+                                                "restored": restored, "frozen": frozen, "thawed": thawed}})
     LOG.info("%s now lays out in what %s held, in %s; the old layout lives in %s at UV set(s) %s",
              texture_set, target_layer, pending.source, target_layer,
              ", ".join(sorted(index for index, entry in retargeted["extra"].items()
@@ -519,4 +603,9 @@ def complete(context, session, generation, frame_of_project, directory):
                  texture_set, apart)
         line += "; texels two islands of the old layout share part by up to {0:.3g} degrees once turned".format(
             apart)
+    if made_pixels:
+        LOG.info("%s: paint laid out in UV space stands as pixels: %s", texture_set, "; ".join(made_pixels))
+        line += "; paint laid out in UV space stands as pixels: {0}".format("; ".join(made_pixels))
+    if thawed:
+        line += "; {0} piece(s) of paint made pixels before are cast as they were made again".format(len(thawed))
     return line

@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 11
+FORMAT_VERSION = 12
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -161,10 +161,15 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
     read through a chart reading the same coordinates. ``relaid`` carries, for a
     Texture Set whose layout is a chart the texturing side has no mesh maps for
     yet, those maps laid out in it: ``{Texture Set: {"chart": chart, "mesh_maps":
-    {usage: {"file": name, "hash": sha1}}, "fills": {uid: {"path": path}}}}``, the
-    mesh maps beside the record; ``fills`` are pictures of tangent normals carried into
-    the new layout's frames in place, for the fills reading them, on disk where they
-    stay.
+    {usage: {"file": name, "hash": sha1}}, "fills": {uid: {"path": path}}, "frozen": {uid:
+    {"layer", "mask", "own", "name", "moved", "pictures": {channel: {"path", "space"}}}},
+    "thawed": [uid]}}``, the mesh maps beside the record; ``fills`` are pictures of tangent
+    normals carried into the new layout's frames in place, for the fills reading them, on
+    disk where they stay. ``frozen`` is the paint laid out in UV space made pictures, on disk
+    where they stay, for a fill to stand in for it: laid out in the layout the paint was made
+    in, or in the new one (``moved``) where its normals had to turn with the islands; ``space``
+    is how a picture's values are read back. ``thawed`` are the fills standing in for paint
+    that come away again, the layout the paint was made in being back.
 
     ``fingerprints`` is, per Texture Set, a digest of its polygons and their layout
     coordinates as they cross: what its mesh maps are laid out on. The texturing side
@@ -234,7 +239,7 @@ def textures(source, document, directory, texture_sets):
 
 
 def layout_answer(source, texture_set, request, fingerprint, readers, tables, kept,
-                  mesh_maps, fills, pictures, convention, refused):
+                  mesh_maps, fills, pictures, convention, frozen, thawing, refused):
     """A Texture Set about to change layout, as the texturing side holds it.
 
     ``request`` is the generation of the ask it answers. ``fingerprint`` is the
@@ -265,8 +270,16 @@ def layout_answer(source, texture_set, request, fingerprint, readers, tables, ke
     ``{"key", "name", "label", "members", "file"}``. ``convention`` names the exports
     that tell which way the stored tangent maps point their green, how the normal channel
     combines with the mesh map, and -- with ``fresh`` -- a picture Painter had never seen
-    and its render, when there are any. ``refused`` says why the layout cannot change,
-    when it cannot.
+    and its render, when there are any. ``frozen`` is the paint laid out in UV space, which
+    no layout but its own puts back: ``{"uid", "layer", "mask", "own", "name", "reasons",
+    "channels"}`` -- the action group holding it, its layer, whether the mask holds it and
+    whether it is the stack's own strokes rather than an effect -- each channel ``{"channel",
+    "space", "file"}``, an export holding its colour and, as alpha, its coverage, or for an
+    effect in a mask ``{"channel", "space", "zero", "one"}``, the mask with it laid over 0 and
+    over 1; ``space`` is how the values are stored back (``raw``, ``signed`` or ``normal``).
+    Each is a reader of UV set 0 as well. ``thawing`` are the fills standing in for paint, each
+    with the layout the paint was made in, ``{"uid", "layout"}``. ``refused`` says why the
+    layout cannot change, when it cannot.
     """
     record = _base(LAYOUT_ANSWER, source)
     record.update({
@@ -280,6 +293,8 @@ def layout_answer(source, texture_set, request, fingerprint, readers, tables, ke
         "fills": list(fills),
         "pictures": list(pictures),
         "convention": convention,
+        "frozen": list(frozen),
+        "thawing": list(thawing),
         "refused": refused,
     })
     return record
