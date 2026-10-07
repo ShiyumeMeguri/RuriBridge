@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 9
+FORMAT_VERSION = 10
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -233,23 +233,35 @@ def textures(source, document, directory, texture_sets):
     return record
 
 
-def layout_answer(source, texture_set, request, fingerprint, uv_sets_used, uv_sets_taken,
-                  mesh_maps, fills, convention, refused):
+def layout_answer(source, texture_set, request, fingerprint, readers, tables, kept,
+                  mesh_maps, fills, pictures, convention, refused):
     """A Texture Set about to change layout, as the texturing side holds it.
 
     ``request`` is the generation of the ask it answers. ``fingerprint`` is the
     Texture Set's from the surface the project holds (see ``mesh``), empty when the
-    surface came without one. ``uv_sets_used`` are the
-    UV sets the Texture Set's content reads, its own and shared with other Texture
-    Sets; ``uv_sets_taken`` every UV set anything in the project reads or any
-    Texture Set declares. ``mesh_maps`` is ``{usage: {"file": name, "kind": kind}}``
+    surface came without one. ``readers`` are the chart-addressed fills showing the
+    Texture Set, ``{"uid", "index", "members", "following"}`` -- the UV set each reads,
+    every Texture Set showing it and those whose own mesh map it reads -- and ``tables``
+    the tables the project applies (charts only), by Texture Set. ``kept`` are the charts
+    the project holds the Texture Set's mesh maps for, from before: moving to one of them
+    takes those, so nothing is laid out again for it. ``mesh_maps`` is ``{usage: {"file": name, "kind": kind}}``
     beside the record, each laid out in the Texture Set's current layout; ``kind``
     says how its values follow a layout change (``tangent``, ``label`` or ``value``).
     ``fills`` are the content laying tangent normals through a chart: ``{"uid", "name",
-    "index", "members", "source", "file", "render"}`` -- the UV set it reads, the
-    Texture Sets showing it, ``bitmap`` or ``procedural``, the picture's own file when it
-    is on disk (with ``reading``, a render of the picture alone), else its normals
-    rendered in the current layout beside the record. ``convention`` names the exports
+    "index", "members", "procedural", "pixels", "file", "render", "pictures"}`` -- the UV set
+    it reads, the Texture Sets showing it, whether a substance computes its normals (they are
+    only looked at, never laid out) or a picture holds them, whether it lays nothing but
+    pictures and uniform colours through set 0, and its normals, laid out in that UV set: the
+    picture's own file while it is on disk (with ``reading``, a render of the picture alone),
+    else a render of them as the fill lays them, beside the record; for a fill laying nothing
+    but pictures whose other pictures are files on disk (``pixels``), ``pictures`` are those,
+    ``{"channel", "floating", "file"}`` -- ``floating`` when the channel holds values past
+    0..1;
+    ``restorable`` is the chart in which the fill's own normals, from before the bridge laid
+    them out anew, are right -- moving there gives them back instead -- or None when nothing
+    is remembered (the chart a Texture Set began in is the empty name). ``pictures`` are the pictures
+    effects read with no projection of their own, laid out in the current layout:
+    ``{"key", "name", "label", "members", "file"}``. ``convention`` names the exports
     that tell which way the stored tangent maps point their green, how the normal channel
     combines with the mesh map, and -- with ``fresh`` -- a picture Painter had never seen
     and its render, when there are any. ``refused`` says why the layout cannot change,
@@ -260,10 +272,12 @@ def layout_answer(source, texture_set, request, fingerprint, uv_sets_used, uv_se
         "texture_set": texture_set,
         "request": int(request),
         "fingerprint": str(fingerprint),
-        "uv_sets_used": sorted(int(index) for index in uv_sets_used),
-        "uv_sets_taken": sorted(int(index) for index in uv_sets_taken),
+        "readers": list(readers),
+        "tables": dict(tables),
+        "kept": list(kept),
         "mesh_maps": mesh_maps,
         "fills": list(fills),
+        "pictures": list(pictures),
         "convention": convention,
         "refused": refused,
     })

@@ -73,7 +73,13 @@ SLOT_OFFSET_ACKNOWLEDGED_BY = 96
 MAX_LISTENERS = (SLOT_SIZE - SLOT_OFFSET_ACKNOWLEDGED_BY) // 8
 
 MAX_OUTSTANDING_GENERATIONS = 8
-SEQLOCK_READ_ATTEMPTS = 64
+#: How long a reader waits for a writer to leave the seqlock before calling it wedged. A
+#: write holds it for microseconds of work, but the scheduler may take the writing process
+#: off the processor in the middle of them for as long as a loaded machine needs -- so the
+#: wait is measured in time, yielding the processor between looks, never in attempts.
+SEQLOCK_PATIENCE_SECONDS = 0.5
+#: What a look inside the seqlock finds while a write is under way.
+_UNSETTLED = object()
 PRESENCE_SECONDS = 3.0
 
 FILE_ATTRIBUTE_TEMPORARY = 0x00000100
@@ -82,6 +88,19 @@ _HEADER = struct.Struct("<8sIIQ")
 _UNSIGNED_64 = struct.Struct("<Q")
 _UNSIGNED_32 = struct.Struct("<I")
 
+
+def _settled(look, what):
+    """What ``look`` reads outside a write under the seqlock: looked at once, then again with
+    the processor yielded to the writer between looks, for as long as the patience lasts."""
+    found = look()
+    deadline = time.monotonic() + SEQLOCK_PATIENCE_SECONDS
+    while found is _UNSETTLED:
+        if time.monotonic() > deadline:
+            raise ArenaError("{0} stayed mid-write for {1} s; its writer is wedged".format(
+                what, SEQLOCK_PATIENCE_SECONDS))
+        time.sleep(0)
+        found = look()
+    return found
 
 class ArenaError(RuntimeError):
     """Any refusal to build or attach to a session."""
@@ -366,10 +385,11 @@ class Arena:
     def read_slot(self, channel):
         """A torn-free read of one slot, retried until the seqlock settles."""
         base = self._slot_base(channel)
-        for _ in range(SEQLOCK_READ_ATTEMPTS):
+
+        def look():
             first = self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE)
             if first % 2:
-                continue
+                return _UNSETTLED
             generation = self._read_unsigned_64(base + SLOT_OFFSET_GENERATION)
             payload_bytes = self._read_unsigned_64(base + SLOT_OFFSET_PAYLOAD_BYTES)
             acknowledged = self._read_unsigned_64(base + SLOT_OFFSET_ACKNOWLEDGED)
@@ -379,12 +399,11 @@ class Arena:
             taken = tuple(
                 self._read_unsigned_64(base + SLOT_OFFSET_ACKNOWLEDGED_BY + index * 8)
                 for index in range(MAX_LISTENERS))
-            if self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE) == first:
-                return SlotState(channel, first, generation, payload_bytes,
-                                 acknowledged, dropped, writer, heartbeat, taken)
-        raise ArenaError(
-            "slot {0!r} never settled in {1} attempts; a writer is wedged mid-publish".format(
-                channel, SEQLOCK_READ_ATTEMPTS))
+            if self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE) != first:
+                return _UNSETTLED
+            return SlotState(channel, first, generation, payload_bytes,
+                             acknowledged, dropped, writer, heartbeat, taken)
+        return _settled(look, "slot {0!r}".format(channel))
 
     def publish(self, channel, generation, payload_bytes, dropped_generations=None):
         """Make a finished generation visible, under the seqlock."""
@@ -461,22 +480,18 @@ class Arena:
         index = self.slot_index(channel)
         base = HEADER_SIZE + index * SLOT_SIZE
         inline = self._inline_base(len(self.channels), index)
-        for _ in range(SEQLOCK_READ_ATTEMPTS):
+
+        def look():
             first = self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE)
             if first % 2:
-                continue
+                return _UNSETTLED
             length = self._read_unsigned_64(base + SLOT_OFFSET_INLINE_BYTES)
             generation = self._read_unsigned_64(base + SLOT_OFFSET_GENERATION)
-            if length == 0:
-                if self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE) == first:
-                    return None, generation
-                continue
-            encoded = bytes(self._control[inline:inline + length])
+            encoded = bytes(self._control[inline:inline + length]) if length else b""
             if self._read_unsigned_64(base + SLOT_OFFSET_SEQUENCE) != first:
-                continue
-            return json.loads(encoded.decode("utf-8")), generation
-        raise ArenaError("state slot {0!r} never settled in {1} attempts".format(
-            channel, SEQLOCK_READ_ATTEMPTS))
+                return _UNSETTLED
+            return (json.loads(encoded.decode("utf-8")) if length else None), generation
+        return _settled(look, "state slot {0!r}".format(channel))
 
     def channel_directory(self, channel):
         path = self.directory / channel

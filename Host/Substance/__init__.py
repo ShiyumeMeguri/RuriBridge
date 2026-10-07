@@ -783,9 +783,11 @@ def apply_shading(record):
     return "; ".join(parts)
 
 
-def _mesh_finished(_status=None, applied=None):
+def _mesh_finished(status=None, applied=None):
     _mesh_deadline[0] = None
     _presence_due[0] = True
+    if applied is None and status is not None and status != str(substance_painter.project.ReloadMeshStatus.SUCCESS):
+        _panel.set_status(status)
     if applied is not None and applied.relaid:
         _follow_layouts(applied)
 

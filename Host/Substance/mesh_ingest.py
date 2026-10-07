@@ -200,15 +200,23 @@ def apply(generation, texture_resolution, on_finished=None):
     def finished(status):
         _allowed_drops.clear()
         applied = None
+        outcome = str(status)
         if status == substance_painter.project.ReloadMeshStatus.SUCCESS:
             LOG.info("mesh generation %d swapped in", generation.number)
-            applied = layout_state.after_surface(chosen)
-            LOG.info("layouts: %s", applied.line)
+            try:
+                applied = layout_state.after_surface(chosen)
+            except Exception as error:
+                LOG.exception("mesh generation %d is in, but its layouts were not carried over: %s",
+                              generation.number, error)
+                outcome = "mesh generation {0} is in, but its layouts were not carried over: {1}".format(
+                    generation.number, error)
+            else:
+                LOG.info("layouts: %s", applied.line)
         else:
             LOG.error("Painter refused mesh generation %d (%s); its log says why",
                       generation.number, status)
         if on_finished is not None:
-            on_finished(str(status), applied)
+            on_finished(outcome, applied)
 
     def reload():
         layout_state.before_surface(chosen)

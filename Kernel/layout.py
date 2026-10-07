@@ -24,7 +24,8 @@ looks exactly as it would through set 0.
 Blender owns the tables -- the coordinates are its data, and a retarget changes
 both in one step -- and sends them with every surface. The texturing
 side keeps the tables it last applied and, before a surface goes in, works out
-where everything addressed through a chart has to read from now (``rebind``).
+where everything addressed through a chart has to read from now (``rebind``); a
+retarget makes the same check before it changes anything (``retargeted``).
 """
 
 from __future__ import annotations
@@ -96,38 +97,80 @@ def new_chart():
     return uuid.uuid4().hex
 
 
-def retargeted(table, target_layer, used, taken):
-    """The table after a retarget swaps the render layer's coordinates with
-    ``target_layer``'s on this Texture Set's faces.
+def _wanted(table, member, index, following):
+    """The chart a fill reading UV set ``index`` needs to find in one Texture Set."""
+    return table["layout"] if member in following else chart_at(table, index)
 
-    The render layer then holds what ``target_layer`` held -- a chart the table
-    already names when that layer was one of its extras, else a new one -- and
-    ``target_layer`` holds the layout the Texture Set had. Everything the texturing
-    side reads through that old layout must find it again: content laid out in set
-    0 moves to an index holding it, and so does content shared with another Texture
-    Set that reads an index this table never declared (``used``: every index the
-    Texture Set's content reads, as the texturing side reports it). A new index is
-    one nothing in the project uses (``taken``).
+
+def retargeted(table, source_layer, target_layer, readers, tables, texture_set):
+    """The table after a retarget swaps ``source_layer``'s coordinates with
+    ``target_layer``'s on this Texture Set's faces, with every chart-addressed fill
+    still finding the coordinates it reads.
+
+    After the swap the source layer -- set 0 -- holds what the target layer held: a
+    chart the table already names when the target was one of its extras, else a new
+    one; the target holds the layout the Texture Set had; every other layer the table
+    names keeps what it held. A UV set the table declares stays pointed at its layer and
+    so holds whatever that layer holds now.
+
+    ``readers`` are the fills showing this Texture Set, ``[(uid, index, members,
+    following)]``, and ``tables`` the tables the texturing side applies (charts only),
+    by Texture Set. One fill reads one UV set in every Texture Set showing it, so the
+    others pin which ones it may read: where none of those holds what the fill reads
+    here, the lowest one nothing else here needs is pointed at the layer that holds it
+    now -- most constrained fills first. The result is checked with ``rebind``, the very
+    check the texturing side makes when the surface arrives, so a change it would refuse
+    is refused here, before anything moves; ``LayoutError`` names the fills.
     """
     table = normalized(table)
-    old = table["layout"]
-    extra = dict(table["extra"])
-    held = [index for index, entry in extra.items() if entry["layer"] == target_layer]
-    layout = extra[held[0]]["chart"] if held else new_chart()
-    for index in held:
-        extra[index] = {"layer": target_layer, "chart": old}
-    implicit = sorted(str(index) for index in used if int(index) > 0 and str(index) not in extra)
-    for index in implicit:
-        extra[index] = {"layer": target_layer, "chart": old}
-    if not held and not implicit:
-        reserved = {int(index) for index in extra} | {int(index) for index in taken}
-        free = [index for index in range(1, MAX_UV_SETS) if index not in reserved]
-        if not free:
-            raise LayoutError(
-                "every one of the {0} UV sets a surface can carry is in use; a Texture Set "
-                "cannot keep another layout".format(MAX_UV_SETS))
-        extra[str(free[0])] = {"layer": target_layer, "chart": old}
-    return {"layout": layout, "extra": extra}
+    holding = {source_layer: table["layout"]}
+    for entry in table["extra"].values():
+        holding[entry["layer"]] = entry["chart"]
+    layout = holding[target_layer] if target_layer in holding else new_chart()
+    holding[target_layer] = table["layout"]
+    holding[source_layer] = layout
+    pointers = {int(index): entry["layer"] for index, entry in table["extra"].items()}
+
+    def desired_table():
+        return {"layout": layout, "extra": {str(index): holding[layer] for index, layer in pointers.items()}}
+
+    current = charts_only(table)
+    others = {name: charts(value) for name, value in dict(tables).items() if name != texture_set}
+    needs = []
+    for uid, index, members, following in readers:
+        wanted = layout if texture_set in following else chart_at(current, index)
+        allowed = [one for one in range(MAX_UV_SETS)
+                   if all(chart_at(others.get(member) or empty(), one)
+                          == _wanted(others.get(member) or empty(), member, index, following)
+                          for member in members if member != texture_set)]
+        needs.append((uid, wanted, allowed))
+    claimed = {}
+    stranded = []
+    for uid, wanted, allowed in sorted(needs, key=lambda need: (len(need[2]), need[0])):
+        desired = desired_table()
+        fitting = [one for one in allowed if chart_at(desired, one) == wanted
+                   and claimed.get(one, wanted) == wanted]
+        if fitting:
+            claimed.setdefault(fitting[0], wanted)
+            continue
+        layer = next((name for name, chart in sorted(holding.items()) if chart == wanted), None)
+        free = [one for one in allowed if one > 0 and one not in claimed]
+        if layer is None or not free:
+            stranded.append(uid)
+            continue
+        pointers[free[0]] = layer
+        claimed[free[0]] = wanted
+    if stranded:
+        raise LayoutError("no UV set of the new surface can hold what layer(s) {0} read for every "
+                          "Texture Set showing them".format(", ".join(str(uid) for uid in sorted(stranded))))
+    result = {"layout": layout, "extra": {str(index): {"layer": layer, "chart": holding[layer]}
+                                          for index, layer in sorted(pointers.items())}}
+    applied = dict(others)
+    applied[texture_set] = current
+    desired = dict(others)
+    desired[texture_set] = charts_only(result)
+    rebind(readers, applied, desired, uv_set_count(desired.values()))
+    return result
 
 
 def rebind(fills, applied, desired, count):
@@ -139,10 +182,12 @@ def rebind(fills, applied, desired, count):
     own mesh map is that Texture Set's mesh map wherever it is shown there, and the
     mesh maps are laid out in the layout. ``applied`` and ``desired`` are tables by
     Texture Set (charts only); one missing from ``applied`` was never retargeted.
-    Returns ``{uid: new index}`` for every fill that has to move, keeping one that can
-    stay. A fill that no index of the new surface can serve -- the chart it reads is
-    gone for one of its Texture Sets, or its Texture Sets need it at different indices
-    -- is a ``LayoutError`` naming them all, raised before anything moves.
+    Returns ``{uid: new index}`` for every fill that moves: to set 0 wherever set 0 holds
+    what it reads -- read one to one, the way it was laid -- else it stays where it can,
+    else to the lowest UV set that serves it. A fill that no index of the new surface can
+    serve -- the chart it reads is gone for one of its Texture Sets, or its Texture Sets
+    need it at different indices -- is a ``LayoutError`` naming them all, raised before
+    anything moves.
     """
     moves = {}
     stranded = []
@@ -163,7 +208,7 @@ def rebind(fills, applied, desired, count):
         if not candidates:
             stranded.append((uid, index, sorted(members)))
             continue
-        target = index if index in candidates else min(candidates)
+        target = 0 if 0 in candidates else index if index in candidates else min(candidates)
         if target != index:
             moves[uid] = target
     if stranded:

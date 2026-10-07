@@ -411,9 +411,13 @@ def publish(publisher, objects, frame_of_project, relaid=None):
     """Gather, write and publish the surface in the project's frame. Returns the generation.
 
     ``relaid`` is ``{Texture Set: {"chart": chart, "mesh_maps": {usage: (file name,
-    bytes)}, "fills": {uid: {"path": path}}}}``: mesh maps laid out in a chart that
-    becomes a Texture Set's layout with this surface, written beside it, and pictures
-    of tangent normals carried into its frames, where they lie on disk.
+    bytes)}, "fills": {uid: {"pictures": {channel: path}, "pixels": pixels}}, "pictures": {key:
+    {"path": path}}, "restored": [uid]}}``: mesh maps laid out in a chart that becomes a Texture
+    Set's layout with this surface, written beside it; the pictures fills lay anew -- every one
+    of a fill laying nothing but pictures, laid out in it (``pixels``), else a picture of
+    normals turned into its frames in the chart the fill reads -- and the pictures of effects
+    laid out in it, where they lie on disk; and the fills that take their own pictures back in
+    it.
     """
     bare = bare_objects(objects)
     if bare:
@@ -436,7 +440,9 @@ def publish(publisher, objects, frame_of_project, relaid=None):
                     handle.write(data)
                 files[usage] = {"file": file_name, "hash": hashlib.sha1(data).hexdigest()}
             payload[texture_set] = {"chart": entry["chart"], "mesh_maps": files,
-                                    "fills": dict(entry.get("fills") or {})}
+                                    "fills": dict(entry.get("fills") or {}),
+                                    "pictures": dict(entry.get("pictures") or {}),
+                                    "restored": list(entry.get("restored") or [])}
         return staging.publish(record_module.mesh(
             source="Blender",
             scene_file=record_module.SURFACE_FILE_NAME,

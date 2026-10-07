@@ -15,9 +15,10 @@ The same verbs as Painter's end, from this side, and one table:
   its own, as images in the same folder.
 * **The table** says which material paints into which Texture Set, and is the one
   thing edited by hand -- from here or from Painter.
-* **Retarget Layout** moves the active material's Texture Set to the UV layout another
-  UV map of its meshes holds (``layout_retarget``): Painter keeps every layer, reading
-  what was laid out in the old layout through the map that holds it now.
+* **Retarget Layout** moves the active material's Texture Set from the layout its
+  Source UV holds to the one its Target UV holds (``layout_retarget``): the two maps
+  swap on its faces, and Painter keeps every layer, reading what was laid out in the old
+  layout through the map that holds it now.
 
 Nothing is sent on its own. Every crossing is somebody pressing a button, here or
 in Painter, so a timer here only reads a few integers out of the mapped control
@@ -439,17 +440,22 @@ def exclude(material_name, excluded):
     refresh_view(force=True)
 
 
-def retarget_layout(context, target_layer):
-    """Move the Texture Set the active material paints to the layout its meshes hold in
-    ``target_layer``: the render map takes that layout and ``target_layer`` the one it has
-    now. Painter is asked first, and the change completes with its answer."""
+def retarget_layout(context):
+    """Move the Texture Set the active material paints from the layout the scene's Source
+    UV holds to the one its Target UV holds: on its faces the source takes the new layout
+    and the target keeps the old one. Painter is asked first, and the change completes
+    with its answer."""
     if not painter_is_attached():
         raise RuntimeError("Painter is not attached, and a layout change keeps its layers "
                            "only with it")
     material = context.object.active_material if context.object is not None else None
     if material is None:
         raise RuntimeError("the active object has no active material")
-    return layout_retarget.begin(CONNECTION.session, material, target_layer)
+    texture_set = mesh_publish.texture_set_of(material)
+    if not texture_set:
+        raise RuntimeError("{0} is kept out of Painter".format(material.name))
+    settings = context.scene.ruri_bridge_retarget
+    return layout_retarget.begin(CONNECTION.session, texture_set, settings.source, settings.target)
 
 
 def follow_rename(material_name):
@@ -974,33 +980,32 @@ class RURIBRIDGE_OT_exclude(bpy.types.Operator):
         return {"FINISHED"}
 
 
-_TARGET_ITEMS = []
+class RuriBridgeRetargetSettings(bpy.types.PropertyGroup):
+    """The two UV maps a layout change goes between, kept with the scene."""
 
-
-def _target_items(_operator, context):
-    """The UV maps every mesh wearing the active material's Texture Set has besides the
-    one it renders with. Kept alive on purpose (see ``_material_items``)."""
-    material = context.object.active_material if context.object is not None else None
-    names = layout_retarget.target_layers(material) if material is not None else []
-    _TARGET_ITEMS[:] = [(name, name, "Lay the Texture Set out as {0} holds it; {0} keeps the "
-                                     "layout it has now".format(name)) for name in names]
-    return _TARGET_ITEMS
+    source: bpy.props.StringProperty(
+        name="Source UV",
+        description="The UV map the Texture Set's textures are laid out in now: the one its "
+                    "meshes render with, which Painter paints in. It takes the new layout")
+    target: bpy.props.StringProperty(
+        name="Target UV",
+        description="The UV map holding the layout the textures move to. It keeps the old "
+                    "layout afterwards, and Painter's layers made for that layout read it there")
 
 
 class RURIBRIDGE_OT_retarget_layout(bpy.types.Operator):
     bl_idname = "ruri_bridge.retarget_layout"
     bl_label = "Retarget Layout"
-    bl_description = ("Move the active material's Texture Set to the UV layout another UV map "
-                      "of every mesh wearing it holds: the two maps swap on its faces, Painter "
-                      "keeps every layer and lays its mesh maps out again, and the material's "
-                      "own pictures are laid out again beside them")
-    bl_property = "target"
-
-    target: bpy.props.EnumProperty(items=_target_items)
+    bl_description = ("Move the active material's Texture Set from the layout the Source UV "
+                      "holds to the one the Target UV holds: the two maps swap on its faces, so "
+                      "the Source UV takes the new layout and the Target UV keeps the old one. "
+                      "Painter keeps every layer and lays its mesh maps out again, and the "
+                      "material's own pictures are laid out again beside them. Run it again "
+                      "to swap back")
 
     def execute(self, context):
         try:
-            say(retarget_layout(context, self.target))
+            say(retarget_layout(context))
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
@@ -1470,8 +1475,21 @@ class RURIBRIDGE_PT_pull_mapping(bpy.types.Panel):
             _draw_mapping(layout, material, row["texture_set"])
 
 
-def _chart_text(chart):
-    return chart[:8] if chart else "as first sent"
+def _wrapped(layout, context, text, icon):
+    """A label broken into lines that fit the region, the icon on the first."""
+    width = max(16, int(context.region.width / (7.0 * context.preferences.system.ui_scale)))
+    line = ""
+    lines = []
+    for word in text.split(" "):
+        if line and len(line) + 1 + len(word) > width:
+            lines.append(line)
+            line = word
+        else:
+            line = word if not line else line + " " + word
+    lines.append(line)
+    column = layout.column(align=True)
+    for index, one in enumerate(lines):
+        column.label(text=one, icon=icon if index == 0 else "BLANK1")
 
 
 class RURIBRIDGE_PT_layout(bpy.types.Panel):
@@ -1484,7 +1502,8 @@ class RURIBRIDGE_PT_layout(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        material = context.object.active_material if context.object is not None else None
+        object_reference = context.object
+        material = object_reference.active_material if object_reference is not None else None
         if material is None:
             layout.label(text="No active material", icon="INFO")
             return
@@ -1492,25 +1511,37 @@ class RURIBRIDGE_PT_layout(bpy.types.Panel):
         if not texture_set:
             layout.label(text="{0} is kept out of Painter".format(material.name), icon="INFO")
             return
+        settings = context.scene.ruri_bridge_retarget
         box = layout.box()
         box.label(text="{0} -> {1}".format(material.name, texture_set), icon="MATERIAL")
+        if object_reference.type == "MESH":
+            render = mesh_publish.render_uv_layer(object_reference.data)
+            if render is not None:
+                box.label(text="Painted in {0!r}, the map it renders with".format(render.name), icon="UV")
+            box.prop_search(settings, "source", object_reference.data, "uv_layers", icon="UV")
+            box.prop_search(settings, "target", object_reference.data, "uv_layers", icon="UV")
+        else:
+            box.prop(settings, "source")
+            box.prop(settings, "target")
         try:
-            table = layouts.table_of(material)
+            table = layouts.table_of_texture_set(texture_set, layout_retarget.painted_by(texture_set))
         except Exception as error:
-            box.label(text=str(error), icon="ERROR")
+            _wrapped(layout, context, str(error), "ERROR")
             return
-        box.label(text="Render UV map: layout {0}".format(_chart_text(table["layout"])),
-                  icon="UV")
         for index, entry in sorted(table["extra"].items(), key=lambda item: int(item[0])):
-            box.label(text="UV set {0}: {1} holds layout {2}".format(
-                index, entry["layer"], _chart_text(entry["chart"])), icon="UV_DATA")
-        if texture_set in layout_retarget.waiting():
-            layout.label(text="Waiting for Painter", icon="SORTTIME")
-            return
+            _wrapped(box, context, "{0!r} holds an earlier layout Painter's layers read as UV set {1}; "
+                     "keep it".format(entry["layer"], index), "UV_DATA")
+        found = layout_retarget.problems(texture_set, settings.source, settings.target)
+        if not painter_is_attached():
+            found.insert(0, "Painter is not attached")
         row = layout.row()
-        row.enabled = CONNECTION.is_open and painter_is_attached()
-        row.operator_menu_enum(RURIBRIDGE_OT_retarget_layout.bl_idname, "target",
-                               text="Retarget Layout To", icon="UV_SYNC_SELECT")
+        row.scale_y = 1.3
+        row.enabled = CONNECTION.is_open and not found
+        row.operator(RURIBRIDGE_OT_retarget_layout.bl_idname,
+                     text="Retarget {0} -> {1}".format(settings.source or "?", settings.target or "?"),
+                     icon="UV_SYNC_SELECT")
+        for line in found:
+            _wrapped(layout, context, line, "ERROR")
 
 
 class RURIBRIDGE_PT_cascadeur(bpy.types.Panel):
@@ -1529,7 +1560,7 @@ class RURIBRIDGE_PT_cascadeur(bpy.types.Panel):
         column.operator(RURIBRIDGE_OT_fetch_animation.bl_idname, icon="IMPORT")
 
 
-_CLASSES = (RuriBridgePreferences,
+_CLASSES = (RuriBridgePreferences, RuriBridgeRetargetSettings,
             RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_push_shader, RURIBRIDGE_OT_pull_shader,
             RURIBRIDGE_OT_push_textures, RURIBRIDGE_OT_pull_textures,
             RURIBRIDGE_OT_pull_selected_layer, RURIBRIDGE_OT_bind, RURIBRIDGE_OT_exclude,
@@ -1547,6 +1578,7 @@ def register():
     log_module.install_stream_sink()
     for entry in _CLASSES:
         bpy.utils.register_class(entry)
+    bpy.types.Scene.ruri_bridge_retarget = bpy.props.PointerProperty(type=RuriBridgeRetargetSettings)
     if _ruri_bridge_after_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_ruri_bridge_after_load)
     try:
@@ -1562,5 +1594,6 @@ def unregister():
     if _ruri_bridge_after_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_ruri_bridge_after_load)
     CONNECTION.close()
+    del bpy.types.Scene.ruri_bridge_retarget
     for entry in reversed(_CLASSES):
         bpy.utils.unregister_class(entry)

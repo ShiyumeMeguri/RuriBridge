@@ -10,14 +10,35 @@ is resampled into a picture that is not the one somebody made. What does not dep
 on the layout is left to Painter: strokes and polygon fills are re-applied in 3D when
 the surface comes in, and the 3D projections never read UVs at all.
 
-A fill reading a picture of tangent-space normals keeps its pixels too, and the frame
-they are decoded in turns where an island turns: such a picture is handed to Blender --
-its own file, where Painter still knows one -- and comes back with every texel carried
-into the frames of the new layout, in place, to stand in for it (``fills``).
+Tangent-space normals are directions in the frame an island's UVs give the surface, and
+Painter decodes the normal channel in the frames of set 0, copying normals read through
+another UV set as they are: where an island turns or mirrors in the new layout, values
+read through the old chart point elsewhere on the surface. What a substance computes
+stays computed -- it reads the old chart like every other channel, and where islands
+turn its normals keep the directions the old islands gave them; nothing renders it into
+a picture. A picture is pixels, and pixels move: a picture of normals goes to Blender as
+its own file where Painter still knows it, else as Painter reads it (``fills``). A fill
+laying nothing but pictures and uniform colours through set 0, every other picture of it
+still a file on disk, takes every picture laid out in the new layout -- its normals
+carried from their old frames into the new ones -- and goes on reading set 0: islands
+that shared texels in the old layout take each their own. Any other fill keeps reading
+the chart it reads, and takes its picture of normals turned where each texel lies, from
+the frame the island reading it had into the one it has now: what Painter renders of a
+picture is the picture only for normals, so nothing else is laid out from a render. A fill whose normals a full Replace at the bottom
+of its content covers, or whose normal channel is disabled, lays none of its own. The
+pictures a fill laid first are remembered with the layout they are right in
+(``NORMALS_KEY``): moving back to that layout gives the fill those pictures back --
+nothing laid out twice.
 
 A picture that is a Texture Set's own mesh map is not laid out in a chart at all, in
 that Texture Set: Painter shows it there as whatever the mesh map is, and swaps it when
 the map is swapped -- so it follows the layout, as the mesh maps do (``following``).
+
+An effect that reads a picture with no projection of its own -- a colour selection's id
+mask, an image input of a generator or a filter -- reads it in set 0, laid out in the
+layout the Texture Set has. A Texture Set's own mesh map it reads follows the map, as
+a fill's does; any other picture goes to Blender, comes back laid out in the new layout,
+and takes its place (``pictures``).
 
 A fill whose UV transformation tiles, turns or offsets its source is a tile: a pattern
 laid in UV space, which keeps tiling the new layout. It is left as it is, because
@@ -43,6 +64,7 @@ import os
 import struct
 import zlib
 
+import substance_painter.colormanagement as colormanagement
 import substance_painter.export
 import substance_painter.js
 import substance_painter.layerstack as layerstack
@@ -66,6 +88,12 @@ LAYOUTS_KEY = "layouts"
 #: record): what its mesh maps are laid out on.
 SURFACE_KEY = "surface"
 
+#: Per fill whose pictures were laid out anew, by uid, the pictures it laid first and the
+#: layout they are right in, ``{"layout", "pixels", "pictures": {channel: {"name",
+#: "version"}}}`` -- ``pixels`` when the fill took them laid out in the new layout and reads
+#: set 0 for them.
+NORMALS_KEY = "normals"
+
 #: Painter's mesh maps: the name its JavaScript export knows each by, and how its
 #: values change when the layout under them changes -- a tangent-space normal turns
 #: with the tangent frame, an id is a label no texel may blend, the rest are values.
@@ -82,10 +110,13 @@ MESH_MAPS = {
     textureset.MeshMapUsage.Opacity: ("opacity", "value"),
 }
 
-#: The one normal a picture Painter has never seen holds, leaning along both axes so
-#: neither can be mistaken for the other: how Painter takes a fresh picture of normals is
-#: read off it (``_readings``).
-_FRESH_NORMAL = (0.65, 0.8, 0.87)
+#: A normal leaning along both axes, so neither can be mistaken for the other: the one a
+#: picture Painter has never seen holds, to read off how Painter takes a fresh picture of
+#: normals (``_readings``), and the one laid over the whole normal channel while the
+#: project's convention is read (``_convention_maps``).
+_LEANING_NORMAL = (0.65, 0.8, 0.87)
+#: The height laid over the whole height channel while the project's convention is read.
+_LEVEL_HEIGHT = 0.5
 
 _SPATIAL_SOURCES = (source_module.SourceBitmap, source_module.SourceSubstance,
                     source_module.SourceVectorial, source_module.SourceFont)
@@ -97,17 +128,19 @@ _TOLERANCE = 1e-6
 class Addressed:
     """One fill that reads its source through a chart, every Texture Set showing it, the
     pictures it reads, where its tangent normals come from (``normal_content``) when it
-    lays any, and the Texture Sets whose own mesh map it reads (``following``)."""
+    lays any and whether it lays nothing but pictures and uniform colours through set 0
+    (``pixels``), and the Texture Sets whose own mesh map it reads (``following``)."""
 
-    __slots__ = ("uid", "name", "index", "members", "layer", "normal", "pictures", "following")
+    __slots__ = ("uid", "name", "index", "members", "layer", "normal", "pixels", "pictures", "following")
 
-    def __init__(self, uid, name, index, layer, normal, pictures):
+    def __init__(self, uid, name, index, layer, normal, pixels, pictures):
         self.uid = uid
         self.name = name
         self.index = index
         self.members = set()
         self.layer = layer
         self.normal = normal
+        self.pixels = pixels
         self.pictures = pictures
         self.following = set()
 
@@ -187,8 +220,86 @@ def normal_content(node):
     return ("procedural", "")
 
 
-def _visit(nodes, member, found, unplaceable, in_mask=False):
+class Unprojected:
+    """A picture an effect reads in set 0 with no projection of its own -- a colour
+    selection's id mask (``slot`` empty), or the image input ``slot`` of a generator or a
+    filter -- whether its values are labels no texel may blend, and the Texture Sets showing
+    the effect."""
+
+    __slots__ = ("uid", "name", "slot", "url", "label", "members")
+
+    def __init__(self, uid, name, slot, url, label):
+        self.uid = uid
+        self.name = name
+        self.slot = slot
+        self.url = url
+        self.label = label
+        self.members = set()
+
+    @property
+    def key(self):
+        return "{0}:{1}".format(self.uid, self.slot)
+
+
+def _unprojected_of(node):
+    """The pictures an effect reads with no projection of its own."""
+    if isinstance(node, layerstack.ColorSelectionEffectNode):
+        mask = node.get_parameters().id_mask
+        return [] if mask is None else [Unprojected(node.uid(), node.get_name(), "", mask.url(), True)]
+    if not isinstance(node, (layerstack.GeneratorEffectNode, layerstack.FilterEffectNode)):
+        return []
+    source = node.get_source()
+    if not isinstance(source, source_module.SourceSubstance):
+        return []
+    found = []
+    for identifier in source.image_inputs:
+        inner = source.get_source(identifier)
+        if isinstance(inner, source_module.SourceBitmap):
+            found.append(Unprojected(node.uid(), node.get_name(), identifier, inner.resource_id.url(), False))
+    return found
+
+
+def _covered_normal(node):
+    """Whether the bottom of a fill layer's content lays normals in place of the fill's own,
+    at full strength, so the fill shows none of its own."""
+    effects = node.content_effects()
+    if not effects:
+        return False
+    bottom = effects[-1]
+    return (isinstance(bottom, layerstack.FillEffectNode) and bottom.is_visible()
+            and textureset.ChannelType.Normal in set(bottom.active_channels)
+            and bottom.get_blending_mode(textureset.ChannelType.Normal) == layerstack.BlendingMode.Replace
+            and abs(bottom.get_opacity(textureset.ChannelType.Normal) - 1.0) <= _TOLERANCE)
+
+
+def _laid_normal(node, in_mask):
+    """Where a fill takes the normals it shows from, or None when it shows none of its own."""
+    if in_mask:
+        return None
+    normal = normal_content(node)
+    if normal is None:
+        return None
+    if node.get_blending_mode(textureset.ChannelType.Normal) == layerstack.BlendingMode.Disable:
+        return None
+    if isinstance(node, layerstack.FillLayerNode) and _covered_normal(node):
+        return None
+    return normal
+
+
+def _pictures_only(node):
+    """Whether a fill lays nothing but pictures and uniform colours: nothing it lays is computed."""
+    return all(isinstance(source, (source_module.SourceBitmap, source_module.SourceUniformColor))
+               for source in _sources(node) if source is not None)
+
+
+def _visit(nodes, member, found, unplaceable, unprojected, in_mask=False):
     for node in nodes:
+        if not isinstance(node, layerstack.LayerNode):
+            uid = node.uid()
+            if uid not in unprojected:
+                unprojected[uid] = _unprojected_of(node)
+            for entry in unprojected[uid]:
+                entry.members.add(member)
         if isinstance(node, (layerstack.FillLayerNode, layerstack.FillEffectNode)):
             uid = node.uid()
             if uid not in found:
@@ -198,21 +309,22 @@ def _visit(nodes, member, found, unplaceable, in_mask=False):
                     found[uid] = None
                 else:
                     index = chart_index(node)
+                    normal = None if index is None else _laid_normal(node, in_mask)
                     found[uid] = None if index is None else Addressed(
-                        uid, node.get_name(), index, isinstance(node, layerstack.FillLayerNode),
-                        None if in_mask else normal_content(node),
+                        uid, node.get_name(), index, isinstance(node, layerstack.FillLayerNode), normal,
+                        normal is not None and normal[0] == "bitmap" and index == 0 and _pictures_only(node),
                         set().union(*(_pictures(source) for source in _sources(node) if source is not None)))
             if found[uid] is not None:
                 found[uid].members.add(member)
             elif uid in unplaceable:
                 unplaceable[uid][1].add(member)
         if isinstance(node, layerstack.LayerNode):
-            _visit(node.content_effects(), member, found, unplaceable, in_mask)
-            _visit(node.mask_effects(), member, found, unplaceable, True)
+            _visit(node.content_effects(), member, found, unplaceable, unprojected, in_mask)
+            _visit(node.mask_effects(), member, found, unplaceable, unprojected, True)
             if isinstance(node, layerstack.GroupLayerNode):
-                _visit(node.sub_layers(), member, found, unplaceable, in_mask)
+                _visit(node.sub_layers(), member, found, unplaceable, unprojected, in_mask)
             if isinstance(node, layerstack.InstanceLayerNode):
-                _visit([node.instance_source()], member, found, unplaceable, in_mask)
+                _visit([node.instance_source()], member, found, unplaceable, unprojected, in_mask)
 
 
 def _mesh_map_pictures(texture_set):
@@ -227,19 +339,21 @@ def _mesh_map_pictures(texture_set):
 def readers():
     """Every chart-addressed fill in the project, with the Texture Sets that show it and
     those whose own mesh map it reads -- Painter shows such a picture, in that Texture
-    Set, as whatever its mesh map is, and swaps it along with the map -- and the fills
-    projected per UV tile, which no chart can carry, with theirs."""
+    Set, as whatever its mesh map is, and swaps it along with the map; the fills
+    projected per UV tile, which no chart can carry, with theirs; and every picture an
+    effect reads with no projection of its own."""
     found = {}
     unplaceable = {}
+    unprojected = {}
     mesh_maps = {}
     for texture_set in textureset.all_texture_sets():
         mesh_maps[texture_set.name] = _mesh_map_pictures(texture_set)
         for stack in texture_set.all_stacks():
-            _visit(layerstack.get_root_layer_nodes(stack), texture_set.name, found, unplaceable)
+            _visit(layerstack.get_root_layer_nodes(stack), texture_set.name, found, unplaceable, unprojected)
     fills = [entry for entry in found.values() if entry is not None]
     for fill in fills:
         fill.following = {member for member in fill.members if fill.pictures & mesh_maps.get(member, set())}
-    return fills, unplaceable
+    return fills, unplaceable, [entry for entries in unprojected.values() for entry in entries]
 
 
 # -- what the project applied last ------------------------------------------------------
@@ -270,9 +384,11 @@ def _current_mesh_maps(texture_set):
 class Plan:
     """What one surface changes, worked out before anything moves."""
 
-    __slots__ = ("moves", "desired", "states", "relayouts", "nodes", "fingerprints", "fills")
+    __slots__ = ("moves", "desired", "states", "relayouts", "nodes", "fingerprints", "fills", "pictures",
+                 "unprojected", "restored")
 
-    def __init__(self, moves, desired, states, relayouts, nodes, fingerprints, fills):
+    def __init__(self, moves, desired, states, relayouts, nodes, fingerprints, fills, pictures, unprojected,
+                 restored):
         self.moves = moves
         self.desired = desired
         self.states = states
@@ -280,6 +396,9 @@ class Plan:
         self.nodes = nodes
         self.fingerprints = fingerprints
         self.fills = fills
+        self.pictures = pictures
+        self.unprojected = unprojected
+        self.restored = restored
 
     @property
     def changes_anything(self):
@@ -297,7 +416,7 @@ def plan(record, directory):
     before = _tables(states)
     changed = sorted(name for name in desired
                      if desired[name] != layout_module.charts(before.get(name)))
-    fills, unplaceable = readers()
+    fills, unplaceable, unprojected = readers()
     moves = layout_module.rebind([(fill.uid, fill.index, fill.members, fill.following) for fill in fills],
                                  before, desired, int(record.get("uv_sets") or 1))
     problems = []
@@ -318,33 +437,51 @@ def plan(record, directory):
             continue
         delivered = dict(record.get("relaid") or {}).get(name)
         kept = (states.get(name) or {}).get("mesh_maps", {}).get(new)
-        if delivered is not None and delivered["chart"] == new:
+        if kept is not None:
+            relayouts[name] = ("kept", old, new, kept)
+        elif delivered is not None and delivered["chart"] == new and delivered["mesh_maps"]:
             relayouts[name] = ("delivered", old, new, {
                 usage: dict(entry, held=held_imports.hold(os.path.join(directory, entry["file"]),
                                                           entry["hash"]))
                 for usage, entry in delivered["mesh_maps"].items()})
-        elif kept is not None:
-            relayouts[name] = ("kept", old, new, kept)
         elif texture_set is not None and _current_mesh_maps(texture_set):
             problems.append("{0} moves to a layout nobody laid its mesh maps out in; retarget it "
                             "from Blender, which sends them with the surface".format(name))
         else:
             relayouts[name] = ("none", old, new, {})
     replaced = {}
+    restored = []
     known = {fill.uid: fill for fill in fills}
+    records = dict(project_facts.read(NORMALS_KEY) or {})
     for name, entry in dict(record.get("relaid") or {}).items():
+        layout = (before.get(name) or layout_module.empty())["layout"]
         for uid, replacement in dict(entry.get("fills") or {}).items():
             fill = known.get(int(uid))
-            if fill is None or fill.normal is None or fill.normal[0] != "bitmap":
-                problems.append("{0}: the layer Blender turned the normals of ({1}) is gone or "
-                                "no longer lays a picture of normals".format(name, uid))
+            if fill is None or fill.normal is None:
+                problems.append("{0}: the layer Blender laid the normals of ({1}) out for is gone "
+                                "or no longer lays normals".format(name, uid))
                 continue
-            replaced[int(uid)] = replacement
+            replaced[int(uid)] = dict(replacement, layout=layout)
+        for uid in entry.get("restored") or []:
+            if int(uid) not in known or str(uid) not in records:
+                problems.append("{0}: the layer whose own normals were to come back ({1}) is gone or "
+                                "has nothing remembered".format(name, uid))
+                continue
+            restored.append(int(uid))
+    pictures = {}
+    held = {entry.key: entry for entry in unprojected}
+    for name, entry in dict(record.get("relaid") or {}).items():
+        for key, replacement in dict(entry.get("pictures") or {}).items():
+            if key not in held:
+                problems.append("{0}: the effect whose picture Blender laid out anew ({1}) is gone or "
+                                "reads no picture there any more".format(name, key))
+                continue
+            pictures[key] = replacement
     if problems:
         raise layout_module.LayoutError("; ".join(problems))
     nodes = {fill.uid: fill.name for fill in fills}
     return Plan(moves, desired, states, relayouts, nodes, dict(record.get("fingerprints") or {}),
-                replaced)
+                replaced, pictures, held, restored)
 
 
 # -- applying it -----------------------------------------------------------------------------
@@ -400,22 +537,65 @@ class Applied:
         self.replaced = replaced
 
 
-def _turned(uid, replacement):
-    """Give a fill the picture of its normals Blender carried into the new frames."""
+def _restore(uid, records):
+    """Give a fill back the pictures it laid first, in the layout they are right in, reading
+    set 0 again where it read pictures laid out in the new layout."""
+    remembered = records.pop(str(uid))
     node = layerstack.get_node_by_uid(uid)
-    resource = project_imports.take_in(replacement["path"], substance_painter.resource.Usage.TEXTURE,
-                                       name=os.path.splitext(os.path.basename(replacement["path"]))[0])
-    node.set_source(textureset.ChannelType.Normal, resource.identifier())
+    for name, picture in sorted(remembered["pictures"].items()):
+        node.set_source(getattr(textureset.ChannelType, name),
+                        substance_painter.resource.ResourceID.from_project(picture["name"], picture["version"]))
+    if remembered["pixels"]:
+        _bind(uid, 0)
+
+
+def _turned(uid, replacement, records):
+    """Give a fill the pictures Blender laid out anew in place of its own: every picture of a
+    fill laying nothing but pictures, laid out in the new layout and read through set 0, else
+    its picture of normals turned where each texel lies, in the chart the fill goes on reading.
+    The picture each channel laid first is remembered, once, with the layout of the first
+    change: a channel never laid anew before still lays its own."""
+    node = layerstack.get_node_by_uid(uid)
+    channels = {name: getattr(textureset.ChannelType, name) for name in replacement["pictures"]}
+    record = records.setdefault(str(uid), {"layout": replacement["layout"], "pixels": False, "pictures": {}})
+    record["pixels"] = record["pixels"] or bool(replacement["pixels"])
+    for name, channel in channels.items():
+        if name not in record["pictures"]:
+            source = node.get_source(channel)
+            record["pictures"][name] = {"name": source.resource_id.name, "version": source.resource_id.version}
+    for name, channel in sorted(channels.items()):
+        path = replacement["pictures"][name]
+        resource = project_imports.take_in(path, substance_painter.resource.Usage.TEXTURE,
+                                           name=os.path.splitext(os.path.basename(path))[0])
+        node.set_source(channel, resource.identifier())
+    if replacement["pixels"]:
+        _bind(uid, 0)
+
+
+def _read_picture(entry, resource_id):
+    """Make an effect read another picture where it read ``entry``'s."""
+    node = layerstack.get_node_by_uid(entry.uid)
+    if isinstance(node, layerstack.ColorSelectionEffectNode):
+        parameters = node.get_parameters()
+        parameters.id_mask = resource_id
+        node.set_parameters(parameters)
+        return
+    node.get_source().set_source(entry.slot, resource_id)
 
 
 def after_surface(chosen):
     """Moves to the other UV sets, the mesh maps of every Texture Set that changed layout,
-    the normals turned with their islands, and the tables now applied."""
+    the normals and the effects' pictures laid out anew, and the tables now applied."""
     for uid, index in sorted(chosen.moves.items()):
         if index != 0:
             _bind(uid, index)
+    records = {key: value for key, value in dict(project_facts.read(NORMALS_KEY) or {}).items()
+               if int(key) in chosen.nodes}
+    for uid in chosen.restored:
+        _restore(uid, records)
     for uid, replacement in sorted(chosen.fills.items()):
-        _turned(uid, replacement)
+        _turned(uid, replacement, records)
+    project_facts.write(NORMALS_KEY, records)
     states = dict(chosen.states)
     names = {one.name: one for one in textureset.all_texture_sets()}
     replaced = {}
@@ -431,15 +611,20 @@ def after_surface(chosen):
         state["mesh_maps"][new] = maps
         _assign(texture_set, maps)
         replaced[name] = {usage: (current[usage], maps[usage]) for usage in current if usage in maps}
+    for key, replacement in sorted(chosen.pictures.items()):
+        resource = project_imports.take_in(replacement["path"], substance_painter.resource.Usage.TEXTURE,
+                                           name=os.path.splitext(os.path.basename(replacement["path"]))[0])
+        _read_picture(chosen.unprojected[key], resource.identifier())
     _settle(states, chosen.desired, names)
     _hold_surface(chosen.fingerprints, names)
     moved = len(chosen.moves)
     relaid = sorted(name for name in chosen.relayouts if name in names)
     if moved or relaid:
-        LOG.info("%d fill(s) now read another UV set, %d took normals turned with their "
-                 "islands; %d Texture Set(s) took the mesh maps of their new layout", moved,
-                 len(chosen.fills), len(relaid))
-    return Applied("{0} fill(s) rebound, {1} with turned normals, {2} Texture Set(s) relaid".format(
+        LOG.info("%d fill(s) now read another UV set, %d took their pictures of normals turned "
+                 "into the new frames and %d their own back, %d effect(s) a picture laid out anew; "
+                 "%d Texture Set(s) took the mesh maps of their new layout", moved, len(chosen.fills),
+                 len(chosen.restored), len(chosen.pictures), len(relaid))
+    return Applied("{0} fill(s) rebound, {1} with normals turned, {2} Texture Set(s) relaid".format(
         moved, len(chosen.fills), len(relaid)), relaid, replaced)
 
 
@@ -479,9 +664,12 @@ def read_layout(node):
 
 def _keep_recorded(states):
     """Mesh maps kept for a chart that is not the layout still matter: an undo brings the
-    chart back. Every one the bridge imported is held out of the after-save sweep."""
+    chart back; so do the pictures fills will take back in the layout they are right in.
+    Every one of them the bridge imported is held out of the after-save sweep."""
     kept = [entry for state in states.values() for maps in dict(state.get("mesh_maps") or {}).values()
             for entry in maps.values()]
+    kept += [picture for entry in dict(project_facts.read(NORMALS_KEY) or {}).values()
+             for picture in entry["pictures"].values()]
     project_imports.keep(kept)
 
 
@@ -493,13 +681,35 @@ def _save_mesh_map(texture_set_name, identifier, path):
 
 
 def _convention_maps(texture_set, directory):
-    """The maps that tell which way the stored tangent maps point their green: the
-    combined OpenGL normal export, the normal and height channels it is combined from, and
-    how the Texture Set combines its normal channel with the mesh map."""
+    """The maps that tell which way the stored tangent maps point their green: the combined
+    OpenGL normal export and the normal channel it is combined from, with a fill on top of
+    everything for as long as they render -- the normal channel replaced by one leaning
+    normal, the height by one level, so no bump the content makes stands in the way at any
+    texel -- and how the Texture Set combines its normal channel with the mesh map."""
+    stack = texture_set.get_stack()
+    present = set(stack.all_channels())
+    laid = {channel: value for channel, value in (
+        (textureset.ChannelType.Normal, colormanagement.Color(*_LEANING_NORMAL)),
+        (textureset.ChannelType.Height, colormanagement.Color(_LEVEL_HEIGHT, _LEVEL_HEIGHT, _LEVEL_HEIGHT)))
+        if channel in present}
+    over = layerstack.insert_fill(layerstack.InsertPosition.from_textureset_stack(stack)) if laid else None
+    try:
+        if over is not None:
+            over.active_channels = set(laid)
+            for channel, value in laid.items():
+                over.set_source(channel, value)
+                over.set_blending_mode(layerstack.BlendingMode.Replace, channel)
+                over.set_opacity(1.0, channel)
+        return _convention_exports(texture_set, directory)
+    finally:
+        if over is not None:
+            layerstack.delete_node(over)
+
+
+def _convention_exports(texture_set, directory):
     maps = []
     for name, kind, source, dest in (("probe_normal_gl", "virtualMap", "Normal_OpenGL", "RGB"),
-                                     ("probe_channel_normal", "documentMap", "normal", "RGB"),
-                                     ("probe_height", "documentMap", "height", "L")):
+                                     ("probe_channel_normal", "documentMap", "normal", "RGB")):
         maps.append({"fileName": name,
                      "channels": [{"destChannel": one, "srcChannel": one, "srcMapType": kind,
                                    "srcMapName": source} for one in dest],
@@ -514,8 +724,7 @@ def _convention_maps(texture_set, directory):
     result = substance_painter.export.export_project_textures(configuration)
     written = {os.path.splitext(os.path.basename(path))[0]: os.path.basename(path)
                for paths in result.textures.values() for path in paths}
-    found = {key: written[key] for key in ("probe_normal_gl", "probe_channel_normal", "probe_height")
-             if key in written}
+    found = {key: written[key] for key in ("probe_normal_gl", "probe_channel_normal") if key in written}
     found["blending"] = substance_painter.js.evaluate(
         "alg.texturesets.structure({0}).additionalNormalMapBlending".format(json.dumps(texture_set.name)))
     return found
@@ -529,33 +738,99 @@ def _file_of(url):
     return path if path and os.path.isfile(path) else ""
 
 
-def _normal_fills(fills, texture_set_name, staging):
-    """Every fill of the Texture Set laying tangent normals through a chart: where its
-    picture is on disk, or -- for a layer whose normals are not a picture on disk -- its
-    normals rendered in the current layout, so Blender can tell whether any lie where the
-    frames turn."""
+def _normal_fills(fills, texture_set, staging, records):
+    """Every fill of the Texture Set laying tangent normals through a chart, with where they
+    come from, laid out in the chart the fill reads: a picture's own file while it is on
+    disk, else the normals rendered as the fill lays them -- the picture as Painter reads
+    it, or what a substance computes, which Blender only looks at. A fill laying nothing but
+    pictures, every other one of them a file on disk, hands over those files too, each with
+    whether the channel it is laid in holds values past 0..1 (``pixels``)."""
+    stack = texture_set.get_stack()
     found = []
     for fill in fills:
-        if texture_set_name not in fill.members or texture_set_name in fill.following or fill.normal is None:
+        if (texture_set.name not in fill.members or texture_set.name in fill.following
+                or fill.normal is None):
             continue
         kind, url = fill.normal
-        entry = {"uid": fill.uid, "name": fill.name, "index": fill.index,
-                 "members": sorted(fill.members), "source": kind, "file": "", "render": ""}
-        if kind == "bitmap":
-            entry["file"] = _file_of(url)
-        if not entry["file"] and fill.layer:
-            render = "fill_{0}_normal.exr".format(fill.uid)
-            substance_painter.js.evaluate("alg.mapexport.save([{0}, 'normal'], {1}, {{bitDepth: 32, "
-                                          "padding: 'Passthrough'}})".format(
-                                              fill.uid, json.dumps(str(staging.path(render)).replace("\\", "/"))))
-            entry["render"] = render
+        node = layerstack.get_node_by_uid(fill.uid)
+        pictures = [{"channel": channel.name, "floating": stack.get_channel(channel).is_floating(),
+                     "file": _file_of(node.get_source(channel).resource_id.url())}
+                    for channel in sorted(node.active_channels if fill.pixels else (), key=lambda one: one.name)
+                    if channel != textureset.ChannelType.Normal
+                    and isinstance(node.get_source(channel), source_module.SourceBitmap)]
+        moving = fill.pixels and all(picture["file"] for picture in pictures)
+        entry = {"uid": fill.uid, "name": fill.name, "index": fill.index, "members": sorted(fill.members),
+                 "procedural": kind != "bitmap", "pixels": moving, "pictures": pictures if moving else [],
+                 "file": _file_of(url) if kind == "bitmap" else "", "render": "",
+                 "restorable": records[str(fill.uid)]["layout"] if str(fill.uid) in records else None}
+        if not entry["file"]:
+            entry["render"] = "fill_{0}_normal.exr".format(fill.uid)
+            _render_own(node, str(staging.path(entry["render"])))
         found.append(entry)
     return found
 
 
+def _unprojected_pictures(unprojected, texture_set, problems):
+    """Every picture an effect of the Texture Set reads with no projection of its own,
+    other than its own mesh maps, with the file it is: each is laid out in the Texture Set's
+    current layout. A picture that is no file on this computer any more is a problem."""
+    own = _mesh_map_pictures(texture_set)
+    found = []
+    for entry in unprojected:
+        if texture_set.name not in entry.members:
+            continue
+        identity = substance_painter.resource.ResourceID.from_url(entry.url)
+        if (identity.name, identity.version) in own:
+            continue
+        path = _file_of(entry.url)
+        if not path:
+            problems.append("{0}: {1} is a picture that is no file on this computer any more".format(
+                entry.name, "its id mask" if not entry.slot else "its input {0}".format(entry.slot)))
+            continue
+        found.append({"key": entry.key, "name": entry.name, "label": entry.label,
+                      "members": sorted(entry.members), "file": path})
+    return found
+
+
+def _render_own(node, path):
+    """The normals a fill lays by itself, rendered over the whole chart it reads: its layer's
+    content with every other effect of it hidden, an effect laying its normals in place of
+    what lies under it, and a fill reading another UV set reading set 0 for as long as it
+    renders -- Painter renders in the layout of set 0, where what is read through another UV
+    set covers only the islands set 0 lays out -- all put back afterwards."""
+    normal = textureset.ChannelType.Normal
+    layer = node if isinstance(node, layerstack.FillLayerNode) else node.get_parent()
+    others = [effect for effect in layer.content_effects() if effect.uid() != node.uid() and effect.is_visible()]
+    held = None if node is layer else (node.get_blending_mode(normal), node.get_opacity(normal))
+    shown = node.is_visible()
+    projection = (node.get_projection_parameters()
+                  if node.get_projection_mode() == layerstack.ProjectionMode.UVSetToUVSet else None)
+    try:
+        for effect in others:
+            effect.set_visible(False)
+        node.set_visible(True)
+        if held is not None:
+            node.set_blending_mode(layerstack.BlendingMode.Replace, normal)
+            node.set_opacity(1.0, normal)
+        if projection is not None:
+            _bind(node.uid(), 0)
+        substance_painter.js.evaluate("alg.mapexport.save([{0}, 'normal'], {1}, {{bitDepth: 32, "
+                                      "padding: 'Passthrough'}})".format(
+                                          layer.uid(), json.dumps(path.replace("\\", "/"))))
+    finally:
+        if projection is not None:
+            node.set_projection_parameters(projection)
+        if held is not None:
+            node.set_blending_mode(held[0], normal)
+            node.set_opacity(held[1], normal)
+        node.set_visible(shown)
+        for effect in others:
+            effect.set_visible(True)
+
+
 def _write_fresh_picture(path):
     side = 16
-    pixel = bytes(int(round(value * 255.0)) for value in _FRESH_NORMAL)
+    pixel = bytes(int(round(value * 255.0)) for value in _LEANING_NORMAL)
     raw = b"".join(b"\x00" + pixel * side for _ in range(side))
 
     def chunk(kind, payload):
@@ -587,8 +862,9 @@ def _render_alone(stack, resource_id, path):
 def _readings(texture_set, normal_fills, fills, staging):
     """How Painter takes the green of the pictures of normals involved: each fill's own
     picture that is on disk, and a picture it has never seen -- which is what a picture
-    Blender turns comes in as. Painter takes a picture by the first use it is put to, so
-    each is read off a render of its own; Blender compares the renders with the files."""
+    Blender lays out anew comes in as. Painter takes a picture by the first use it is put
+    to, so each is read off a render of its own; Blender compares the renders with the
+    files. A render needs no reading: it is in the project's own convention."""
     stack = texture_set.get_stack()
     urls = {fill.uid: fill.normal[1] for fill in fills if fill.normal is not None}
     for entry in normal_fills:
@@ -614,16 +890,23 @@ def answer(publisher, texture_set_name, request_number):
         refused = "this project has no Texture Set {0}".format(texture_set_name)
     elif texture_set.has_uv_tiles():
         refused = "{0} is laid out in UV tiles, which a layout change cannot carry".format(texture_set_name)
-    fills, unplaceable = readers()
+    fills, unplaceable, unprojected = readers()
     tiled = sorted(name for name, members in unplaceable.values() if texture_set_name in members)
     if tiled and not refused:
         refused = "{0} has fills projected per UV tile ({1}); set their projection to UV first".format(
             texture_set_name, ", ".join(tiled))
-    used = sorted({fill.index for fill in fills if texture_set_name in fill.members
-                   and texture_set_name not in fill.following and fill.index > 0})
-    taken = {fill.index for fill in fills if fill.index > 0}
-    for state in applied().values():
-        taken |= {int(index) for index in state["extra"]}
+    pictures = []
+    if texture_set is not None and not refused:
+        problems = []
+        pictures = _unprojected_pictures(unprojected, texture_set, problems)
+        if problems:
+            refused = "; ".join(problems)
+    readers_here = [{"uid": fill.uid, "index": fill.index, "members": sorted(fill.members),
+                     "following": sorted(fill.following)}
+                    for fill in fills if texture_set_name in fill.members]
+    states = applied()
+    tables = _tables(states)
+    kept = sorted(dict((states.get(texture_set_name) or {}).get("mesh_maps") or {}))
     with publisher.staging() as staging:
         mesh_maps = {}
         convention = {}
@@ -635,15 +918,17 @@ def answer(publisher, texture_set_name, request_number):
                 file_name = "{0}.exr".format(identifier)
                 _save_mesh_map(texture_set_name, identifier, str(staging.path(file_name)))
                 mesh_maps[usage.name] = {"file": file_name, "kind": kind}
-            normal_fills = _normal_fills(fills, texture_set_name, staging)
-            if normal_fills or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
+            normal_fills = _normal_fills(fills, texture_set, staging,
+                                         dict(project_facts.read(NORMALS_KEY) or {}))
+            pictured = [entry for entry in normal_fills if not entry["procedural"]]
+            if pictured or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
                 convention = _convention_maps(texture_set, staging.directory)
-            if any(entry["file"] for entry in normal_fills):
-                convention["fresh"] = _readings(texture_set, normal_fills, fills, staging)
+            if pictured:
+                convention["fresh"] = _readings(texture_set, pictured, fills, staging)
         fingerprint = dict(project_facts.read(SURFACE_KEY) or {}).get(texture_set_name, "")
         staging.publish(record_module.layout_answer(
-            "Substance", texture_set_name, request_number, fingerprint, used, sorted(taken),
-            mesh_maps, normal_fills, convention, refused))
+            "Substance", texture_set_name, request_number, fingerprint, readers_here, tables,
+            kept, mesh_maps, normal_fills, pictures, convention, refused))
     if refused:
         return "cannot change the layout of {0}: {1}".format(texture_set_name, refused)
     return "handed {0}'s {1} mesh map(s) to Blender for its new layout".format(

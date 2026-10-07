@@ -8,15 +8,17 @@ taken from the nearest texel, never blended; everything else bilinearly, the way
 texture is read. Texels no triangle covers are padded from the nearest covered one,
 so filtering across an island border reads the island and not the background.
 
+A picture repeats across UV space, the way a texture set without UV tiles is painted,
+baked and read: coordinates past 0..1 land on the texel they wrap to, in both layouts,
+and a triangle reaching across a tile border covers the texels on both sides of it.
+
 A tangent-space normal is a direction in the tangent frame the layout defines, and
 that frame turns when an island turns, mirrors when it mirrors. At every texel the
 normal is decoded in the frame the old layout gives that point of the surface and
 encoded in the one the new layout gives it: the corners' normals and MikkTSpace
 tangents interpolated across the triangle, the bitangent their cross product times
 the interpolated sign -- what a renderer decodes in (``Frames``). ``green`` is +1 for
-a picture stored the OpenGL way, -1 for the DirectX way. A normal picture that stays
-in its own layout while the frames under it change is carried in place, texel by
-texel, with no resampling at all (``reframed``).
+a picture stored the OpenGL way, -1 for the DirectX way.
 
 Pure numpy, and nothing here knows a mesh, a material or an image datablock.
 """
@@ -27,16 +29,28 @@ import numpy
 
 #: Samples handled per block, which bounds the peak memory of one call.
 _BLOCK = 2_000_000
-#: How far apart two carried normals of one texel may be before the texel is two
-#: things at once.
-_SAME_NORMAL = 1e-3
+
+
+def _wrapped(triangles):
+    """Each triangle once per UV tile it reaches into, moved into the first tile, with the
+    triangle each copy comes from."""
+    low = numpy.floor(triangles.min(axis=1)).astype(numpy.int64)
+    high = numpy.floor(triangles.max(axis=1)).astype(numpy.int64)
+    if not (low.any() or high.any()):
+        return triangles, numpy.arange(len(triangles))
+    spans = high - low + 1
+    copies = spans[:, 0] * spans[:, 1]
+    source = numpy.repeat(numpy.arange(len(triangles)), copies)
+    rank = numpy.arange(len(source)) - numpy.repeat(numpy.cumsum(copies) - copies, copies)
+    shift = numpy.stack((low[source, 0] + rank % spans[source, 0], low[source, 1] + rank // spans[source, 0]), axis=1)
+    return triangles[source] - shift[:, None, :], source
 
 
 def rasterize(triangles, width, height, every=False):
-    """The texel centres the triangles cover: flat texel indices, the triangle covering
-    each, and its barycentric weights there. A texel two triangles cover goes to the
-    later one, unless ``every`` asks for each of them."""
-    triangles = numpy.asarray(triangles, dtype=numpy.float64)
+    """The texel centres the triangles cover, the picture repeating across UV space: flat
+    texel indices, the triangle covering each, and its barycentric weights there. A texel
+    two triangles cover goes to the later one, unless ``every`` asks for each of them."""
+    triangles, source = _wrapped(numpy.asarray(triangles, dtype=numpy.float64))
     x = triangles[:, :, 0] * width - 0.5
     y = triangles[:, :, 1] * height - 0.5
     x_low = numpy.clip(numpy.ceil(x.min(axis=1)), 0, width - 1).astype(numpy.int64)
@@ -73,7 +87,7 @@ def rasterize(triangles, width, height, every=False):
         w0 = 1.0 - w1 - w2
         inside = valid & (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
         texels.append(row[inside] * width + column[inside])
-        owners.append(repeat[inside])
+        owners.append(source[repeat[inside]])
         weights.append(numpy.stack((w0[inside], w1[inside], w2[inside]), axis=1))
     if not texels:
         return (numpy.empty(0, dtype=numpy.int64), numpy.empty(0, dtype=numpy.int64),
@@ -98,12 +112,10 @@ def _bilinear(picture, uv):
     y0 = numpy.floor(y)
     fx = (x - x0)[:, None]
     fy = (y - y0)[:, None]
-    x0 = x0.astype(numpy.int64)
-    y0 = y0.astype(numpy.int64)
-    x1 = numpy.clip(x0 + 1, 0, width - 1)
-    y1 = numpy.clip(y0 + 1, 0, height - 1)
-    x0 = numpy.clip(x0, 0, width - 1)
-    y0 = numpy.clip(y0, 0, height - 1)
+    x0 = x0.astype(numpy.int64) % width
+    y0 = y0.astype(numpy.int64) % height
+    x1 = (x0 + 1) % width
+    y1 = (y0 + 1) % height
     top = picture[y0, x0] * (1.0 - fx) + picture[y0, x1] * fx
     bottom = picture[y1, x0] * (1.0 - fx) + picture[y1, x1] * fx
     return top * (1.0 - fy) + bottom * fy
@@ -111,8 +123,8 @@ def _bilinear(picture, uv):
 
 def _nearest(picture, uv):
     height, width = picture.shape[:2]
-    column = numpy.clip(numpy.floor(uv[:, 0] * width).astype(numpy.int64), 0, width - 1)
-    row = numpy.clip(numpy.floor(uv[:, 1] * height).astype(numpy.int64), 0, height - 1)
+    column = numpy.floor(uv[:, 0] * width).astype(numpy.int64) % width
+    row = numpy.floor(uv[:, 1] * height).astype(numpy.int64) % height
     return picture[row, column]
 
 
@@ -237,13 +249,39 @@ def pad(picture, covered):
     return filled
 
 
-def relaid(picture, old_triangles, new_triangles, kind, frames=None, green=1.0, size=None):
+def turned_apart(picture, triangles, frames, green=1.0):
+    """The most, in degrees, a tangent picture laid out in ``triangles`` parts from itself
+    once carried into the frames after a layout change, at the texel centres two of its
+    triangles share: a picture laid out there holds the normal of one of them."""
+    picture = numpy.asarray(picture, dtype=numpy.float64)
+    height, width = picture.shape[:2]
+    texels, owners, weights = rasterize(triangles, width, height, every=True)
+    again = numpy.flatnonzero(texels[1:] == texels[:-1])
+    if not len(again):
+        return 0.0
+    pairs = numpy.concatenate((again, again + 1))
+    lanes = picture.reshape(-1, picture.shape[2])[texels[pairs]]
+    coverage = lanes[:, 3] if lanes.shape[1] > 3 else numpy.ones(len(lanes))
+    covered = coverage > 0.0
+    vectors = numpy.zeros((len(lanes), 3))
+    vectors[covered] = lanes[covered, :3] / coverage[covered, None] * 2.0 - 1.0
+    vectors[:, 1] *= green
+    carried = _unit(_carried(vectors, weights[pairs], owners[pairs], frames))
+    both = covered[:len(again)] & covered[len(again):]
+    if not both.any():
+        return 0.0
+    cosine = numpy.clip(numpy.sum(carried[:len(again)][both] * carried[len(again):][both], axis=1), -1.0, 1.0)
+    return float(numpy.degrees(numpy.arccos(cosine)).max())
+
+
+def relaid(picture, old_triangles, new_triangles, kind, frames=None, green=1.0, green_after=None, size=None):
     """``picture`` (height, width, channels), laid out in ``old_triangles``, laid out
     again in ``new_triangles``; ``size`` is the (width, height) of the result, the
     picture's own by default. ``kind`` is ``value``, ``label`` or ``tangent``; a tangent
-    picture needs the ``frames`` of both layouts and its ``green``. Its first three lanes
-    are the normal; a fourth, when there is one, is a coverage the normal is
-    premultiplied by, as Painter stores one."""
+    picture needs the ``frames`` of both layouts, its ``green``, and ``green_after`` when
+    it is written for a reader that takes green another way. Its first three lanes are
+    the normal; a fourth, when there is one, is a coverage the normal is premultiplied
+    by, as Painter stores one."""
     picture = numpy.asarray(picture, dtype=numpy.float64)
     height, width = picture.shape[:2]
     out_width, out_height = size if size is not None else (width, height)
@@ -252,50 +290,9 @@ def relaid(picture, old_triangles, new_triangles, kind, frames=None, green=1.0, 
     old_uv = numpy.einsum("kc,kcd->kd", weights, old_triangles[owners])
     values = (_nearest if kind == "label" else _bilinear)(picture, old_uv)
     if kind == "tangent":
-        values = _carried_lanes(values, weights, owners, frames, green)
+        values = _carried_lanes(values, weights, owners, frames, green, green_after)
     out = numpy.zeros((out_height * out_width, picture.shape[2]))
     out[texels] = values
     covered = numpy.zeros(out_height * out_width, dtype=bool)
     covered[texels] = True
     return pad(out.reshape(out_height, out_width, -1), covered.reshape(out_height, out_width))
-
-
-def reframed(picture, triangles, frames, green=1.0, green_after=None):
-    """A tangent-space normal ``picture`` laid out in ``triangles``, left in that layout
-    with every texel's normal carried from the frames before to the frames after -- no
-    texel moves, so nothing is resampled. Its green is read with ``green`` and written
-    with ``green_after``, for a picture that will be taken another way than it was. A
-    texel no triangle covers is carried with the frames of the nearest one that is, which
-    keeps an island's border filtering right. Raises ``ValueError`` when triangles
-    overlapping in the layout would need one texel to hold two different normals."""
-    picture = numpy.asarray(picture, dtype=numpy.float64)
-    height, width = picture.shape[:2]
-    flat = picture.reshape(-1, picture.shape[2])
-    texels, owners, weights = rasterize(triangles, width, height, every=True)
-    if not len(texels):
-        return picture
-    carried = _carried_lanes(flat[texels], weights, owners, frames, green, green_after)
-    first = numpy.ones(len(texels), dtype=bool)
-    first[1:] = texels[1:] != texels[:-1]
-    group = numpy.cumsum(first) - 1
-    leader = carried[first][group]
-    disagreeing = numpy.abs(carried[:, :3] - leader[:, :3]).max(axis=1) > _SAME_NORMAL
-    if disagreeing.any():
-        raise ValueError("{0} texel(s) are shared by overlapping islands whose frames change "
-                         "differently".format(int(numpy.unique(texels[disagreeing]).size)))
-    texels, owners, weights = texels[first], owners[first], weights[first]
-    out = flat.copy()
-    out[texels] = carried[first]
-    covered = numpy.zeros(height * width, dtype=bool)
-    covered[texels] = True
-    uncovered = numpy.flatnonzero(~covered)
-    if len(uncovered):
-        owner_of = numpy.full(height * width, -1, dtype=numpy.int64)
-        owner_of[texels] = owners
-        weights_of = numpy.zeros((height * width, 3))
-        weights_of[texels] = weights
-        seed_row, seed_column = nearest(covered.reshape(height, width))
-        seed = (seed_row * width + seed_column).reshape(-1)[uncovered]
-        out[uncovered] = _carried_lanes(flat[uncovered], weights_of[seed], owner_of[seed], frames, green,
-                                        green_after)
-    return out.reshape(picture.shape)
