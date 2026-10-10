@@ -777,13 +777,34 @@ def apply_shading(record):
     return "; ".join(parts)
 
 
-def _mesh_finished(status=None, applied=None):
+def _mesh_finished(status=None, applied=None, created=()):
     _mesh_deadline[0] = None
     _presence_due[0] = True
     if applied is None and status is not None and status != str(substance_painter.project.ReloadMeshStatus.SUCCESS):
         _panel.set_status(status)
     if applied is not None and applied.relaid:
         _follow_layouts(applied)
+    if created:
+        _wear_material_shaders(created)
+
+
+def _wear_material_shaders(created):
+    """Texture Sets a surface just made take the shader of the Blender material painting each, with
+    every parameter -- what Pull Shader takes -- and the textures the shader reads whole, its ramps
+    and lookups -- the shader half of Pull Textures, no layer touched: a Texture Set born from a
+    material shades as the material does from the start, its blending and transparency included,
+    and nobody has to remember to pull it. Ones no generated material paints keep Painter's own.
+    The shader is asked for first, and its textures land on the instance it makes."""
+    painted = speakers(blender_state().get("materials") or [])
+    wanted = sorted(name for name in created if name in painted)
+    if not wanted:
+        return
+    _ask(record_module.ASK_FOR_SHADING, texture_sets=wanted)
+    requests, skipped = _stand_up_requests(wanted, material_seed.SHADER_KINDS)
+    _say_skipped("shader textures", skipped)
+    if requests:
+        _ask(record_module.ASK_FOR_INPUTS, texture_sets=requests)
+    _panel.set_status("taking the shader of {0} from Blender, new with this mesh".format(_named(wanted)))
 
 
 def _follow_layouts(applied):
@@ -929,8 +950,8 @@ def _on_timer():
 def _on_project_ready(_event):
     _IMPORTED.clear()
     project_imports.forget()
-    mesh_ingest.settle_new_project()
-    _mesh_finished()
+    made = mesh_ingest.settle_new_project()
+    _mesh_finished(created=sorted(one.name for one in substance_painter.textureset.all_texture_sets()) if made else ())
 
 
 def _on_project_changed(_event):

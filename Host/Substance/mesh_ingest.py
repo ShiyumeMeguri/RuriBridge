@@ -157,9 +157,9 @@ def apply(generation, texture_resolution, on_finished=None):
     """Queue this generation's surface into Painter. Returns what it will do.
 
     ``on_finished`` hears the end of a swap, with what it changed of the layouts
-    (``layout_state.Applied``) when it went in. A new project says it is ready the
-    way every project does, with ``ProjectEditionEntered`` -- creating returns long
-    before the project can be asked anything.
+    (``layout_state.Applied``) when it went in, and the Texture Sets the swap made. A new
+    project says it is ready the way every project does, with ``ProjectEditionEntered`` --
+    creating returns long before the project can be asked anything.
     """
     record = generation.record
     scene_path = generation.path(record["scene_file"])
@@ -217,12 +217,16 @@ def apply(generation, texture_resolution, on_finished=None):
     if emptied:
         LOG.info("%s keep no face and go with this swap, their paint carried where the faces went",
                  ", ".join(emptied))
+    before = {texture_set.name for texture_set in substance_painter.textureset.all_texture_sets()}
 
     def finished(status):
         _allowed_drops.clear()
         applied = None
+        created = []
         outcome = str(status)
         if status == substance_painter.project.ReloadMeshStatus.SUCCESS:
+            created = sorted({texture_set.name for texture_set in substance_painter.textureset.all_texture_sets()}
+                             - before)
             LOG.info("mesh generation %d swapped in", generation.number)
             try:
                 applied = layout_state.after_surface(chosen)
@@ -241,7 +245,7 @@ def apply(generation, texture_resolution, on_finished=None):
             LOG.error("Painter refused mesh generation %d (%s); its log says why",
                       generation.number, status)
         if on_finished is not None:
-            on_finished(outcome, applied)
+            on_finished(outcome, applied, created)
 
     def reload():
         layout_state.before_surface(chosen)
