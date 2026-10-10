@@ -36,9 +36,25 @@ def slot_texture_sets(object_reference):
             for slot in object_reference.material_slots]
 
 
-def events_of(texture_set):
-    """The events that carried faces into a Texture Set, ``{event: source}``."""
-    return face_ledger.events_of_materials(mesh_publish.painted_by(texture_set))
+def held_events(painter):
+    """Every event whose folder the project Painter has open holds, ``{event: (Texture Set holding it,
+    Texture Set its paint came from)}``: Painter's own statement, the one record of where a folder is."""
+    return {str(event): (holder, str(source)) for holder, events in dict(painter.get("guests") or {}).items()
+            for event, source in dict(events).items()}
+
+
+def renamed_view(painter, renamed):
+    """Painter's statement with the Texture Sets it just renamed, old name to new, under their new
+    names -- what it states next."""
+    if not renamed:
+        return painter
+    named = dict(renamed)
+    return dict(painter,
+                texture_sets=[dict(entry, name=named.get(entry["name"], entry["name"]))
+                              for entry in painter.get("texture_sets") or []],
+                guests={named.get(holder, holder): {event: named.get(source, source)
+                                                    for event, source in dict(events).items()}
+                        for holder, events in dict(painter.get("guests") or {}).items()})
 
 
 def render_coordinates(mesh):
@@ -188,15 +204,16 @@ def mask(render, chosen, others, size):
     return chart_resample.pad_near(values.reshape(height, width, 1), covered.reshape(height, width), _MASK_RIM)
 
 
-def guests(surface, painter, beside, events, resolutions):
+def guests(surface, painter, beside, events, resolutions, rehomes):
     """For every Texture Set holding faces whose paint lives in another one once this surface is in,
     its painted UV set and a mask per event, ``{target: {"index", "events": {event: {"source",
     "mask"}}}}``: the faces each event carried, ``events`` ``{(source, target): event}`` naming the
-    ones this surface carries, each mask a picture ``beside`` the record. An event whose faces are
-    all gone keeps a black mask while Painter holds its folder. ``resolutions`` gives the size of a
+    ones this surface carries and ``rehomes`` ``{event: (holder, target)}`` the ones whose folder
+    moves with their faces, each mask a picture ``beside`` the record. An event whose faces are all
+    gone keeps a black mask while Painter holds its folder. ``resolutions`` gives the size of a
     Texture Set Painter does not have yet."""
     known = {entry["name"]: entry for entry in painter.get("texture_sets") or []}
-    held = {name: set(listed) for name, listed in dict(painter.get("guests") or {}).items()}
+    held = held_events(painter)
     payload = {}
     if surface.target is None:
         return payload
@@ -204,11 +221,12 @@ def guests(surface, painter, beside, events, resolutions):
     for (source, target), event in events.items():
         movers = (surface.event == 0) & (surface.source == face_ledger.digest(source)) & surface.of(target)
         after[movers] = event
+    sources = {event: source for event, (_holder, source) in held.items()}
+    sources.update({str(event): source for (source, _target), event in events.items()})
     for target in surface.names:
         here = surface.of(target)
-        registry = events_of(target)
         listed = {str(event) for event in numpy.unique(after[here]) if event}
-        listed |= {event for event in registry if event in held.get(target, set())}
+        listed |= {event for event, (holder, _source) in held.items() if holder == target and event not in rehomes}
         listed |= {str(event) for (_source, carried_into), event in events.items() if carried_into == target}
         if not listed:
             continue
@@ -218,9 +236,6 @@ def guests(surface, painter, beside, events, resolutions):
             raise RuntimeError("{0} holds faces whose paint lives in another Texture Set, and its table has no "
                                "UV set for them".format(target))
         size = tuple(known[target]["resolution"]) if target in known else tuple(resolutions[target])
-        sources = dict(registry)
-        sources.update({str(event): source for (source, carried_into), event in events.items()
-                        if carried_into == target})
         entry = {"index": index, "events": {}}
         for event in sorted(listed):
             chosen = here & (after == int(event))
@@ -236,12 +251,14 @@ def guests(surface, painter, beside, events, resolutions):
 # -- sending, and the record once Painter holds it --------------------------------------------------------
 
 def send(session, context, frame_of_project, painter, beside, relaid=None, carry=None, events=None,
-         resolutions=None, dropped=()):
+         resolutions=None, dropped=(), rehomes=None):
     """Send the surface in the project's frame with the masks of its guests and the pictures
-    ``beside`` it (``Beside``), and keep the record it leaves until Painter holds it. ``events`` are
-    the events this surface carries faces by, ``{(source, target): event}``; ``resolutions`` the
-    sizes of Texture Sets Painter does not have yet; ``dropped`` the Texture Sets Painter deletes with
-    it, whose faces start over where they paint now. Returns the generation."""
+    ``beside`` it (``Beside``), and keep the record it leaves until Painter holds it. ``painter`` is
+    what Painter states it holds; ``events`` are the events this surface carries faces by,
+    ``{(source, target): event}``, and ``rehomes`` the ones whose folder moves with their faces,
+    ``{event: (holder, target)}``; ``resolutions`` the sizes of Texture Sets Painter does not have
+    yet; ``dropped`` the Texture Sets Painter deletes with it, whose faces start over where they paint
+    now. Returns the generation."""
     objects = mesh_publish.scope(context.view_layer)
     events = dict(events or {})
     names = [name for name in project_names(painter) if name not in set(dropped)]
@@ -249,8 +266,8 @@ def send(session, context, frame_of_project, painter, beside, relaid=None, carry
     if names:
         surface = gather(objects, frames=False)
         if surface.target is not None and (events or (surface.event != 0).any() or painter.get("guests")):
-            payload = guests(surface, painter, beside, events, dict(resolutions or {}))
-    generation = mesh_publish.publish(session.publisher(topic_module.MESH), objects, frame_of_project,
+            payload = guests(surface, painter, beside, events, dict(resolutions or {}), dict(rehomes or {}))
+    generation =mesh_publish.publish(session.publisher(topic_module.MESH), objects, frame_of_project,
                                       beside.files, relaid=relaid, guests=payload, carry=carry,
                                       dropped=dropped)
     meshes = face_ledger.settled(objects, slot_texture_sets, render_coordinates, events, names, fresh=not names)

@@ -111,19 +111,56 @@ def _coverage(node, texture_set, staging):
     return {"mask": mask, "channels": channels}
 
 
+def _layer(node, texture_set, painted, seed, emptied, staging, measured):
+    """One layer of the Texture Set as ``carry_answer`` describes a root layer; where it covers the
+    Texture Set only when ``measured`` and it would be copied."""
+    shows = shown_by(node)
+    home = shows.get_texture_set().name
+    paint = any(layer.uid() in painted for layer in _layers_under(shows))
+    own_seed = seed is not None and node.uid() == int(seed)
+    copied = measured and home == texture_set.name and not own_seed and (paint or emptied)
+    return {"uid": node.uid(), "name": node.get_name(), "shows": shows.uid(), "home": home,
+            "paint": paint, "seed": own_seed, "kind": _kind(shows), "visible": node.is_visible(),
+            "coverage": _coverage(node, texture_set, staging) if copied and node.is_visible() else None}
+
+
 def _roots(texture_set, painted, seed, emptied, staging):
     """The Texture Set's root layers, top first, as ``carry_answer`` describes them."""
-    found = []
+    return [_layer(node, texture_set, painted, seed, emptied, staging, True)
+            for node in layerstack.get_root_layer_nodes(texture_set.get_stack())]
+
+
+def _lying_in(node, group):
+    """The layer a node lies under that is a root layer or lies in ``group`` (a uid)."""
+    while node.get_parent() is not None and node.get_parent().uid() != group:
+        node = node.get_parent()
+    return node
+
+
+def _leaving(texture_set, folder, folders, painted, seed, emptied, held, staging, problems):
+    """An event's folder in the Texture Set holding it, for the faces leaving with it, as
+    ``carry_answer`` gives ``rehomes``: the root layers over the folder -- but the other events'
+    folders (``folders``, uids), which show on their own faces only -- and the layers it holds, top
+    first; the paint under the ones copied that a copy cannot cast again -- polygon fills only, the
+    faces lying where they lay -- each with the layer of those it lies under (``root``); every layer
+    lying in the folder, which goes with it (``lying``); and every layer and effect the folder shows,
+    through instances too (``inside``)."""
+    group = layerstack.get_node_by_uid(int(folder["group"]))
+    over = []
     for node in layerstack.get_root_layer_nodes(texture_set.get_stack()):
-        shows = shown_by(node)
-        home = shows.get_texture_set().name
-        paint = any(layer.uid() in painted for layer in _layers_under(shows))
-        own_seed = seed is not None and node.uid() == int(seed)
-        copied = home == texture_set.name and not own_seed and (paint or emptied)
-        found.append({"uid": node.uid(), "name": node.get_name(), "shows": shows.uid(), "home": home,
-                      "paint": paint, "seed": own_seed, "kind": _kind(shows), "visible": node.is_visible(),
-                      "coverage": _coverage(node, texture_set, staging) if copied and node.is_visible() else None})
-    return found
+        if node.uid() == group.uid():
+            break
+        if node.uid() in folders:
+            continue
+        over.append(dict(_layer(node, texture_set, painted, seed, emptied, staging, True), inside=False))
+    inside = [dict(_layer(node, texture_set, painted, None, True, staging, False), inside=True)
+              for node in group.sub_layers()]
+    copied = {entry["uid"] for entry in over if entry["coverage"] is not None} | {group.uid()}
+    found = paint_pixels.carried(texture_set, held, copied, problems, laid_alike=True)
+    frozen = [dict(entry, root=_lying_in(layerstack.get_node_by_uid(entry["layer"]), group.uid()).uid())
+              for entry in paint_pixels.capture(found, staging)]
+    return {"holder": texture_set.name, "roots": over + inside, "frozen": frozen,
+            "lying": [layer.uid() for layer in _layers_under(group)], "inside": _nodes_under(group)}
 
 
 def _nodes_under(node):
@@ -166,40 +203,52 @@ def _described(texture_set, prefix, staging):
     return {"resolution": [resolution.width, resolution.height], "channels": channels, "mesh_maps": mesh_maps}
 
 
-def answer(publisher, moves, emptied, request_number):
-    """Say how the sources' stacks are made and hand over what carrying their faces needs: the
-    sources' and targets' mesh maps, the chart-addressed fills the sources show, the sources' root
-    layers with pictures of where the ones that would be copied cover them, and pictures of the
-    paint a copy cannot cast again, and the fills laying normals through a chart. Returns one line
-    about it."""
+def answer(publisher, renamed, moves, rehomes, emptied, request_number, refused=""):
+    """Say how the stacks the moving faces' paint lives in are made, once the Texture Sets ``renamed``
+    (old name to new) were renamed, and hand over what carrying their faces needs: the mesh maps of
+    the Texture Sets the faces leave and go into, the chart-addressed fills those show, the sources'
+    root layers with pictures of where the ones that would be copied cover them, the folders leaving
+    with their faces (``rehomes``, ``{event: {"holder", "target"}}``) with what lies over them and in
+    them (``_leaving``), pictures of the paint a copy cannot cast again, and the fills laying normals
+    through a chart. Returns one line about it."""
     names = {one.name: one for one in textureset.all_texture_sets()}
-    targets = sorted(moves)
+    events = known()
+    targets = sorted(set(moves) | {entry["target"] for entry in rehomes.values()})
     sources = sorted({source for listed in moves.values() for source in listed})
-    refused = ""
-    missing = sorted(source for source in sources if source not in names)
-    if missing:
-        refused = "this project has no Texture Set {0} to carry paint from".format(", ".join(missing))
-    tiled = sorted(name for name in set(sources) | set(targets) if name in names and names[name].has_uv_tiles())
+    holders = sorted({entry["holder"] for entry in rehomes.values()})
+    leaving_from = set(sources) | set(holders)
+    if not refused:
+        missing = sorted(name for name in leaving_from if name not in names)
+        if missing:
+            refused = "this project has no Texture Set {0} to carry paint from".format(", ".join(missing))
+    if not refused:
+        gone = sorted(event for event, entry in rehomes.items() if event not in events.get(entry["holder"], {}))
+        if gone:
+            refused = "this project holds no folder of {0} for the faces carried into it".format(
+                ", ".join(sorted({rehomes[event]["holder"] for event in gone})))
+    tiled = sorted(name for name in leaving_from | set(targets) if name in names and names[name].has_uv_tiles())
     if tiled and not refused:
         refused = "{0} laid out in UV tiles, which faces cannot be carried between".format(", ".join(tiled))
     fills = []
     if not refused:
         fills, unplaceable, _unprojected = layout_state.readers()
-        projected = sorted(name for name, members in unplaceable.values() if members & set(sources))
+        projected = sorted(name for name, members in unplaceable.values() if members & leaving_from)
         if projected:
             refused = ("fills projected per UV tile ({0}) cannot read where their faces went; set their "
                        "projection to UV first".format(", ".join(projected)))
     readers = [{"uid": fill.uid, "index": fill.index, "members": sorted(fill.members),
-                "following": sorted(fill.following)} for fill in fills if fill.members & set(sources)]
-    roots, frozen, normals, described, convention = {}, {}, {}, {}, {}
+                "following": sorted(fill.following)} for fill in fills if fill.members & leaving_from]
+    roots, frozen, normals, described, convention, leaving = {}, {}, {}, {}, {}, {}
+    carrying = bool(targets) and not refused
     with publisher.staging() as staging:
         held = None
-        if not refused:
+        if carrying:
             try:
                 held = paint_pixels.document()
             except project_document.DocumentError as error:
                 refused = "the project file holds its strokes in a form the bridge does not read: {0}".format(error)
-        if not refused:
+                carrying = False
+        if carrying:
             painted = project_document.painted(held)
             seeds = {name: state.get("layer")
                      for name, state in dict(project_facts.read(material_seed.SEED_KEY) or {}).items()}
@@ -211,29 +260,41 @@ def answer(publisher, moves, emptied, request_number):
                 frozen[source] = [dict(entry, root=paint_pixels.root_of(layerstack.get_node_by_uid(entry["layer"])).uid())
                                   for entry in paint_pixels.capture(found, staging)]
                 normals[source] = _normals(names[source], fills, roots[source], staging)
+            for event, entry in sorted(rehomes.items()):
+                holder = entry["holder"]
+                folders = {int(one["group"]) for one in events[holder].values()}
+                leaving[event] = dict(_leaving(names[holder], events[holder][event], folders, painted,
+                                               seeds.get(holder), holder in emptied, held, staging, problems),
+                                      target=entry["target"])
             if problems:
                 refused = "; ".join(problems)
-        if not refused:
-            for index, name in enumerate(sorted(set(sources) | set(targets))):
+        if carrying and not refused:
+            for index, name in enumerate(sorted(leaving_from | set(targets))):
                 if name in names:
                     described[name] = _described(names[name], "set{0}".format(index), staging)
-            probed = next((source for source in sources if described[source]["mesh_maps"].get("Normal")), None)
-            normal_paint = any(channel["space"] == "normal" for listed in frozen.values() for entry in listed
-                               for channel in entry["channels"])
+            carried_from = sources + holders
+            probed = next((name for name in carried_from if described[name]["mesh_maps"].get("Normal")), None)
+            normal_paint = any(channel["space"] == "normal"
+                               for listed in list(frozen.values()) + [one["frozen"] for one in leaving.values()]
+                               for entry in listed for channel in entry["channels"])
             pictured = [entry for listed in normals.values() for entry in listed if not entry["untouched"]]
             if probed is None and (normal_paint or any(normals.values())):
-                probed = sources[0]
+                probed = carried_from[0]
             if probed is not None:
                 convention[probed] = layout_state.convention_maps(names[probed], staging.directory)
                 if pictured:
                     convention[probed]["fresh"] = layout_state.readings(names[probed], pictured, fills, staging)
         staging.publish(record_module.carry_answer(
-            "Substance", request_number, moves, layout_state.tables_of(layout_state.applied()), described,
-            readers, roots, frozen, normals, convention, refused))
+            "Substance", request_number, renamed, moves, leaving, layout_state.tables_of(layout_state.applied()),
+            described, readers, roots, frozen, normals, convention, refused))
+    done = ["renamed {0} -> {1}".format(old, new) for old, new in sorted(renamed.items())]
     if refused:
-        return "cannot carry faces into {0}: {1}".format(", ".join(targets), refused)
-    return "handed the stacks of {0} to Blender for their faces moving into {1}".format(
-        ", ".join(sources), ", ".join(targets))
+        return "; ".join(done + ["cannot carry faces into {0}: {1}".format(", ".join(targets) or "anything",
+                                                                            refused)])
+    if targets:
+        done.append("handed the stacks of {0} to Blender for their faces moving into {1}".format(
+            ", ".join(sorted(leaving_from)), ", ".join(targets)))
+    return "; ".join(done) or "nothing to carry"
 
 
 def rename(renames):
@@ -261,13 +322,14 @@ def known():
 class Plan:
     """What one surface does with guests, worked out before anything moves: the events it
     carries (``carry``), the masks of every event (``guests``), the mesh maps taken in, held,
-    and -- filled in before the surface goes in, while every source is still there -- the root
-    layers to lay, by root uid: copies (``copies``) and the layers instances show (``instances``,
-    ``{"shows", "name", "visible", "blending"}``), each with how the root blends in its source
-    (``_blending``); the channels each source has (``channels``); and what is laid only as near
-    as Painter lets it, one line each (``notes``)."""
+    and -- filled in before the surface goes in, while every source is still there -- the
+    layers to lay, by uid: copies (``copies``) and the layers instances show (``instances``,
+    ``{"shows", "name", "visible", "blending"}``), each with how it blends where it lies
+    (``_blending``); the channels of each Texture Set they lie in (``channels``); how each folder
+    leaving with its faces blends, by event (``folders``); and what is laid only as near as Painter
+    lets it, one line each (``notes``)."""
 
-    __slots__ = ("guests", "carry", "mesh_maps", "copies", "instances", "channels", "notes")
+    __slots__ = ("guests", "carry", "mesh_maps", "copies", "instances", "channels", "folders", "notes")
 
     def __init__(self, guests, carry, mesh_maps):
         self.guests = guests
@@ -276,11 +338,18 @@ class Plan:
         self.copies = {}
         self.instances = {}
         self.channels = {}
+        self.folders = {}
         self.notes = []
 
     @property
     def emptied(self):
         return set((self.carry or {}).get("emptied") or [])
+
+
+def _home(carried):
+    """The Texture Set the layers an event lays lie in now: the folder's, for one leaving with its
+    faces; the source's otherwise."""
+    return carried["holder"] or carried["source"]
 
 
 def _outside_instances(node, inside):
@@ -331,8 +400,12 @@ def plan(record, directory):
                                 "open the project they were carried in".format(target, guest["source"]))
     for target, entry in sorted(targets.items()):
         for event, carried in sorted(entry["events"].items()):
-            if carried["source"] not in names:
-                problems.append("there is no Texture Set {0} to carry paint from".format(carried["source"]))
+            if _home(carried) not in names:
+                problems.append("there is no Texture Set {0} to carry paint from".format(_home(carried)))
+                continue
+            if carried["holder"] and event not in held.get(carried["holder"], {}):
+                problems.append("{0} holds no folder for the faces leaving it for {1}".format(carried["holder"],
+                                                                                            target))
                 continue
             for root in carried["roots"]:
                 try:
@@ -463,11 +536,18 @@ def before_surface(chosen):
     its tree as it stands -- each root with how it blends in its source. A root the target's own
     layer stands in for that blends otherwise there is noted."""
     folder = held_imports.folder()
+    names = {one.name for one in textureset.all_texture_sets()}
+    events = known()
     for target, entry in sorted(dict((chosen.carry or {}).get("targets") or {}).items()):
-        target_channels = set(textureset.TextureSet.from_name(target).get_stack().all_channels())
+        target_channels = (set(textureset.TextureSet.from_name(target).get_stack().all_channels())
+                           if target in names else set())
         for event, carried in sorted(entry["events"].items()):
-            channels = set(textureset.TextureSet.from_name(carried["source"]).get_stack().all_channels())
-            chosen.channels[carried["source"]] = channels
+            channels = set(textureset.TextureSet.from_name(_home(carried)).get_stack().all_channels())
+            chosen.channels[_home(carried)] = channels
+            if carried["holder"]:
+                leaving = layerstack.get_node_by_uid(int(events[carried["holder"]][event]["group"]))
+                chosen.folders[event] = {channel: (leaving.get_blending_mode(channel), leaving.get_opacity(channel))
+                                         for channel in channels}
             for root in carried["roots"]:
                 node = layerstack.get_node_by_uid(int(root["uid"]))
                 if root["carry"] in ("instance", "own"):
@@ -650,7 +730,10 @@ def _mesh_maps(texture_set, held):
 
 def _build(texture_set, index, event, carried, mask, chosen, standing):
     """One event's folder: on top of the Texture Set's stack, or right under the Texture Set's own
-    layers the source shows, which lie on the faces as they lay in the source."""
+    layers the source shows, which lie on the faces as they lay in the source; blending Replace, or
+    as the folder it stands for blended, for one leaving with its faces. What it lays reading the
+    layout of set 0 is made to read where the faces' paint is laid out, but what goes on reading the
+    layout (``reads``)."""
     stack = texture_set.get_stack()
     own = [layerstack.get_node_by_uid(int(chosen.instances[int(root["uid"])]["shows"]))
            for root in carried["roots"] if root["carry"] == "own"]
@@ -658,11 +741,12 @@ def _build(texture_set, index, event, carried, mask, chosen, standing):
                 else layerstack.InsertPosition.from_textureset_stack(stack))
     group = layerstack.insert_group(position)
     group.set_name("From {0}".format(carried["source"]))
+    blending = chosen.folders.get(event, {})
     for channel in stack.all_channels():
-        group.set_blending_mode(layerstack.BlendingMode.Replace, channel)
+        _set_blending(group, channel, *blending.get(channel, (layerstack.BlendingMode.Replace, 1.0)))
     mask_fill = _mask_fill(group, mask)
     inside = layerstack.InsertPosition.inside_node(group, layerstack.NodeStack.Substack)
-    laid = [("own", node, None) for node in own]
+    laid = [("own", node, None, "painted") for node in own]
     for root in reversed(carried["roots"]):
         if root["carry"] in ("skip", "own"):
             continue
@@ -672,7 +756,7 @@ def _build(texture_set, index, event, carried, mask, chosen, standing):
             made.set_name(shown["name"])
             made.set_visible(shown["visible"])
             _blend(made, shown["blending"], stack, shown["home"])
-            laid.append(("instance", made, None))
+            laid.append(("instance", made, None, root["reads"]))
             continue
         copy = chosen.copies[int(root["uid"])]
         if copy["kind"] == "group":
@@ -682,17 +766,17 @@ def _build(texture_set, index, event, carried, mask, chosen, standing):
             _blend_copy(made, copy["blending"])
         else:
             made = _lay_plain(inside, copy["plain"])
-        laid.append(("copy", made, copy))
+        laid.append(("copy", made, copy, root["reads"]))
     following = {uid for uid in _following(texture_set)}
     bound = set()
     stand_ins = []
     turned = set()
-    for how, made, copy in laid:
+    for how, made, copy, reads in laid:
         if how == "copy":
             found, converted, repairs = {}, {}, []
             _match(copy["shape"], made, found, converted, repairs)
             for node, shape in repairs:
-                _repair(layerstack.get_node_by_uid(found[shape["uid"]]), shape, chosen.channels[carried["source"]],
+                _repair(layerstack.get_node_by_uid(found[shape["uid"]]), shape, chosen.channels[_home(carried)],
                         stack)
             for uid, path in sorted(dict(carried.get("normals") or {}).items()):
                 if int(uid) in found:
@@ -704,11 +788,12 @@ def _build(texture_set, index, event, carried, mask, chosen, standing):
                 layer = layerstack.get_node_by_uid(found[int(frozen["layer"])])
                 effect = None if frozen["own"] else layerstack.get_node_by_uid(found[int(uid)])
                 if frozen["own"] and frozen["mask"]:
-                    for turned in converted.get(int(frozen["layer"]), []):
-                        layerstack.get_node_by_uid(turned).set_visible(False)
+                    for converted_uid in converted.get(int(frozen["layer"]), []):
+                        layerstack.get_node_by_uid(converted_uid).set_visible(False)
                 fill = paint_pixels.stand_in(layer, effect, frozen)
                 stand_ins.append((fill, layer, frozen, effect))
-        _carried_fills(made, index, following, bound)
+        if reads == "painted":
+            _carried_fills(made, index, following, bound)
     for uid in sorted({int(one) for one in dict(carried.get("normals") or {})} - turned):
         chosen.notes.append("{0}: a fill laying normals ({1}) lies under an instance in a copy, and keeps the "
                             "directions the old islands gave them".format(carried["source"], uid))
@@ -743,14 +828,22 @@ def _remask(entry, path):
 
 
 def after_surface(chosen):
-    """Lay the folders of the events this surface carries, the mesh maps and channels they bring,
-    and every other event's mask where its faces lie now. Returns one line about it."""
+    """Lay the folders of the events this surface carries, the mesh maps and channels they bring --
+    and the resolution of a Texture Set the surface made -- take away the folders that left with
+    their faces, and give every other event's mask where its faces lie now. Returns one line about
+    it."""
     names = {one.name: one for one in textureset.all_texture_sets()}
     events = known()
     standing = dict(project_facts.read(paint_pixels.CARRIED_PAINT_KEY) or {})
-    built, layers, pixels, added, remasked = 0, 0, 0, [], 0
-    for target, entry in sorted(dict((chosen.carry or {}).get("targets") or {}).items()):
+    built, layers, pixels, added, remasked, left = 0, 0, 0, [], 0, []
+    targets = dict((chosen.carry or {}).get("targets") or {})
+    for target, entry in sorted(targets.items()):
         texture_set = names[target]
+        if entry.get("resolution"):
+            width, height = entry["resolution"]
+            held = texture_set.get_resolution()
+            if (held.width, held.height) != (width, height):
+                texture_set.set_resolution(textureset.Resolution(width, height))
         added += ["{0} in {1}".format(one, target) for one in _channels(
             texture_set, entry.get("channels") or [], list(events.get(target, {}).values()))]
         if chosen.mesh_maps.get(target):
@@ -763,16 +856,24 @@ def after_surface(chosen):
             built += 1
             layers += count
             pixels += stood
+    for target, entry in sorted(targets.items()):
+        for event, carried in sorted(entry["events"].items()):
+            if carried["holder"]:
+                layerstack.delete_node(layerstack.get_node_by_uid(int(events[carried["holder"]].pop(event)["group"])))
+                left.append("{0} -> {1}".format(carried["holder"], target))
     for target, entry in sorted(chosen.guests.items()):
         for event, guest in sorted(entry["events"].items()):
             if event in events.get(target, {}) and _remask(events[target][event], guest["mask"]):
                 remasked += 1
-    project_facts.write(GUESTS_KEY, events)
-    project_facts.write(paint_pixels.CARRIED_PAINT_KEY, standing)
+    project_facts.write(GUESTS_KEY, {target: listed for target, listed in events.items() if listed})
+    project_facts.write(paint_pixels.CARRIED_PAINT_KEY, {uid: record for uid, record in standing.items()
+                                                          if paint_pixels.exists(uid)})
     if not built and not remasked:
         return ""
     line = "{0} folder(s) carry {1} layer(s) of paint from other Texture Sets, {2} piece(s) of it as pixels".format(
         built, layers, pixels)
+    if left:
+        line += "; folders gone with their faces: {0}".format(", ".join(sorted(set(left))))
     if added:
         line += "; channels added: {0}".format(", ".join(added))
     if remasked:

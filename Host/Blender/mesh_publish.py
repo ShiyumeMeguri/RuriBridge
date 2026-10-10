@@ -29,12 +29,12 @@ one, the coordinates every face's paint is laid out in (``face_ledger``).
 Materials are names and nothing else, because a material description is exactly
 what an importer turns into an unasked-for layer on every new Texture Set.
 
-**Which Texture Set a material paints into** is the one fact this side keeps
-about the other. It is a name, written on the material the first time it crosses
-and held still afterwards, so renaming the material here renames a label and not
-the paint. Several materials may name the same Texture Set -- one material split
-in two across one UV layout is still one surface to paint -- and a material may
-name none, which keeps its faces out of the texturing tool entirely.
+**Which Texture Set a material paints into** is the material itself: the Texture Set
+is called what the material is called, one each, so the texturing project holds the
+materials this document actually has. A material can be kept out, which keeps its
+faces -- and its name -- out of the texturing tool entirely. Where a face's paint
+lives is kept per face (``face_ledger``): a material renamed here finds its paint by
+its faces, and the Texture Set takes the new name with every layer.
 """
 
 from __future__ import annotations
@@ -55,10 +55,9 @@ from . import face_ledger, fbx_surface, layouts
 
 LOG = logger("blender.mesh")
 
-#: The Texture Set a material paints into. Absent until the material first
-#: crosses; an empty string when it is deliberately kept out of the texturing
-#: tool. A key written into .blend files, so it never changes spelling.
-IDENTITY_PROPERTY = "ruri_bridge_identity"
+#: True on a material deliberately kept out of the texturing tool. A key written
+#: into .blend files, so it never changes spelling.
+KEPT_OUT_PROPERTY = "ruri_bridge_kept_out"
 #: The custom property a generated material uses to say what its shading row
 #: is. Written by whatever generated the material; the bridge only reads it.
 SHADING_DECLARATION = "ruri_shading"
@@ -74,37 +73,28 @@ PAINTER_AXES = numpy.array(((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)))
 
 # -- which Texture Set ---------------------------------------------------------
 
-def texture_set_of(material):
-    """The Texture Set this material paints into; empty when it paints none.
+def is_kept_out(material):
+    return bool(material.get(KEPT_OUT_PROPERTY, False))
 
-    A material that has never crossed answers with its own name, which is also
-    what it is settled to the first time it does.
-    """
-    if IDENTITY_PROPERTY in material.keys():
-        return str(material[IDENTITY_PROPERTY])
-    return material.name
+
+def texture_set_of(material):
+    """The Texture Set this material paints into -- its own name -- or empty when it is kept out."""
+    return "" if is_kept_out(material) else material.name
 
 
 def painted_by(texture_set):
-    """Every material of this document that paints into the Texture Set."""
+    """The material of this document that paints into the Texture Set, in a list: none when it
+    is kept out, is a library's, or there is no such material."""
     return [material for material in bpy.data.materials
             if material.library is None and texture_set_of(material) == texture_set]
 
 
-def is_excluded(material):
-    return IDENTITY_PROPERTY in material.keys() and not str(material[IDENTITY_PROPERTY])
-
-
-def settle(material):
-    """Hold the name still from here on, so a rename is a rename of the label."""
-    if IDENTITY_PROPERTY not in material.keys():
-        material[IDENTITY_PROPERTY] = material.name
-    return str(material[IDENTITY_PROPERTY])
-
-
-def paint_into(material, texture_set):
-    """Make this material paint into that Texture Set, or into none when empty."""
-    material[IDENTITY_PROPERTY] = texture_set
+def keep_out(material, kept):
+    """Keep this material's faces out of the texturing tool, or let them back in."""
+    if kept:
+        material[KEPT_OUT_PROPERTY] = True
+    elif KEPT_OUT_PROPERTY in material.keys():
+        del material[KEPT_OUT_PROPERTY]
 
 
 # -- which objects, which materials ---------------------------------------------
@@ -456,8 +446,6 @@ def publish(publisher, objects, frame_of_project, files, relaid=None, guests=Non
     bare = bare_objects(objects)
     if bare:
         LOG.info("faces that wear no material stay out of Painter: %s", ", ".join(bare))
-    for material in worn_materials(objects).values():
-        settle(material)
     parts, tables, uv_set_count = gather(objects, frame_of_project)
     if not parts:
         raise RuntimeError("nothing to send: no visible object has a face that paints "
@@ -667,22 +655,10 @@ _OBJECT_AXIS_SWAP = mathutils.Matrix(((1.0, 0.0, 0.0, 0.0),
 
 
 def speakers(objects):
-    """The material that speaks for each Texture Set, and one object wearing it.
-
-    The material named like the Texture Set speaks for it; a Texture Set painted by
-    materials none of which carries that name is spoken for by the first of them
-    in name order. Several materials painting into one Texture Set share one
-    shader instance over there, so only one row can be its row, and the rule has
-    to be one a person can predict -- the same rule both ways.
-    """
-    found = {}
-    for name, (material, wearing) in wearers(objects).items():
-        texture_set = texture_set_of(material)
-        if not texture_set:
-            continue
-        if texture_set not in found or name == texture_set:
-            found[texture_set] = (material, wearing[0])
-    return dict(sorted(found.items()))
+    """The material that speaks for each Texture Set -- the one painting it, named like it -- and
+    one object wearing it."""
+    return {texture_set_of(material): (material, wearing[0])
+            for material, wearing in wearers(objects).values() if texture_set_of(material)}
 
 
 def shading_rows(objects):

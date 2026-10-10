@@ -1,17 +1,25 @@
 # -*- coding: utf-8 -*-
 """Carrying the paint of faces that moved into another Texture Set, in the step that sends them.
 
-Update Mesh finds, in the record ``face_ledger`` keeps, the faces whose paint lives in another
-Texture Set than the one they paint into now and that no event carried yet. Painter is asked first
-(``begin``): how the sources' stacks are made, the sources' and targets' mesh maps, and pictures of
-the paint a copy cannot cast again. Its answer completes the surface (``complete``):
+Update Mesh reads, in the record ``face_ledger`` keeps, what the surface changes: Texture Sets
+that take a new name, faces whose paint lives in another Texture Set's own stack than the one they
+paint into now, and faces an event carried into one Texture Set that now paint into another.
+Painter is asked first (``begin``): it renames, then says how the stacks are made and hands over the
+mesh maps and pictures of the paint a copy cannot cast again. Its answer completes the surface
+(``complete``):
 
 * each pair of source and target becomes an event: a folder over there showing the source's stack
   on its faces (``guest_state``); which root layers come live, which are copied and which those
   faces never show is decided here, from where each covers them in the source;
+* an event whose faces now paint into another Texture Set than the one holding its folder keeps its
+  number and goes with them -- one material leaving a Texture Set it shared with another takes its
+  faces' paint into its own: the target gets a folder of its own laying what the folder holds, as it
+  lies, and the holder's root layers over it, and the holder's folder goes. The faces lie where they
+  lay, so everything goes on reading what it read;
 * the target's mesh maps take the moving faces' maps laid out where they lie now -- tangent normals
   carried from the frames the source's layout gave them into the ones the target's gives -- and
-  none of the target's own texels changes;
+  none of the target's own texels changes; a Texture Set the surface makes for faces leaving
+  another where they lie takes that one's maps whole, so what reads around them reads the same;
 * the paint the copies stand in for is laid out where it was made, read through the coordinates it
   was made in; where it lays normals that bend as the islands turn, it is laid out where the faces
   lie now, the normals carried into the new frames;
@@ -22,7 +30,7 @@ the paint a copy cannot cast again. Its answer completes the surface (``complete
   turn -- computed, a tile's, or laid by a layer that stays live or is the target's own -- keep the
   directions the old islands gave them, and the line says by how much;
 * the target's table gains the UV set where every face holds the coordinates its paint is laid out
-  in, and its materials record the events;
+  in; Painter records the events, with the folders;
 
 and the surface goes with all of it (``surface_crossing.send``). A source left with no face goes
 with that surface, its paint living on where its faces went.
@@ -50,23 +58,31 @@ _COVERS = 0.5 / 255.0
 
 
 class Asked:
-    """A carry Blender asked Painter about: the faces moving, ``{(source, target): count}``, the
-    sources left with no face, and the Texture Sets the surface deletes in Painter."""
+    """A carry Blender asked Painter about: the Texture Sets renamed first, ``{old: new}``, the faces
+    moving, ``{(source, target): count}``, the events moving with their faces, ``{event: (holder,
+    target)}``, the sources and holders left with no face, and the Texture Sets the surface deletes
+    in Painter."""
 
-    __slots__ = ("moves", "emptied", "dropped")
+    __slots__ = ("renames", "moves", "rehomes", "emptied", "dropped")
 
-    def __init__(self, moves, emptied, dropped):
+    def __init__(self, renames, moves, rehomes, emptied, dropped):
+        self.renames = renames
         self.moves = moves
+        self.rehomes = rehomes
         self.emptied = emptied
         self.dropped = dropped
 
 
-def survey(objects, painter, dropped=()):
-    """What the record says of the faces in scope, against the project Painter has open but for the
-    Texture Sets the surface deletes there (``dropped``): faces whose paint lives in one start over."""
+def survey(objects, painter, dropped=(), renames=None):
+    """What the record says of the faces in scope (``face_ledger.survey``), against what Painter
+    states it holds but for the Texture Sets the surface deletes there (``dropped``): faces whose
+    paint lives in one start over. ``renames`` are renames asked for besides the ones the faces make.
+    A project not open yet holds nothing: every face starts over in it."""
     names = [name for name in surface_crossing.project_names(painter) if name not in set(dropped)]
-    return face_ledger.survey(objects, surface_crossing.slot_texture_sets, surface_crossing.events_of,
-                              names, surface_crossing.render_coordinates)
+    if not painter.get("document"):
+        return face_ledger.Survey()
+    return face_ledger.survey(objects, surface_crossing.slot_texture_sets, surface_crossing.held_events(painter),
+                              names, surface_crossing.render_coordinates, renames)
 
 
 def waiting():
@@ -74,26 +90,47 @@ def waiting():
     return bool(_asked)
 
 
+def describe(found):
+    """What a surveyed surface changes in Painter, one line each, for a person to read first."""
+    lines = ["{0} takes the name {1}, every layer kept".format(old, new) for old, new in sorted(found.renames.items())]
+    lines += ["{0} face(s) take their paint from {1} into {2}".format(count, source, target)
+              for (source, target), count in sorted(found.moves.items())]
+    leaving = {}
+    for holder, target in found.rehomes.values():
+        leaving[(holder, target)] = leaving.get((holder, target), 0) + 1
+    lines += ["{0} carried folder(s) of {1} go into {2} with their faces".format(count, holder, target)
+              for (holder, target), count in sorted(leaving.items())]
+    return lines
+
+
 def begin(session, found, dropped=()):
-    """Ask Painter how the paint of the moving faces is made; the surface that follows deletes
-    ``dropped`` there. Returns one line about it."""
+    """Ask Painter to rename what the surface renames and how the paint of the moving faces is made;
+    the surface that follows deletes ``dropped`` there. Returns one line about it."""
     targets = {}
     for source, target in sorted(found.moves):
         targets.setdefault(target, []).append(source)
-    emptied = sorted({source for source, _target in found.moves
-                      if not layout_retarget.wearing(mesh_publish.painted_by(source))})
+    leaving = {holder for holder, _target in found.rehomes.values()}
+    emptied = sorted(name for name in {source for source, _target in found.moves} | leaving
+                     if not layout_retarget.wearing(mesh_publish.painted_by(name)))
     generation = session.publisher(topic_module.REQUEST).publish_record(record_module.request(
-        "Blender", record_module.ASK_TO_CARRY, moves=targets, emptied=emptied))
-    _asked[generation.number] = Asked(dict(found.moves), emptied, tuple(sorted(dropped)))
-    return "asked Painter how the paint of {0} face(s) moving into {1} is made".format(
-        sum(found.moves.values()), ", ".join(sorted(targets)))
+        "Blender", record_module.ASK_TO_CARRY, renames=dict(found.renames), moves=targets,
+        rehomes={event: {"holder": holder, "target": target} for event, (holder, target) in found.rehomes.items()},
+        emptied=emptied))
+    _asked[generation.number] = Asked(dict(found.renames), dict(found.moves), dict(found.rehomes), emptied,
+                                      tuple(sorted(dropped)))
+    return "asked Painter to " + "; ".join(describe(found))
 
 
-# -- what each root layer of a source becomes ----------------------------------------------------------
+# -- what each layer comes as ------------------------------------------------------------------------------
 
 def _movers(surface, source, target):
-    """The triangles moving from ``source`` into ``target`` with this surface."""
-    return ((surface.event == 0) & (surface.source == face_ledger.digest(source)) & surface.of(target))
+    """The triangles moving from ``source``'s own stack into ``target`` with this surface."""
+    return (surface.event == 0) & (surface.source == face_ledger.digest(source)) & surface.of(target)
+
+
+def _leaving(surface, event, target):
+    """The triangles of an event moving with its folder into ``target``."""
+    return (surface.event == int(event)) & surface.of(target)
 
 
 def _covers(generation, coverage, painted):
@@ -123,7 +160,7 @@ def _covers(generation, coverage, painted):
     return False
 
 
-def _decide(record, generation, painted, source, target, emptied, problems, bending):
+def _decide(roots, generation, painted, source, target, emptied, problems, bending):
     """How each root layer of ``source`` comes along with the faces laid out at ``painted``, top
     first: ``own`` for a layer of the target itself, which already lies on the faces in the target's
     stack -- a Texture Set showing its own layer twice computes it over and over, so it is never
@@ -131,9 +168,11 @@ def _decide(record, generation, painted, source, target, emptied, problems, bend
     Texture Set that stays and shows no paint only the source shows; ``copy`` for the source's own
     layers holding paint -- or all its own when it goes -- that cover the faces, its own layers laying
     a picture of normals that bends where the faces' islands turn (``bending``), and its own layer of
-    the Blender material; ``skip`` for the rest and every hidden root, which shows on no face."""
+    the Blender material; ``skip`` for the rest and every hidden root, which shows on no face. Every
+    one goes on reading the layout it reads; a fill of it reading the layout is made to read where
+    the faces' paint is laid out once laid in the target."""
     decided = []
-    for root in record["roots"][source]:
+    for root in roots:
         if root["home"] == target:
             carry = "own"
             if not root["visible"]:
@@ -157,7 +196,29 @@ def _decide(record, generation, painted, source, target, emptied, problems, bend
         if carry == "copy" and root["kind"] == "other":
             problems.append("{0} of {1} would have to be copied, and only folders and plain fills can be; put it "
                             "in a folder in Painter".format(root["name"], source))
-        decided.append({"uid": root["uid"], "carry": carry})
+        decided.append({"uid": root["uid"], "carry": carry, "reads": "painted"})
+    return decided
+
+
+def _decide_leaving(rehome, generation, laid, target, emptied, problems):
+    """How each layer an event's folder takes along comes, top first: the holder's root layers over
+    the folder as ``_decide`` takes a source's, each going on reading the layout -- the faces lie
+    where they lay; and everything the folder holds, hidden or not, since the folder goes: an
+    instance whose layer stays instanced again, the rest copied, each reading what it reads."""
+    holder = rehome["holder"]
+    over = [root for root in rehome["roots"] if not root["inside"]]
+    decided = [dict(entry, reads="layout") for entry in _decide(over, generation, laid, holder, target, emptied,
+                                                               problems, {})]
+    lying = {int(uid) for uid in rehome["lying"]}
+    for root in rehome["roots"]:
+        if not root["inside"]:
+            continue
+        stays = int(root["shows"]) not in lying and (root["home"] != holder or holder not in emptied)
+        carry = "instance" if int(root["shows"]) != int(root["uid"]) and stays else "copy"
+        if carry == "copy" and root["kind"] == "other":
+            problems.append("{0} in a folder of {1} would have to be copied, and only folders and plain fills can "
+                            "be; put it in a folder in Painter".format(root["name"], holder))
+        decided.append({"uid": root["uid"], "carry": carry, "reads": "painted"})
     return decided
 
 
@@ -174,16 +235,14 @@ class _Laid:
         self.target = target
 
 
-def _frozen(record, generation, surface, movers, source, decided, green, beside):
+def _frozen(entries, decided, generation, laid, frames, green, beside, name):
     """Pictures of the paint the copies stand in for, ``{uid: {..., "root"}}``, and its names."""
     copied = {int(entry["uid"]) for entry in decided if entry["carry"] == "copy"}
-    entries = [entry for entry in record["frozen"][source] if int(entry["root"]) in copied]
+    entries = [entry for entry in entries if int(entry["root"]) in copied]
     if not entries:
         return {}, []
-    frames = surface.frames(movers, "painted", "render")
-    frozen, named = layout_retarget.frozen_pictures(
-        {"frozen": entries}, generation, _Laid(surface.painted[movers], surface.render[movers]), frames, green,
-        source, beside)
+    frozen, named = layout_retarget.frozen_pictures({"frozen": entries}, generation, laid, frames, green, name,
+                                                    beside)
     roots = {str(entry["uid"]): int(entry["root"]) for entry in entries}
     return {uid: dict(entry, root=roots[uid]) for uid, entry in frozen.items()}, named
 
@@ -195,23 +254,41 @@ def _lanes(values):
     return values[..., :1] if grey and opaque else values[..., :3] if opaque else values
 
 
-def _composite(record, generation, surface, target, sources, green, problems):
+def _whole(record, generation, name):
+    """A Texture Set's mesh maps as they are, as PNG files by usage."""
+    made = {}
+    for usage, entry in sorted(record["texture_sets"][name]["mesh_maps"].items()):
+        values, _wide = pixels.read(str(generation.path(entry["file"])))
+        lanes = _lanes(values.astype(numpy.float64))
+        if lanes.min() < 0.0 or lanes.max() > 1.0:
+            raise RuntimeError("the {0} mesh map of {1} holds values outside 0..1, which a PNG cannot keep".format(
+                usage, name))
+        made[usage] = ("{0}_{1}_whole.png".format(name, usage), pixels.png(lanes, True))
+    return made
+
+
+def _composite(record, generation, surface, target, units, green, problems):
     """The target's mesh maps with the faces moving in laid into them, as PNG files by usage: its own
-    texels as they are, the moving faces' taken from their source's map at the same point of the
-    surface -- tangent normals carried into the target's frames, labels from the nearest texel --
-    and past every island the nearest island's value. Usages the target lacks stay out."""
+    texels as they are, the moving faces' taken from the map of the Texture Set they come from at the
+    same point of the surface -- tangent normals carried into the target's frames, labels from the
+    nearest texel -- and past every island the nearest island's value. ``units`` are ``[(Texture Set,
+    triangles, where its maps hold them: "painted" or "render")]``. Usages the target lacks stay out.
+
+    A Texture Set this surface makes for faces that all leave one Texture Set where they lie in it
+    takes that one's maps whole: the faces lie on the same texels, and what reads around them --
+    a blur, a sharpen, a warp in UV space -- reads what it read there."""
     described = record["texture_sets"]
+    if target not in described and {(name, before) for name, _chosen, before in units} == {(units[0][0], "render")}:
+        return _whole(record, generation, units[0][0])
     own = surface.of(target).copy()
-    movers = {}
-    for source in sources:
-        movers[source] = _movers(surface, source, target)
-        own &= ~movers[source]
+    for _name, chosen, _before in units:
+        own &= ~chosen
     if target in described:
         usages = dict(described[target]["mesh_maps"])
     else:
         usages = {}
-        for source in sources:
-            for usage, entry in described[source]["mesh_maps"].items():
+        for name, _chosen, _before in units:
+            for usage, entry in described[name]["mesh_maps"].items():
                 usages.setdefault(usage, entry)
     made = {}
     mine_at = {}
@@ -220,7 +297,8 @@ def _composite(record, generation, surface, target, sources, green, problems):
         if target in described:
             base, _wide = pixels.read(str(generation.path(entry["file"])))
         else:
-            width, height = max((tuple(described[source]["resolution"]) for source in sources), key=lambda size: size[0])
+            width, height = max((tuple(described[name]["resolution"]) for name, _chosen, _before in units),
+                                key=lambda size: size[0])
             base = numpy.zeros((height, width, 4), dtype=numpy.float32)
             base[..., 3] = 1.0
         rows, columns = base.shape[:2]
@@ -233,24 +311,23 @@ def _composite(record, generation, surface, target, sources, green, problems):
         covered = mine.copy()
         clashes = 0
         taken = []
-        for source in sources:
-            maps = described[source]["mesh_maps"]
+        for name, chosen, before in units:
+            maps = described[name]["mesh_maps"]
             if usage not in maps:
                 problems.append("{0} has no {1} mesh map, so the faces it brings into {2} take none".format(
-                    source, usage, target))
+                    name, usage, target))
                 continue
-            chosen = movers[source]
             picture, _wide = pixels.read(str(generation.path(maps[usage]["file"])))
             kind = entry["kind"]
             texels, values = chart_resample.laid_at(
-                picture, surface.painted[chosen], surface.render[chosen], kind,
-                frames=surface.frames(chosen, "painted", "render") if kind == "tangent" else None,
+                picture, getattr(surface, before)[chosen], surface.render[chosen], kind,
+                frames=surface.frames(chosen, before, "render") if kind == "tangent" else None,
                 green=green() if kind == "tangent" else 1.0, size=(columns, rows))
             free = ~mine[texels]
             clashes += int((~free).sum())
             out[texels[free]] = values[free]
             covered[texels] = True
-            taken.append(source)
+            taken.append(name)
         if clashes:
             problems.append("{0}: {1} texel(s) of its {2} map lie under both its own faces and faces moving in; "
                             "its own keep them".format(target, clashes, usage))
@@ -266,13 +343,14 @@ def _composite(record, generation, surface, target, sources, green, problems):
     return made
 
 
-def _channels(record, target, sources):
-    """The channels the sources have and the target lacks, with their format and label."""
+def _channels(record, target, names):
+    """The channels the Texture Sets the faces come from have and the target lacks, with their format
+    and label."""
     described = record["texture_sets"]
     held = {entry["channel"] for entry in (described.get(target) or {}).get("channels") or []}
     wanted = []
-    for source in sources:
-        for entry in described[source]["channels"]:
+    for name in names:
+        for entry in described[name]["channels"]:
             if entry["channel"] not in held:
                 held.add(entry["channel"])
                 wanted.append(entry)
@@ -365,19 +443,33 @@ def _turned(generation, decided, bending, frames, layout, green, written, beside
 
 # -- completing the carry -----------------------------------------------------------------------------------
 
+def _read_charts(tables, holder, decided, problems):
+    """What stands in the way of the holder's root layers over a folder going on reading the layout in
+    the target: a fill of the holder reading a chart other than its layout and its guests' UV set."""
+    table = layout_module.charts(tables.get(holder))
+    extra = sorted(index for index, chart in table["extra"].items() if chart != layout_module.PAINTED_CHART)
+    if extra and any(entry["reads"] == "layout" and entry["carry"] != "skip" for entry in decided):
+        problems.append("{0} reads layouts it had before a retarget through UV set(s) {1}, and the layers over its "
+                        "carried folders go along only where it lies in its layout now; retarget {0} back "
+                        "first".format(holder, ", ".join(extra)))
+
+
 def complete(context, session, generation, frame_of_project, painter):
     """Carry the moving faces' paint with Painter's answer and send the surface. Returns one line."""
     record = generation.record
     asked = _asked.pop(int(record["request"]), None)
     if asked is None:
         return "Painter answered about carrying paint nothing here is waiting for"
+    renamed = dict(record.get("renamed") or {})
+    face_ledger.rename(renamed)
     if record.get("refused"):
         raise RuntimeError("Painter cannot carry the paint of the moving faces: {0}".format(record["refused"]))
+    view = surface_crossing.renamed_view(painter, renamed)
     objects = mesh_publish.scope(context.view_layer)
-    found = survey(objects, painter, asked.dropped)
+    found = survey(objects, view, asked.dropped)
     if found.problems:
         raise RuntimeError("; ".join(found.problems))
-    if found.moves != asked.moves:
+    if found.renames or found.moves != asked.moves or found.rehomes != asked.rehomes:
         raise RuntimeError("faces moved between Texture Sets while Painter answered; Update Mesh again")
     tables = record["tables"]
     sources = sorted({source for source, _target in asked.moves})
@@ -396,57 +488,85 @@ def complete(context, session, generation, frame_of_project, painter):
     events, targets, notes, named = {}, {}, [], []
     beside = surface_crossing.Beside()
     counts = {"own": 0, "instance": 0, "copy": 0, "skip": 0}
-    for target in sorted({target for _source, target in asked.moves}):
+    taken = set(surface_crossing.held_events(view))
+    for target in sorted({target for _source, target in asked.moves} | {target for _holder, target
+                                                                         in asked.rehomes.values()}):
         into = sorted(source for source, carried_into in asked.moves if carried_into == target)
-        taken = set(surface_crossing.events_of(target))
-        entry = {"channels": _channels(record, target, into), "events": {}}
+        leaving = sorted(event for event, (_holder, carried_into) in asked.rehomes.items() if carried_into == target)
+        entry = {"events": {}}
+        units = []
         for source in into:
             event = face_ledger.new_event(taken | {str(one) for one in events.values()})
             events[(source, target)] = event
             movers = _movers(surface, source, target)
+            units.append((source, movers, "painted"))
             bending, frames = _bending(record, generation, surface, movers, source)
-            decided = _decide(record, generation, surface.painted[movers], source, target, asked.emptied, problems,
-                              bending)
-            frozen, made = _frozen(record, generation, surface, movers, source, decided, green, beside)
+            decided = _decide(record["roots"][source], generation, surface.painted[movers], source, target,
+                              asked.emptied, problems, bending)
+            frozen, made = _frozen(record["frozen"][source], decided, generation,
+                                   _Laid(surface.painted[movers], surface.render[movers]), frames, green, beside, source)
             normals = _turned(generation, decided, bending, frames, surface.painted[movers], green, written, beside,
                               source, notes)
             named += made
-            for one in decided:
-                counts[one["carry"]] += 1
-            entry["events"][str(event)] = {"source": source, "roots": decided, "frozen": frozen,
+            entry["events"][str(event)] = {"source": source, "holder": "", "roots": decided, "frozen": frozen,
                                            "normals": normals}
-        entry["mesh_maps"] = _composite(record, generation, surface, target, into, green, notes)
+        for event in leaving:
+            rehome = record["rehomes"][event]
+            holder = rehome["holder"]
+            movers = _leaving(surface, event, target)
+            units.append((holder, movers, "render"))
+            decided = _decide_leaving(rehome, generation, surface.render[movers], target, asked.emptied, problems)
+            _read_charts(tables, holder, decided, problems)
+            frames = surface.frames(movers, "render", "render")
+            frozen, made = _frozen(rehome["frozen"], decided, generation,
+                                   _Laid(surface.render[movers], surface.render[movers]), frames, green, beside, holder)
+            named += made
+            entry["events"][event] = {"source": surface_crossing.held_events(view)[event][1], "holder": holder,
+                                      "roots": decided, "frozen": {uid: dict(one, moved=True)
+                                                                   for uid, one in frozen.items()},
+                                      "normals": {}}
+        for one in entry["events"].values():
+            for decision in one["roots"]:
+                counts[decision["carry"]] += 1
+        entry["channels"] = _channels(record, target, [name for name, _chosen, _before in units])
+        entry["mesh_maps"] = _composite(record, generation, surface, target, units, green, notes)
+        entry["resolution"] = (None if target in record["texture_sets"] else
+                               list(max((tuple(record["texture_sets"][name]["resolution"]) for name, _chosen, _before
+                                         in units), key=lambda size: size[0])))
         targets[target] = entry
     if problems:
         raise RuntimeError("; ".join(problems))
     resolutions = {}
-    for target in targets:
+    for target, entry in targets.items():
         materials = mesh_publish.painted_by(target)
         into = {source for source, carried_into in asked.moves if carried_into == target}
+        reading = {}
+        for event in entry["events"]:
+            if event in record["rehomes"]:
+                holder = record["rehomes"][event]["holder"]
+                index = layout_module.painted_index(layout_module.charts(tables.get(holder)))
+                reading.update({int(uid): index for uid in record["rehomes"][event]["inside"]})
         readers = [(reader["uid"], int(reader["index"]), set(reader["members"])) for reader in record["readers"]
-                   if set(reader["members"]) & into and target not in reader["following"]]
+                   if (set(reader["members"]) & into and target not in reader["following"])
+                   or reading.get(int(reader["uid"]), -1) == int(reader["index"])]
         layouts.write(materials, layout_module.with_guests(
             layouts.table_of_texture_set(target, materials), face_ledger.PAINTED_UV_ATTRIBUTE, readers, tables,
             target))
-        recorded = surface_crossing.events_of(target)
-        recorded.update({str(event): source for (source, carried_into), event in events.items()
-                         if carried_into == target})
-        face_ledger.write_events(materials, recorded)
-        if target not in record["texture_sets"]:
-            resolutions[target] = max((tuple(record["texture_sets"][source]["resolution"]) for source in into),
-                                      key=lambda size: size[0])
+        if entry["resolution"] is not None:
+            resolutions[target] = tuple(entry["resolution"])
     carry = {"request": int(record["request"]), "emptied": list(asked.emptied), "targets": targets}
-    sent = surface_crossing.send(session, context, frame_of_project, painter, beside, carry=carry, events=events,
-                                 resolutions=resolutions, dropped=asked.dropped)
+    sent = surface_crossing.send(session, context, frame_of_project, view, beside, carry=carry, events=events,
+                                 resolutions=resolutions, dropped=asked.dropped, rehomes=asked.rehomes)
     notes = list(dict.fromkeys(notes))
     for note in notes:
         LOG.warning("%s", note)
-    line = ("carried the paint of {0} face(s) into {1}: {2} layer(s) live, {3} of the target's own laid over "
-            "them, {4} copied, {5} left out, {6} piece(s) of paint as pixels; surface generation {7} sent".format(
-                sum(asked.moves.values()), ", ".join(sorted(targets)), counts["instance"], counts["own"],
-                counts["copy"], counts["skip"], len(named), sent.number))
+    parts = ["{0} renamed {1}".format(old, new) for old, new in sorted(renamed.items())]
+    if targets:
+        parts.append("carried paint into {0}: {1} layer(s) live, {2} of the target's own laid over them, {3} copied, "
+                     "{4} left out, {5} piece(s) of paint as pixels".format(
+                         ", ".join(sorted(targets)), counts["instance"], counts["own"], counts["copy"], counts["skip"],
+                         len(named)))
+    parts.append("surface generation {0} sent".format(sent.number))
     if asked.emptied:
-        line += "; {0} keep no face and go".format(", ".join(asked.emptied))
-    if notes:
-        line += "; " + "; ".join(notes)
-    return line
+        parts.append("{0} keep no face and go".format(", ".join(asked.emptied)))
+    return "; ".join(parts + notes)

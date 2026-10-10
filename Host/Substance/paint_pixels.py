@@ -143,14 +143,15 @@ def root_of(node):
     return node
 
 
-def carried(texture_set, held, roots, problems):
+def carried(texture_set, held, roots, problems, laid_alike=False):
     """Every piece of the Texture Set's paint under these root layers (uids) that a copy of them in
     another Texture Set cannot cast again where it lay -- laid out in UV space, or picked by polygon
-    as the Texture Set's own triangles -- and no fill stands in for yet, ``[Frozen]``, read from the
-    project's document ``held``; what stands in the way of making one pixels goes into
-    ``problems``."""
+    as the Texture Set's own triangles; only the latter when the faces lie there where they lie here
+    (``laid_alike``) -- and no fill stands in for yet, ``[Frozen]``, read from the project's document
+    ``held``; what stands in the way of making one pixels goes into ``problems``."""
     bound = [entry for entry in project_document.bound(held, texture_set.name, triangles=True)
-             if root_of(layerstack.get_node_by_uid(entry.layer)).uid() in roots]
+             if root_of(layerstack.get_node_by_uid(entry.layer)).uid() in roots
+             and (entry.polygons or not laid_alike)]
     return _standing_free(texture_set, bound, problems, False)
 
 

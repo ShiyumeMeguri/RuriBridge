@@ -13,8 +13,12 @@ The same verbs as Painter's end, from this side, and one table:
   textures folder and put into the materials that paint into it.
 * **Pull Selected Layer** asks Painter for the one layer selected over there, on
   its own, as images in the same folder.
-* **The table** says which material paints into which Texture Set, and is the one
-  thing edited by hand -- from here or from Painter.
+* **The table** is Painter's Texture Sets and the materials painting them: one each,
+  called alike, so Painter holds the materials this document actually has. A material
+  renamed here renames its Texture Set with the next Update Mesh, every layer kept; one
+  that shared another's takes its faces' paint into its own. A Texture Set nothing paints
+  is bound to a material by hand -- from here or from Painter -- and takes its name. A
+  material kept out is nowhere Painter looks: not sent, not listed, not offered.
 * **Retarget Layout** moves the active material's Texture Set from the layout its
   Source UV holds to the one its Target UV holds (``layout_retarget``): the two maps
   swap on its faces, and Painter keeps every layer, reading what was laid out in the old
@@ -228,8 +232,10 @@ def material_rows(objects):
 
 
 def presence_record():
+    """What this side states to the others: the materials that paint into a Texture Set -- one kept
+    out is nothing Painter is told of."""
     return record_module.presence(
-        HOST.name, bpy.data.filepath, materials=_view["materials"],
+        HOST.name, bpy.data.filepath, materials=[row for row in _view["materials"] if row["texture_set"]],
         textures_directory=textures_directory())
 
 
@@ -257,22 +263,25 @@ def painter_state():
     return CONNECTION.peers.get(PAINTER.name) or {}
 
 
-def texture_sets_new_to_painter():
-    """Texture Sets the next mesh would add to a project Painter already paints in.
-
-    A new Texture Set starts with nothing on it. When it is a material just made,
-    that is what anybody expects; when it is a material that used to paint into
-    another set, its faces leave their paint behind there -- every layer is kept,
-    and none of it shows on them any more. The two look the same from here, so the
-    person sending decides.
-    """
+def pending(context):
+    """What the next Update Mesh changes in a project Painter already paints in, one line each, for
+    the person sending to read first: Texture Sets taking a material's new name, paint going along
+    with faces, and Texture Sets new to it with nothing painted on them -- a material just made, or
+    one whose faces' paint is nowhere Painter has."""
     painter = painter_state()
     existing = painter.get("texture_sets") or []
     if not painter.get("document") or not any(entry["layers"] for entry in existing):
         return []
+    found = guest_carry.survey(mesh_publish.scope(context.view_layer), painter)
     known = {entry["name"] for entry in existing}
-    return sorted({row["texture_set"] for row in _view["materials"]
-                   if row["texture_set"] and row["texture_set"] not in known})
+    receiving = (set(found.renames.values()) | {target for _source, target in found.moves}
+                 | {target for _holder, target in found.rehomes.values()})
+    fresh = sorted({row["texture_set"] for row in _view["materials"]
+                    if row["texture_set"] and row["texture_set"] not in known | receiving})
+    lines = guest_carry.describe(found)
+    if fresh:
+        lines.append("{0} new Texture Set(s) with nothing painted on them: {1}".format(len(fresh), ", ".join(fresh)))
+    return lines
 
 
 def painter_is_attached():
@@ -306,11 +315,12 @@ def project_frame(context):
         record_module.CENTIMETRES_PER_METRE * context.scene.unit_settings.scale_length)
 
 
-def send_mesh(context, dropped=()):
-    """Send the model. Painter keeps every layer it has: it only swaps the surface -- and faces
-    that moved into another Texture Set take their paint along: Painter is asked first, and the
-    surface goes with its answer (``guest_carry``). The Texture Sets ``dropped`` go in Painter with
-    this surface (``drop_in_painter``). Returns one line about it."""
+def send_mesh(context, dropped=(), renames=None):
+    """Send the model. Painter keeps every layer it has: it only swaps the surface -- a Texture Set
+    whose material was renamed here takes the new name, and faces that moved into another Texture Set
+    take their paint along: Painter is asked first, and the surface goes with its answer
+    (``guest_carry``). ``renames`` are renames asked for by hand (``bind``); the Texture Sets
+    ``dropped`` go in Painter with this surface (``drop_in_painter``). Returns one line about it."""
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
     objects = mesh_publish.scope(context.view_layer)
@@ -319,12 +329,12 @@ def send_mesh(context, dropped=()):
     if guest_carry.waiting():
         raise RuntimeError("the paint of faces moving between Texture Sets waits for Painter's answer")
     painter = painter_state()
-    found = guest_carry.survey(objects, painter, dropped)
+    found = guest_carry.survey(objects, painter, dropped, renames)
     if found.problems:
         raise RuntimeError("; ".join(found.problems))
-    if found.moves:
+    if found.carries:
         if not painter_is_attached():
-            raise RuntimeError("faces moved into other Texture Sets, and their paint goes along only while Painter "
+            raise RuntimeError("Texture Sets take new names and faces take their paint along only while Painter "
                                "is attached")
         line = guest_carry.begin(CONNECTION.session, found, dropped)
     else:
@@ -462,40 +472,27 @@ def drop_in_painter(context, texture_sets):
 
 
 def bind(texture_set, material_name):
-    """Make a material paint into a Texture Set Painter has.
-
-    Two cases, decided by whether some material here already paints into it. If
-    one does, the Texture Set already has its proper name and this material joins
-    it -- one material split in two across one UV layout. If none does, the name
-    is Painter's alone and is not the convention here, so Painter is asked to
-    rename the Texture Set after the material: a rename is the one edit there
-    that keeps every layer. A material painting into another Texture Set Painter has,
-    or whose name another one there already bears, is refused: the faces it paints
-    would leave that Texture Set, or the rename could not happen. A Texture Set that
-    only repeats another goes with ``drop_in_painter``.
-    """
+    """Make a material paint a Texture Set Painter has that nothing here paints: the Texture Set takes
+    the material's name -- a rename is the one edit there that keeps every layer -- with an Update
+    Mesh, so it lands where the surface does. Refused for a material kept out, for one Painter already
+    has a Texture Set of, whose faces would leave it, and for a Texture Set a material of its own name
+    paints. A Texture Set that only repeats another goes with ``drop_in_painter``."""
     material = bpy.data.materials.get(material_name)
     if material is None:
         raise RuntimeError("there is no material called {0!r} here".format(material_name))
-    owners = texture_ingest.materials_painting(texture_set)
-    if owners:
-        mesh_publish.paint_into(material, texture_set)
-        refresh_view(force=True)
-        return "{0} now paints into {1}, with {2}".format(
-            material.name, texture_set, ", ".join(one.name for one in owners))
+    if mesh_publish.is_kept_out(material):
+        raise RuntimeError("{0} is kept out of Painter; let it back in first".format(material.name))
+    if texture_set == material.name:
+        return "{0} already paints into {1}".format(material.name, texture_set)
     held = painter_texture_sets()
-    current = mesh_publish.texture_set_of(material)
-    if current and current != texture_set and current in held:
-        raise RuntimeError("{0} paints into {1}, which Painter has; it cannot paint into {2} instead. If {2} "
-                           "only repeats {1}, delete {2} in Painter".format(material.name, current, texture_set))
-    if material.name != texture_set and material.name in held:
-        raise RuntimeError("Painter already has a Texture Set called {0}, so {1} cannot take that name".format(
-            material.name, texture_set))
-    mesh_publish.paint_into(material, material.name)
-    face_ledger.rename(texture_set, material.name)
-    _ask(record_module.ASK_TO_RENAME, renames={texture_set: material.name})
-    refresh_view(force=True)
-    return "asked Painter to call {0} {1}".format(texture_set, material.name)
+    if texture_set not in held:
+        raise RuntimeError("Painter has no Texture Set {0}".format(texture_set))
+    if material.name in held:
+        raise RuntimeError("Painter already has a Texture Set called {0}, which {0} paints into; delete the one "
+                           "of the two that only repeats the other in Painter".format(material.name))
+    if mesh_publish.painted_by(texture_set):
+        raise RuntimeError("{0} is painted by the material of its name".format(texture_set))
+    return send_mesh(bpy.context, renames={texture_set: material.name})
 
 
 def exclude(material_name, excluded):
@@ -503,7 +500,7 @@ def exclude(material_name, excluded):
     material = bpy.data.materials.get(material_name)
     if material is None:
         raise RuntimeError("there is no material called {0!r} here".format(material_name))
-    mesh_publish.paint_into(material, "" if excluded else material.name)
+    mesh_publish.keep_out(material, excluded)
     refresh_view(force=True)
 
 
@@ -523,23 +520,10 @@ def retarget_layout(context):
         raise RuntimeError("{0} is kept out of Painter".format(material.name))
     settings = context.scene.ruri_bridge_retarget
     found = guest_carry.survey(mesh_publish.scope(context.view_layer), painter_state())
-    if found.moves:
-        raise RuntimeError("faces moved into other Texture Sets; Update Mesh carries their paint first")
+    if found.carries:
+        raise RuntimeError("Texture Sets take new names or faces take their paint along with the next Update "
+                           "Mesh; send it first")
     return layout_retarget.begin(CONNECTION.session, texture_set, settings.source, settings.target)
-
-
-def follow_rename(material_name):
-    """A material renamed here: rename its Texture Set to match, and keep painting it -- with every
-    material that paints it, and every face whose paint lives in it."""
-    material = bpy.data.materials.get(material_name)
-    if material is None:
-        raise RuntimeError("there is no material called {0!r} here".format(material_name))
-    old = mesh_publish.texture_set_of(material)
-    for one in mesh_publish.painted_by(old):
-        mesh_publish.paint_into(one, material.name)
-    face_ledger.rename(old, material.name)
-    _ask(record_module.ASK_TO_RENAME, renames={old: material.name})
-    refresh_view(force=True)
 
 
 # -- where a material nobody generated takes Painter's maps --------------------------------
@@ -852,21 +836,22 @@ class RuriBridgePreferences(bpy.types.AddonPreferences):
 class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
     bl_idname = "ruri_bridge.send_mesh"
     bl_label = "Update Mesh"
-    bl_description = ("Update only the mesh in Painter: every visible mesh is swapped in "
-                      "under the layers Painter already has, and nothing else changes. A "
-                      "Texture Set with layers that nothing here paints into stops the swap")
+    bl_description = ("Update the mesh in Painter: every visible mesh is swapped in under the layers "
+                      "Painter already has. A Texture Set whose material was renamed takes the new name, "
+                      "and faces painting another Texture Set take their paint along. A Texture Set with "
+                      "layers that nothing here paints into stops the swap")
 
     def invoke(self, context, event):
         refresh_view()
-        fresh = texture_sets_new_to_painter()
-        if not fresh:
+        try:
+            lines = pending(context)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        if not lines:
             return self.execute(context)
         return context.window_manager.invoke_confirm(
-            self, event, title="Update Mesh",
-            message=("Painter gets {0} new Texture Set(s) with nothing painted on them: {1}. "
-                     "Faces that move into one leave their paint behind in the Texture Set "
-                     "they came from".format(len(fresh), ", ".join(fresh))),
-            confirm_text="Update")
+            self, event, title="Update Mesh", message="; ".join(lines), confirm_text="Update")
 
     def execute(self, context):
         try:
@@ -1000,20 +985,20 @@ _MATERIAL_ITEMS = []
 
 
 def _material_items(_self, _context):
-    """Every worn material, for the binding search. Kept alive on purpose: Blender
-    reads enum strings after this returns, and a list it does not hold can be gone
-    by then."""
-    _MATERIAL_ITEMS[:] = [(row["name"], row["name"],
-                           "{0} -- on {1}".format(row["texture_set"] or "not painted",
-                                                 ", ".join(row["objects"][:3])))
-                          for row in _view["materials"]]
+    """The worn materials a Texture Set nothing paints can be bound to: painting into Painter, with no
+    Texture Set of their own there. Kept alive on purpose: Blender reads enum strings after this
+    returns, and a list it does not hold can be gone by then."""
+    held = set(painter_texture_sets())
+    _MATERIAL_ITEMS[:] = [(row["name"], row["name"], "on {0}".format(", ".join(row["objects"][:3])))
+                          for row in _view["materials"] if row["texture_set"] and row["name"] not in held]
     return _MATERIAL_ITEMS
 
 
 class RURIBRIDGE_OT_bind(bpy.types.Operator):
     bl_idname = "ruri_bridge.bind"
     bl_label = "Painted By"
-    bl_description = "Choose the material that paints into this Texture Set"
+    bl_description = ("Choose the material that paints into this Texture Set: it takes the material's "
+                      "name, every layer kept, with an Update Mesh")
     bl_property = "material"
 
     texture_set: bpy.props.StringProperty()
@@ -1116,23 +1101,6 @@ class RURIBRIDGE_OT_retarget_layout(bpy.types.Operator):
     def execute(self, context):
         try:
             say(retarget_layout(context))
-        except Exception as error:
-            self.report({"ERROR"}, str(error))
-            return {"CANCELLED"}
-        return {"FINISHED"}
-
-
-class RURIBRIDGE_OT_follow_rename(bpy.types.Operator):
-    bl_idname = "ruri_bridge.follow_rename"
-    bl_label = "Rename Texture Set To Match"
-    bl_description = ("This material was renamed here; rename its Texture Set in Painter "
-                      "to match. Every layer stays")
-
-    material: bpy.props.StringProperty()
-
-    def execute(self, context):
-        try:
-            follow_rename(self.material)
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
@@ -1413,12 +1381,11 @@ def _draw_table(layout):
             line = box.row(align=True)
             orphan = entry.get("layers", 0) and not painters
             line.label(text=name, icon="ERROR" if orphan else "TEXTURE")
-            label = ", ".join(painters) if painters else (
-                "nothing paints it ({0} layers)".format(entry.get("layers", 0))
-                if orphan else "nothing paints it")
-            operator = line.operator(RURIBRIDGE_OT_bind.bl_idname, text=label,
-                                     icon="DOWNARROW_HLT")
-            operator.texture_set = name
+            if not painters:
+                label = ("nothing paints it ({0} layers)".format(entry.get("layers", 0))
+                         if orphan else "nothing paints it")
+                operator = line.operator(RURIBRIDGE_OT_bind.bl_idname, text=label, icon="DOWNARROW_HLT")
+                operator.texture_set = name
             if orphan:
                 operator = line.operator(RURIBRIDGE_OT_drop_in_painter.bl_idname, text="", icon="TRASH")
                 operator.texture_set = name
@@ -1433,31 +1400,15 @@ def _draw_table(layout):
         operator.texture_set = ""
     known = {entry["name"] for entry in sets}
     fresh = [row for row in rows if row["texture_set"] and row["texture_set"] not in known]
-    renamed = [row for row in rows if row["texture_set"] and row["texture_set"] != row["name"]
-               and len(by_set.get(row["texture_set"], [])) == 1]
-    kept_out = [row for row in rows if not row["texture_set"]]
-    if fresh or renamed or kept_out:
+    if fresh:
         box = layout.box()
-        box.label(text="Materials")
+        box.label(text="New In Painter With The Next Update Mesh")
         for row in fresh:
             line = box.row(align=True)
             line.label(text=row["name"], icon="ADD")
             operator = line.operator(RURIBRIDGE_OT_exclude.bl_idname, text="",
                                      icon="HIDE_OFF")
             operator.material, operator.excluded = row["name"], True
-        for row in renamed:
-            line = box.row(align=True)
-            line.label(text="{0} (Painter: {1})".format(row["name"], row["texture_set"]),
-                       icon="SORTALPHA")
-            operator = line.operator(RURIBRIDGE_OT_follow_rename.bl_idname, text="",
-                                     icon="FILE_REFRESH")
-            operator.material = row["name"]
-        for row in kept_out:
-            line = box.row(align=True)
-            line.label(text=row["name"], icon="HIDE_ON")
-            operator = line.operator(RURIBRIDGE_OT_exclude.bl_idname, text="",
-                                     icon="HIDE_ON")
-            operator.material, operator.excluded = row["name"], False
     if _view["bare"]:
         box = layout.box()
         box.label(text="No material, not sent")
@@ -1611,7 +1562,7 @@ def _wrapped(layout, context, text, icon):
 
 
 class RURIBRIDGE_PT_layout(bpy.types.Panel):
-    bl_label = "UV Layout"
+    bl_label = "Active Material"
     bl_idname = "RURIBRIDGE_PT_layout"
     bl_parent_id = "RURIBRIDGE_PT_panel"
     bl_space_type = "VIEW_3D"
@@ -1627,7 +1578,10 @@ class RURIBRIDGE_PT_layout(bpy.types.Panel):
             return
         texture_set = mesh_publish.texture_set_of(material)
         if not texture_set:
-            layout.label(text="{0} is kept out of Painter".format(material.name), icon="INFO")
+            row = layout.row(align=True)
+            row.label(text="{0} is kept out of Painter".format(material.name), icon="HIDE_ON")
+            operator = row.operator(RURIBRIDGE_OT_exclude.bl_idname, text="Let Back In", icon="HIDE_OFF")
+            operator.material, operator.excluded = material.name, False
             return
         settings = context.scene.ruri_bridge_retarget
         box = layout.box()
@@ -1682,8 +1636,7 @@ _CLASSES = (RuriBridgePreferences, RuriBridgeRetargetSettings,
             RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_push_shader, RURIBRIDGE_OT_pull_shader,
             RURIBRIDGE_OT_push_textures, RURIBRIDGE_OT_pull_textures,
             RURIBRIDGE_OT_pull_selected_layer, RURIBRIDGE_OT_bind, RURIBRIDGE_OT_drop_in_painter,
-            RURIBRIDGE_OT_exclude,
-            RURIBRIDGE_OT_follow_rename, RURIBRIDGE_OT_retarget_layout,
+            RURIBRIDGE_OT_exclude, RURIBRIDGE_OT_retarget_layout,
             RURIBRIDGE_OT_map_texture, RURIBRIDGE_OT_invert_lane,
             RURIBRIDGE_OT_open_lanes, RURIBRIDGE_OT_reset_mapping,
             RURIBRIDGE_OT_start_painter, RURIBRIDGE_OT_reattach,

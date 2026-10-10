@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 13
+FORMAT_VERSION = 14
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -29,9 +29,6 @@ ASK_FOR_ANIMATION = "anim"
 #: "This Texture Set is painted by that material": answered by the application
 #: that owns the materials, because it is the one that names what crosses.
 ASK_TO_BIND = "bind"
-#: "Call this Texture Set by that name": answered by the application that owns
-#: the Texture Sets. A rename there is the only edit that keeps every layer.
-ASK_TO_RENAME = "rename"
 #: "State your shading for these Texture Sets": answered by whichever side holds
 #: shading parameters and was not the one asking, on the shading topic -- the same
 #: errand pulls a shader either way.
@@ -50,10 +47,12 @@ ASK_TO_TAKE_TEXTURES = "take_textures"
 ASK_FOR_LAYOUT = "layout"
 #: The shape of that answer.
 LAYOUT_ANSWER = "layout"
-#: "Faces painted in these Texture Sets now paint into those: say how their stacks are
+#: "Call these Texture Sets by those names; faces painted in these Texture Sets now paint
+#: into those, and faces carried into one now paint into another: say how their stacks are
 #: made and hand over what their paint looks like there": answered by the application
 #: with Texture Sets, on the textures topic, so the side that moved the faces can carry
-#: their paint over in the same step that sends the surface.
+#: their paint over in the same step that sends the surface. A rename there is the one
+#: edit that keeps every layer, and it is done before anything is described.
 ASK_TO_CARRY = "carry"
 #: The shape of that answer.
 CARRY_ANSWER = "carry"
@@ -193,16 +192,21 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
     layout, white on them. ``carry`` comes with the surface that
     moves faces into another Texture Set (see ``carry_answer``): ``{"request": generation,
     "emptied": [source], "targets": {Texture Set: {"mesh_maps": {usage: file}, "channels":
-    [{"channel", "format", "label"}], "events": {event: {"source", "roots": [{"uid",
-    "carry"}], "frozen": {uid: {"layer", "mask", "own", "name", "root", "moved", "pictures":
-    {channel: file and "space"}}}, "normals": {uid: file}}}}}}`` -- the Texture Set's mesh
-    maps with the faces moving in laid into them, beside the record, and the channels it
-    takes from them; per event how each root layer of the source comes along
-    (``own``, ``instance``, ``copy`` or ``skip``) and the pictures standing in for the paint of the
-    copies that a copy cannot cast again, laid out where the paint was made, or in the
-    target's layout where its normals had to turn (``moved``), and the pictures of normals of the
+    [{"channel", "format", "label"}], "resolution": [width, height] or None, "events": {event:
+    {"source", "holder", "roots": [{"uid", "carry", "reads"}], "frozen": {uid: {"layer", "mask",
+    "own", "name", "root", "moved", "pictures": {channel: file and "space"}}}, "normals": {uid:
+    file}}}}}}`` -- the Texture Set's mesh maps with the faces moving in laid into them, beside
+    the record, the channels it takes from them, and the resolution of one this surface makes;
+    per event how each layer it lays comes along (``own``, ``instance``, ``copy`` or ``skip``) and
+    whether it goes on reading the layout (``reads`` ``layout``) or reads where the faces' paint
+    is laid out (``painted``), and the pictures standing in for the paint of the
+    copies that a copy cannot cast again, laid out where the paint was made, or where the faces
+    lie now (``moved``), and the pictures of normals of the
     copies' fills turned where each texel lies into the frames the faces have now, in the chart
-    the fill reads (``normals``). The ``emptied`` sources keep no face and go with this surface.
+    the fill reads (``normals``). An event of faces that leave a source's own stack lays the
+    source's root layers; one whose faces leave the Texture Set holding their folder (``holder``,
+    empty otherwise) keeps its number and lays what lies over that folder and what it holds, and
+    the folder goes. The ``emptied`` sources keep no face and go with this surface.
 
     ``dropped`` are Texture Sets the texturing side deletes with this surface, layers and all:
     nothing on it paints into them, and somebody chose to let them go.
@@ -334,13 +338,21 @@ def layout_answer(source, texture_set, request, fingerprint, readers, tables, ke
     return record
 
 
-def carry_answer(source, request, moves, tables, texture_sets, readers, roots, frozen, normals, convention,
-                 refused):
+def carry_answer(source, request, renamed, moves, rehomes, tables, texture_sets, readers, roots, frozen, normals,
+                 convention, refused):
     """Texture Sets some faces of which are about to paint into others, as the texturing side
     holds them, for the side that moved the faces to carry their paint over.
 
-    ``request`` is the generation of the ask it answers, ``moves`` the ask itself, ``{target:
-    [source]}``. ``tables`` are the tables the project applies (charts only), by Texture Set.
+    ``request`` is the generation of the ask it answers, ``renamed`` the Texture Sets it renamed
+    first, old name to new -- every other name in the answer is the new one -- ``moves`` the ask
+    itself, ``{target: [source]}``, and ``rehomes`` the events whose faces leave the Texture Set
+    holding their folder, ``{event: {"holder", "target", "roots", "frozen", "lying", "inside"}}``:
+    the holder's root layers over the folder (``inside`` false) and the layers the folder holds
+    (``inside`` true), top first, in the shape of ``roots``; the paint under them a copy cannot
+    cast again, in the shape of ``frozen``; every layer lying in the folder, which goes with it
+    (``lying``); and every layer and effect the folder shows, through instances too (``inside``),
+    the fills among them reading where the faces' paint is laid out.
+    ``tables`` are the tables the project applies (charts only), by Texture Set.
     ``texture_sets`` describes every source and target, ``{"resolution": [width, height],
     "channels": [{"channel", "format", "label"}], "mesh_maps": {usage: {"file", "kind"}}}``,
     each mesh map beside the record, laid out in the Texture Set's layout. ``readers`` are
@@ -366,7 +378,9 @@ def carry_answer(source, request, moves, tables, texture_sets, readers, roots, f
     record = _base(CARRY_ANSWER, source)
     record.update({
         "request": int(request),
+        "renamed": dict(renamed),
         "moves": {target: list(sources) for target, sources in dict(moves).items()},
+        "rehomes": dict(rehomes),
         "tables": dict(tables),
         "texture_sets": dict(texture_sets),
         "readers": list(readers),
@@ -404,7 +418,9 @@ def presence(source, document, texture_sets=(), materials=(), textures_directory
     start and nobody has measured -- ``surface``, per Texture Set the fingerprint
     of the surface it holds (see ``mesh``), which is how the side that sent a surface
     learns it went in, and ``guests``, per Texture Set the events whose carried paint
-    it holds; a modelling tool fills ``materials`` and says where the
+    it holds, each with the Texture Set the paint came from -- the one record of where a
+    carried event's folder lives; a modelling tool fills ``materials`` -- the ones that
+    paint into a Texture Set, and nothing of one kept out -- and says where the
     textures of its document live. A material row names the generated shader the material runs
     and that shader's identity, empty for a material nobody generated.
     ``document`` is empty when nothing is open, which is an answer and not a
@@ -418,7 +434,8 @@ def presence(source, document, texture_sets=(), materials=(), textures_directory
         "textures_directory": textures_directory or "",
         "frame": frame_of_project,
         "surface": dict(surface or {}),
-        "guests": {name: sorted(events) for name, events in dict(guests or {}).items()},
+        "guests": {name: {str(event): str(origin) for event, origin in dict(events).items()}
+                   for name, events in dict(guests or {}).items()},
     })
     return record
 

@@ -485,4 +485,5 @@ def current_project_state():
         texture_sets=sorted(texture_sets, key=lambda entry: entry["name"]),
         frame_of_project=mesh_ingest.project_frame(),
         surface=project_facts.read(layout_state.SURFACE_KEY) or {},
-        guests={name: list(events) for name, events in guest_state.known().items()})
+        guests={name: {event: entry["source"] for event, entry in events.items()}
+                for name, events in guest_state.known().items()})

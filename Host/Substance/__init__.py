@@ -19,8 +19,9 @@ one table:
   becomes the mask, or the reference fill, of the layer selected here. Blender has
   no layers, so that is the only shape anything coming this way can take, and it
   touches nothing but the selected layer.
-* **The table** says which Blender material paints into each Texture Set, and is
-  edited from either side.
+* **The table** says which Blender material paints into each Texture Set -- one each,
+  called alike; a material kept out in Blender is not in it. A Texture Set nothing
+  paints is bound to a material from either side, and takes its name.
 
 Nothing is sent on its own; a timer only reads a few integers out of the mapped
 control block and answers what was asked.
@@ -203,16 +204,9 @@ def _ask(what, **details):
 
 
 def speakers(rows):
-    """The Blender material that speaks for each Texture Set its generated materials paint:
-    the one named like the set, else the first by name -- the rule the shading row follows."""
-    found = {}
-    for row in sorted(rows, key=lambda one: one["name"]):
-        texture_set = row["texture_set"]
-        if not texture_set or not row["shader"]:
-            continue
-        if texture_set not in found or row["name"] == texture_set:
-            found[texture_set] = row
-    return found
+    """The Blender material that speaks for each Texture Set a generated material paints: the one
+    painting it, named like it."""
+    return {row["texture_set"]: row for row in rows if row["texture_set"] and row["shader"]}
 
 
 def shaders_by_texture_set(rows):
@@ -861,16 +855,15 @@ def _handle(topic, generation):
                 generation.number))
             return False
         if asked == record_module.ASK_TO_CARRY:
-            _panel.set_status(guest_state.answer(
-                CONNECTION.session.publisher(topic_module.TEXTURES), record["moves"],
-                set(record["emptied"]), generation.number))
-            return False
-        if asked == record_module.ASK_TO_RENAME:
-            renamed = texture_publish.rename(generation.record.get("renames") or {})
+            renamed, refused = {}, ""
+            try:
+                renamed = texture_publish.rename(record["renames"])
+            except texture_publish.TexturePublishError as error:
+                refused = str(error)
             _presence_due[0] = True
-            _panel.set_status("renamed " + (", ".join(
-                "{0} -> {1}".format(old, new) for old, new in sorted(renamed.items()))
-                or "nothing"))
+            _panel.set_status(guest_state.answer(
+                CONNECTION.session.publisher(topic_module.TEXTURES), renamed, record["moves"], record["rehomes"],
+                set(record["emptied"]), generation.number, refused))
             return False
     raise RuntimeError(
         "nothing here receives {0!r} yet, and the topic says this application "

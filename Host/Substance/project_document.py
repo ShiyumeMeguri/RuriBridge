@@ -273,16 +273,18 @@ class Bound:
     """Content laid out in UV space: the action group holding it (``uid``) -- an effect's own
     uid, or for a stack's own strokes the group its layer keeps them in -- the layer
     (``layer``), whether the layer's mask holds it (``mask``), whether it is the stack's own
-    content rather than an effect in it (``own``), and why it is laid out in UV space."""
+    content rather than an effect in it (``own``), why it is laid out in UV space, and whether
+    it holds polygon fills (``polygons``), which only the triangles they picked carry."""
 
-    __slots__ = ("uid", "layer", "mask", "own", "reasons")
+    __slots__ = ("uid", "layer", "mask", "own", "reasons", "polygons")
 
-    def __init__(self, uid, layer, mask, own, reasons):
+    def __init__(self, uid, layer, mask, own, reasons, polygons):
         self.uid = uid
         self.layer = layer
         self.mask = mask
         self.own = own
         self.reasons = reasons
+        self.polygons = polygons
 
 
 def _reasons(action, triangles):
@@ -322,6 +324,12 @@ def _holds_paint(action):
     return any(_holds_paint(item) for item in (action.get("subStack") or {}).get("items") or [] if item)
 
 
+def _holds_polygons(action):
+    if action.get("hits"):
+        return True
+    return any(_holds_polygons(item) for item in (action.get("subStack") or {}).get("items") or [] if item)
+
+
 def _layers(items):
     for layer in items:
         if not layer:
@@ -346,7 +354,7 @@ def bound(document, texture_set, triangles=False):
                         reasons = _reasons(action, triangles) if action else set()
                         if reasons:
                             found.append(Bound(int(action["uid"]), int(layer["uid"]), mask, index == 0,
-                                               sorted(reasons)))
+                                               sorted(reasons), _holds_polygons(action)))
     return found
 
 
