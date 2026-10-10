@@ -433,11 +433,13 @@ def layout_fingerprints(parts):
     return {name: digest.hexdigest() for name, digest in sorted(digests.items())}
 
 
-def publish(publisher, objects, frame_of_project, files, relaid=None, guests=None, carry=None):
+def publish(publisher, objects, frame_of_project, files, relaid=None, guests=None, carry=None,
+            dropped=None):
     """Gather, write and publish the surface in the project's frame. Returns the generation.
 
     ``files`` are the pictures the records name, ``{file name: bytes}``, written beside the
-    record. ``guests`` crosses as it is (see ``record.mesh``); so does ``carry``, but for the mesh
+    record. ``guests`` and ``dropped`` cross as they are (see ``record.mesh``); so does ``carry``,
+    but for the mesh
     maps of each target, ``{usage: (file name, bytes)}``, which are written beside the record.
 
     ``relaid`` is ``{Texture Set: {"chart": chart, "mesh_maps": {usage: (file name,
@@ -502,7 +504,8 @@ def publish(publisher, objects, frame_of_project, files, relaid=None, guests=Non
             fingerprints=layout_fingerprints(parts),
             relaid=payload,
             guests=guests,
-            carry=carried))
+            carry=carried,
+            dropped=dropped))
 
 
 # -- shading rows ------------------------------------------------------------------

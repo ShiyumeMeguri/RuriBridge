@@ -236,21 +236,23 @@ def guests(surface, painter, beside, events, resolutions):
 # -- sending, and the record once Painter holds it --------------------------------------------------------
 
 def send(session, context, frame_of_project, painter, beside, relaid=None, carry=None, events=None,
-         resolutions=None):
+         resolutions=None, dropped=()):
     """Send the surface in the project's frame with the masks of its guests and the pictures
     ``beside`` it (``Beside``), and keep the record it leaves until Painter holds it. ``events`` are
     the events this surface carries faces by, ``{(source, target): event}``; ``resolutions`` the
-    sizes of Texture Sets Painter does not have yet. Returns the generation."""
+    sizes of Texture Sets Painter does not have yet; ``dropped`` the Texture Sets Painter deletes with
+    it, whose faces start over where they paint now. Returns the generation."""
     objects = mesh_publish.scope(context.view_layer)
     events = dict(events or {})
-    names = project_names(painter)
+    names = [name for name in project_names(painter) if name not in set(dropped)]
     payload = {}
     if names:
         surface = gather(objects, frames=False)
         if surface.target is not None and (events or (surface.event != 0).any() or painter.get("guests")):
             payload = guests(surface, painter, beside, events, dict(resolutions or {}))
     generation = mesh_publish.publish(session.publisher(topic_module.MESH), objects, frame_of_project,
-                                      beside.files, relaid=relaid, guests=payload, carry=carry)
+                                      beside.files, relaid=relaid, guests=payload, carry=carry,
+                                      dropped=dropped)
     meshes = face_ledger.settled(objects, slot_texture_sets, render_coordinates, events, names, fresh=not names)
     _settling[0] = face_ledger.Pending(generation.record["fingerprints"], meshes)
     return generation

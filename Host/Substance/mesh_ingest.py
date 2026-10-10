@@ -60,8 +60,9 @@ class MeshIngestError(RuntimeError):
     """A mesh generation that cannot be applied to this project."""
 
 
-#: Texture Sets somebody said may go on the next swap, by name. The only way a
-#: Texture Set with layers is ever dropped: by name, by hand, for one swap.
+#: Texture Sets somebody said here may go on the next swap, by name: with the ones a
+#: surface itself names (``dropped_texture_sets``), the only way a Texture Set with layers
+#: is ever dropped -- by name, by hand, for one swap.
 _allowed_drops = set()
 #: The frame a project being created from a payload will live in, and the record of
 #: the surface it came with, whose chart tables and fingerprints are written onto it
@@ -132,13 +133,19 @@ def emptied_texture_sets(record):
     return set((record.get("carry") or {}).get("emptied") or [])
 
 
+def dropped_texture_sets(record):
+    """The Texture Sets Blender deletes with this payload: nothing there paints into them any more,
+    and somebody chose to let them go, layers and all."""
+    return set(record.get("dropped") or [])
+
+
 def would_lose(record):
     """Texture Sets with layers that nothing in this payload paints into."""
     incoming = incoming_texture_sets(record)
-    emptied = emptied_texture_sets(record)
+    allowed = _allowed_drops | emptied_texture_sets(record) | dropped_texture_sets(record)
     lost = []
     for texture_set in substance_painter.textureset.all_texture_sets():
-        if texture_set.name in incoming or texture_set.name in _allowed_drops or texture_set.name in emptied:
+        if texture_set.name in incoming or texture_set.name in allowed:
             continue
         layers = layer_count(texture_set)
         if layers:
@@ -191,11 +198,11 @@ def apply(generation, texture_resolution, on_finished=None):
     if lost:
         raise MeshIngestError(
             "these Texture Sets have layers and nothing in this mesh paints into them: "
-            "{0}. Bind each to the Blender material that paints it, then send again; "
-            "the mesh was not swapped".format(
+            "{0}. Bind each to the Blender material that paints it and send again, or delete "
+            "it with Delete In Painter in Blender; the mesh was not swapped".format(
                 ", ".join("{0} ({1} layers)".format(name, layers) for name, layers in lost)))
 
-    dropping = sorted(name for name in _allowed_drops
+    dropping = sorted(name for name in _allowed_drops | dropped_texture_sets(record)
                       if name not in incoming_texture_sets(record))
     if dropping:
         LOG.warning("dropping %s on this swap, as asked", ", ".join(dropping))

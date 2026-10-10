@@ -50,20 +50,23 @@ _COVERS = 0.5 / 255.0
 
 
 class Asked:
-    """A carry Blender asked Painter about: the faces moving, ``{(source, target): count}``, and the
-    sources left with no face."""
+    """A carry Blender asked Painter about: the faces moving, ``{(source, target): count}``, the
+    sources left with no face, and the Texture Sets the surface deletes in Painter."""
 
-    __slots__ = ("moves", "emptied")
+    __slots__ = ("moves", "emptied", "dropped")
 
-    def __init__(self, moves, emptied):
+    def __init__(self, moves, emptied, dropped):
         self.moves = moves
         self.emptied = emptied
+        self.dropped = dropped
 
 
-def survey(objects, painter):
-    """What the record says of the faces in scope, against the project Painter has open."""
+def survey(objects, painter, dropped=()):
+    """What the record says of the faces in scope, against the project Painter has open but for the
+    Texture Sets the surface deletes there (``dropped``): faces whose paint lives in one start over."""
+    names = [name for name in surface_crossing.project_names(painter) if name not in set(dropped)]
     return face_ledger.survey(objects, surface_crossing.slot_texture_sets, surface_crossing.events_of,
-                              surface_crossing.project_names(painter), surface_crossing.render_coordinates)
+                              names, surface_crossing.render_coordinates)
 
 
 def waiting():
@@ -71,8 +74,9 @@ def waiting():
     return bool(_asked)
 
 
-def begin(session, found):
-    """Ask Painter how the paint of the moving faces is made. Returns one line about it."""
+def begin(session, found, dropped=()):
+    """Ask Painter how the paint of the moving faces is made; the surface that follows deletes
+    ``dropped`` there. Returns one line about it."""
     targets = {}
     for source, target in sorted(found.moves):
         targets.setdefault(target, []).append(source)
@@ -80,7 +84,7 @@ def begin(session, found):
                       if not layout_retarget.wearing(mesh_publish.painted_by(source))})
     generation = session.publisher(topic_module.REQUEST).publish_record(record_module.request(
         "Blender", record_module.ASK_TO_CARRY, moves=targets, emptied=emptied))
-    _asked[generation.number] = Asked(dict(found.moves), emptied)
+    _asked[generation.number] = Asked(dict(found.moves), emptied, tuple(sorted(dropped)))
     return "asked Painter how the paint of {0} face(s) moving into {1} is made".format(
         sum(found.moves.values()), ", ".join(sorted(targets)))
 
@@ -370,7 +374,7 @@ def complete(context, session, generation, frame_of_project, painter):
     if record.get("refused"):
         raise RuntimeError("Painter cannot carry the paint of the moving faces: {0}".format(record["refused"]))
     objects = mesh_publish.scope(context.view_layer)
-    found = survey(objects, painter)
+    found = survey(objects, painter, asked.dropped)
     if found.problems:
         raise RuntimeError("; ".join(found.problems))
     if found.moves != asked.moves:
@@ -433,7 +437,7 @@ def complete(context, session, generation, frame_of_project, painter):
                                       key=lambda size: size[0])
     carry = {"request": int(record["request"]), "emptied": list(asked.emptied), "targets": targets}
     sent = surface_crossing.send(session, context, frame_of_project, painter, beside, carry=carry, events=events,
-                                 resolutions=resolutions)
+                                 resolutions=resolutions, dropped=asked.dropped)
     notes = list(dict.fromkeys(notes))
     for note in notes:
         LOG.warning("%s", note)

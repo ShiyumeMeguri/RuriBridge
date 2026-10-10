@@ -153,7 +153,7 @@ def same_frame(first, second, tolerance=1e-9):
 
 
 def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_sets,
-         fingerprints, relaid=None, guests=None, carry=None):
+         fingerprints, relaid=None, guests=None, carry=None, dropped=None):
     """The surface somebody paints on, in the frame of the project it is for.
 
     ``scene`` describes what went into the file (object names, how many faces
@@ -203,6 +203,9 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
     target's layout where its normals had to turn (``moved``), and the pictures of normals of the
     copies' fills turned where each texel lies into the frames the faces have now, in the chart
     the fill reads (``normals``). The ``emptied`` sources keep no face and go with this surface.
+
+    ``dropped`` are Texture Sets the texturing side deletes with this surface, layers and all:
+    nothing on it paints into them, and somebody chose to let them go.
     """
     record = _base("mesh", source)
     record.update({
@@ -216,6 +219,7 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
         "relaid": relaid or {},
         "guests": guests or {},
         "carry": carry,
+        "dropped": sorted(dropped or []),
     })
     return record
 
