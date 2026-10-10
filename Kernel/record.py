@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 12
+FORMAT_VERSION = 13
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -50,6 +50,13 @@ ASK_TO_TAKE_TEXTURES = "take_textures"
 ASK_FOR_LAYOUT = "layout"
 #: The shape of that answer.
 LAYOUT_ANSWER = "layout"
+#: "Faces painted in these Texture Sets now paint into those: say how their stacks are
+#: made and hand over what their paint looks like there": answered by the application
+#: with Texture Sets, on the textures topic, so the side that moved the faces can carry
+#: their paint over in the same step that sends the surface.
+ASK_TO_CARRY = "carry"
+#: The shape of that answer.
+CARRY_ANSWER = "carry"
 
 RECORD_FILE_NAME = "record.json"
 #: A rig and its performance, as the animation tools on either side read it.
@@ -146,7 +153,7 @@ def same_frame(first, second, tolerance=1e-9):
 
 
 def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_sets,
-         fingerprints, relaid=None):
+         fingerprints, relaid=None, guests=None, carry=None):
     """The surface somebody paints on, in the frame of the project it is for.
 
     ``scene`` describes what went into the file (object names, how many faces
@@ -158,23 +165,44 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
 
     ``layouts`` is every Texture Set's chart table (see ``layout``), the
     coordinates its ``uv_sets`` UV sets hold; the texturing side keeps everything
-    read through a chart reading the same coordinates. ``relaid`` carries, for a
+    read through a chart reading the same coordinates. Every file a record names --
+    a mesh map, a picture -- crosses beside it as ``{"file": name, "hash": sha1}``: transport,
+    held on the far side until its project embeds what it took in. ``relaid`` carries, for a
     Texture Set whose layout is a chart the texturing side has no mesh maps for
     yet, those maps laid out in it: ``{Texture Set: {"chart": chart, "mesh_maps":
-    {usage: {"file": name, "hash": sha1}}, "fills": {uid: {"path": path}}, "frozen": {uid:
-    {"layer", "mask", "own", "name", "moved", "pictures": {channel: {"path", "space"}}}},
-    "thawed": [uid]}}``, the mesh maps beside the record; ``fills`` are pictures of tangent
-    normals carried into the new layout's frames in place, for the fills reading them, on
-    disk where they stay. ``frozen`` is the paint laid out in UV space made pictures, on disk
-    where they stay, for a fill to stand in for it: laid out in the layout the paint was made
-    in, or in the new one (``moved``) where its normals had to turn with the islands; ``space``
-    is how a picture's values are read back. ``thawed`` are the fills standing in for paint
-    that come away again, the layout the paint was made in being back.
+    {usage: file}, "fills": {uid: {"pictures": {channel: file}, "pixels"}}, "pictures": {key:
+    file}, "restored": [uid], "frozen": {uid: {"layer", "mask", "own", "name", "moved",
+    "pictures": {channel: file and "space"}}}, "thawed": [uid]}}``; ``fills`` are the pictures
+    of fills laying normals, carried into the new layout's frames; ``pictures`` those of
+    effects reading a picture with no projection of their own, laid out in the new layout.
+    ``frozen`` is the paint laid out in UV space made pictures, for a fill to stand in for it:
+    laid out in the layout the paint was made in, or in the new one (``moved``) where its
+    normals had to turn with the islands; ``space`` is how a picture's values are read back.
+    ``thawed`` are the fills standing in for paint that come away again, the layout the paint
+    was made in being back.
 
     ``fingerprints`` is, per Texture Set, a digest of its polygons and their layout
     coordinates as they cross: what its mesh maps are laid out on. The texturing side
     keeps the one it applied and hands it back with a layout answer, so the side that
     lays the maps out again knows they were laid out on the coordinates it holds.
+
+    ``guests`` says, for every Texture Set holding faces whose paint lives in another
+    Texture Set's stack, where they lie: ``{Texture Set: {"index": painted UV set,
+    "events": {event: {"source": source Texture Set, "mask": file}}}}`` -- the faces one
+    carry brought from one source, each mask a picture laid out in the Texture Set's
+    layout, white on them. ``carry`` comes with the surface that
+    moves faces into another Texture Set (see ``carry_answer``): ``{"request": generation,
+    "emptied": [source], "targets": {Texture Set: {"mesh_maps": {usage: file}, "channels":
+    [{"channel", "format", "label"}], "events": {event: {"source", "roots": [{"uid",
+    "carry"}], "frozen": {uid: {"layer", "mask", "own", "name", "root", "moved", "pictures":
+    {channel: file and "space"}}}, "normals": {uid: file}}}}}}`` -- the Texture Set's mesh
+    maps with the faces moving in laid into them, beside the record, and the channels it
+    takes from them; per event how each root layer of the source comes along
+    (``own``, ``instance``, ``copy`` or ``skip``) and the pictures standing in for the paint of the
+    copies that a copy cannot cast again, laid out where the paint was made, or in the
+    target's layout where its normals had to turn (``moved``), and the pictures of normals of the
+    copies' fills turned where each texel lies into the frames the faces have now, in the chart
+    the fill reads (``normals``). The ``emptied`` sources keep no face and go with this surface.
     """
     record = _base("mesh", source)
     record.update({
@@ -186,6 +214,8 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
         "uv_sets": int(uv_sets),
         "fingerprints": dict(fingerprints),
         "relaid": relaid or {},
+        "guests": guests or {},
+        "carry": carry,
     })
     return record
 
@@ -300,6 +330,51 @@ def layout_answer(source, texture_set, request, fingerprint, readers, tables, ke
     return record
 
 
+def carry_answer(source, request, moves, tables, texture_sets, readers, roots, frozen, normals, convention,
+                 refused):
+    """Texture Sets some faces of which are about to paint into others, as the texturing side
+    holds them, for the side that moved the faces to carry their paint over.
+
+    ``request`` is the generation of the ask it answers, ``moves`` the ask itself, ``{target:
+    [source]}``. ``tables`` are the tables the project applies (charts only), by Texture Set.
+    ``texture_sets`` describes every source and target, ``{"resolution": [width, height],
+    "channels": [{"channel", "format", "label"}], "mesh_maps": {usage: {"file", "kind"}}}``,
+    each mesh map beside the record, laid out in the Texture Set's layout. ``readers`` are
+    the chart-addressed fills some source shows, ``{"uid", "index", "members", "following"}``
+    as in a layout answer. ``roots`` are, per source, its root layers top first, ``{"uid",
+    "name", "shows", "home", "paint", "seed", "group", "coverage"}``: the layer it shows (an
+    instance's source, itself otherwise) and the Texture Set that layer belongs to, whether
+    anything under it holds paint, whether it is the bridge's own layer of the source's
+    Blender material, whether it is a folder, and -- for one that would have to be copied --
+    pictures of where it covers the source, ``{"mask": file or "", "channels": {channel:
+    file}}``, each holding the coverage as alpha (a mask as its value). ``frozen`` is, per
+    source, its own paint that a copy cannot cast again where it lay -- laid out in UV space
+    or picked by polygon -- in the shape of a layout answer's, each with the root layer
+    holding it (``root``). ``normals`` is, per source, every fill it shows laying tangent
+    normals through a chart, in the shape of a layout answer's ``fills``, each with the root
+    layer it lies under (``root``): Painter reads such normals in the frames of set 0, so on
+    islands that turn they point elsewhere unless their picture is turned. ``convention`` is,
+    per source whose tangent maps, paint or fills lay normals, the exports telling which way
+    they point their green, as in a layout answer, one of them with how Painter reads a
+    picture it has never seen (``fresh``) when a fill lays normals from a picture.
+    ``refused`` says why nothing can be carried, when nothing can.
+    """
+    record = _base(CARRY_ANSWER, source)
+    record.update({
+        "request": int(request),
+        "moves": {target: list(sources) for target, sources in dict(moves).items()},
+        "tables": dict(tables),
+        "texture_sets": dict(texture_sets),
+        "readers": list(readers),
+        "roots": dict(roots),
+        "frozen": dict(frozen),
+        "normals": dict(normals),
+        "convention": dict(convention),
+        "refused": refused,
+    })
+    return record
+
+
 def inputs(source, texture_sets):
     """A material's own textures, cut into the inputs a texturing tool's shader reads.
 
@@ -314,15 +389,18 @@ def inputs(source, texture_sets):
 
 
 def presence(source, document, texture_sets=(), materials=(), textures_directory="",
-             frame_of_project=None):
+             frame_of_project=None, surface=None, guests=None):
     """What this application has open, stated by the application itself.
 
     Everybody publishes it and everybody reads everybody else's, which is how a
     side stops guessing whether the other one is there and what it is holding.
-    A texturing tool fills ``texture_sets`` -- each with its layer count and the
-    maps a whole export of it writes, or why it cannot say -- and the frame its
-    project's surface lives in -- None for a project the bridge did not start and
-    nobody has measured; a modelling tool fills ``materials`` and says where the
+    A texturing tool fills ``texture_sets`` -- each with its layer count, its
+    resolution and the maps a whole export of it writes, or why it cannot say --
+    the frame its project's surface lives in -- None for a project the bridge did not
+    start and nobody has measured -- ``surface``, per Texture Set the fingerprint
+    of the surface it holds (see ``mesh``), which is how the side that sent a surface
+    learns it went in, and ``guests``, per Texture Set the events whose carried paint
+    it holds; a modelling tool fills ``materials`` and says where the
     textures of its document live. A material row names the generated shader the material runs
     and that shader's identity, empty for a material nobody generated.
     ``document`` is empty when nothing is open, which is an answer and not a
@@ -335,6 +413,8 @@ def presence(source, document, texture_sets=(), materials=(), textures_directory
         "materials": list(materials),
         "textures_directory": textures_directory or "",
         "frame": frame_of_project,
+        "surface": dict(surface or {}),
+        "guests": {name: sorted(events) for name, events in dict(guests or {}).items()},
     })
     return record
 

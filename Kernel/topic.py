@@ -159,6 +159,7 @@ ANSWERED_WITH = {
     record_module.ASK_FOR_INPUTS: host_port.NODE_MATERIALS,
     record_module.ASK_TO_TAKE_TEXTURES: host_port.TEXTURE_SETS,
     record_module.ASK_FOR_LAYOUT: host_port.TEXTURE_SETS,
+    record_module.ASK_TO_CARRY: host_port.TEXTURE_SETS,
 }
 
 

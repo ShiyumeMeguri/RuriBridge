@@ -20,11 +20,14 @@ in any other frame is, to Painter, a different object.
 triangulates on import, and the triangulation it chose is part of what a stroke or
 a selection is recorded against; handing it Blender's own triangles would be
 handing it a second opinion. UV set 0 is the one Blender renders with -- the layout
-a Texture Set is painted in -- and the sets after it are the charts the Texture
+a Texture Set is painted in; a face moved by whole tiles since it last crossed crosses at
+the tiles it lay at, the same texels of a repeating picture, where Painter's strokes made
+in its 2D view still find it -- and the sets after it are the charts the Texture
 Set's tables name (see ``layouts``): earlier layouts that content in Painter still
-reads through. Materials are names and nothing else, because a material
-description is exactly what an importer turns into an unasked-for layer on every
-new Texture Set.
+reads through, and for a Texture Set holding faces whose paint lives in another
+one, the coordinates every face's paint is laid out in (``face_ledger``).
+Materials are names and nothing else, because a material description is exactly
+what an importer turns into an unasked-for layer on every new Texture Set.
 
 **Which Texture Set a material paints into** is the one fact this side keeps
 about the other. It is a name, written on the material the first time it crosses
@@ -48,7 +51,7 @@ from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import fbx_surface, layouts
+from . import face_ledger, fbx_surface, layouts
 
 LOG = logger("blender.mesh")
 
@@ -80,6 +83,12 @@ def texture_set_of(material):
     if IDENTITY_PROPERTY in material.keys():
         return str(material[IDENTITY_PROPERTY])
     return material.name
+
+
+def painted_by(texture_set):
+    """Every material of this document that paints into the Texture Set."""
+    return [material for material in bpy.data.materials
+            if material.library is None and texture_set_of(material) == texture_set]
 
 
 def is_excluded(material):
@@ -262,6 +271,18 @@ def _layer_values(mesh, name, object_name, texture_set):
     return values.reshape(-1, 2)
 
 
+def painted_values(mesh, slot_texture_sets, render):
+    """Per corner, the coordinates the face's paint is laid out in: where the record says for a face
+    whose paint lives in another Texture Set than the one it paints into, ``render`` -- the render UV
+    per corner -- for every other."""
+    values = render.copy()
+    guest = face_ledger.guests(face_ledger.painted(mesh), face_ledger.current(mesh, slot_texture_sets))
+    if guest.any():
+        corners = guest[face_ledger.corner_faces(mesh)]
+        values[corners] = face_ledger.painted_coordinates(mesh)[corners]
+    return values
+
+
 def gather_object(object_reference, depsgraph, frame_of_project, tables, uv_set_count):
     """Read one evaluated object into the project's frame.
 
@@ -335,7 +356,12 @@ def gather_object(object_reference, depsgraph, frame_of_project, tables, uv_set_
             span = int(totals[polygons].sum())
             block = corners[corner_start:corner_start + span]
             layers = layouts.layers_of(tables[name], render.name, uv_set_count)
+            if render.name not in read:
+                read[render.name] = face_ledger.crossing(mesh, texture_sets, _layer_values(
+                    mesh, render.name, object_reference.name, name))
             for uv_set, layer_name in enumerate(layers):
+                if layer_name not in read and layer_name == face_ledger.PAINTED_UV_ATTRIBUTE:
+                    read[layer_name] = painted_values(mesh, texture_sets, read[render.name])
                 if layer_name not in read:
                     read[layer_name] = _layer_values(mesh, layer_name, object_reference.name, name)
                 uv_sets[uv_set][corner_start:corner_start + span] = read[layer_name][block]
@@ -407,19 +433,23 @@ def layout_fingerprints(parts):
     return {name: digest.hexdigest() for name, digest in sorted(digests.items())}
 
 
-def publish(publisher, objects, frame_of_project, relaid=None):
+def publish(publisher, objects, frame_of_project, files, relaid=None, guests=None, carry=None):
     """Gather, write and publish the surface in the project's frame. Returns the generation.
 
+    ``files`` are the pictures the records name, ``{file name: bytes}``, written beside the
+    record. ``guests`` crosses as it is (see ``record.mesh``); so does ``carry``, but for the mesh
+    maps of each target, ``{usage: (file name, bytes)}``, which are written beside the record.
+
     ``relaid`` is ``{Texture Set: {"chart": chart, "mesh_maps": {usage: (file name,
-    bytes)}, "fills": {uid: {"pictures": {channel: path}, "pixels": pixels}}, "pictures": {key:
-    {"path": path}}, "restored": [uid], "frozen": {uid: {"layer", "mask", "own", "name", "moved",
-    "pictures": {channel: {"path", "space"}}}}, "thawed": [uid]}}``: mesh maps laid out in a chart
-    that becomes a Texture Set's layout with this surface, written beside it; the pictures fills
-    lay anew -- every one of a fill laying nothing but pictures, laid out in it (``pixels``), else
-    a picture of normals turned into its frames in the chart the fill reads -- and the pictures
-    of effects laid out in it, where they lie on disk; the fills that take their own pictures
-    back in it; the pictures of paint laid out in UV space, for fills to stand in for it; and
-    the fills standing in for paint that come away again.
+    bytes)}, "fills": {uid: {"pictures": {channel: picture}, "pixels": pixels}}, "pictures": {key:
+    picture}, "restored": [uid], "frozen": {uid: {"layer", "mask", "own", "name", "moved",
+    "pictures": {channel: picture and "space"}}}, "thawed": [uid]}}``, every picture ``{"file",
+    "hash"}`` among ``files``: mesh maps laid out in a chart that becomes a Texture Set's layout
+    with this surface, written beside it; the pictures fills lay anew -- every one of a fill
+    laying nothing but pictures, laid out in it (``pixels``), else a picture of normals turned
+    into its frames in the chart the fill reads -- and the pictures of effects laid out in it;
+    the fills that take their own pictures back in it; the pictures of paint laid out in UV
+    space, for fills to stand in for it; and the fills standing in for paint that come away again.
     """
     bare = bare_objects(objects)
     if bare:
@@ -434,6 +464,9 @@ def publish(publisher, objects, frame_of_project, relaid=None):
         path = staging.path(record_module.SURFACE_FILE_NAME)
         fbx_surface.write(path, parts, ["UVSet{0}".format(index) for index in range(uv_set_count)])
         arena_module.keep_in_memory(path)
+        for file_name, data in sorted(files.items()):
+            with open(staging.path(file_name), "wb") as handle:
+                handle.write(data)
         payload = {}
         for texture_set, entry in sorted((relaid or {}).items()):
             files = {}
@@ -447,6 +480,17 @@ def publish(publisher, objects, frame_of_project, relaid=None):
                                     "restored": list(entry.get("restored") or []),
                                     "frozen": dict(entry.get("frozen") or {}),
                                     "thawed": list(entry.get("thawed") or [])}
+        carried = None
+        if carry is not None:
+            targets = {}
+            for texture_set, entry in sorted(carry["targets"].items()):
+                files = {}
+                for usage, (file_name, data) in sorted(entry["mesh_maps"].items()):
+                    with open(staging.path(file_name), "wb") as handle:
+                        handle.write(data)
+                    files[usage] = {"file": file_name, "hash": hashlib.sha1(data).hexdigest()}
+                targets[texture_set] = dict(entry, mesh_maps=files)
+            carried = dict(carry, targets=targets)
         return staging.publish(record_module.mesh(
             source="Blender",
             scene_file=record_module.SURFACE_FILE_NAME,
@@ -456,7 +500,9 @@ def publish(publisher, objects, frame_of_project, relaid=None):
             layouts={name: layout_module.charts_only(table) for name, table in tables.items()},
             uv_sets=uv_set_count,
             fingerprints=layout_fingerprints(parts),
-            relaid=payload))
+            relaid=payload,
+            guests=guests,
+            carry=carried))
 
 
 # -- shading rows ------------------------------------------------------------------

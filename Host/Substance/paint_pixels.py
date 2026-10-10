@@ -20,6 +20,10 @@ background, and an effect in it laid normally over 0 and over 1, which gives the
 the colour. Infinite padding carries both past the islands, so what reads a picture across an
 island's border reads the island. Every export is 32-bit: a narrower one stores height as
 (h + 1) / 2, not as Painter holds it.
+
+Faces carried into another Texture Set take a copy of the layers holding their paint, and in
+the copy a fill stands in for the paint that cannot be cast again there (``carried``,
+``stand_in``): for good -- the paint was made in a Texture Set the copy does not live in.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ import substance_painter.textureset as textureset
 
 from ...Kernel import arena as arena_module
 
-from . import project_document, project_facts, project_imports
+from . import held_imports, project_document, project_facts, project_imports
 
 #: Per fill the bridge laid in place of paint laid out in UV space, by uid: the Texture Set it
 #: shows in, the layout the paint was made in, the layer and whether its mask holds the paint,
@@ -46,6 +50,9 @@ from . import project_document, project_facts, project_imports
 #: "layer", "mask", "effect", "visible"}`` -- ``effect`` is None for a stack's own strokes,
 #: which the fill covers.
 FROZEN_KEY = "frozen"
+#: Per fill standing for good in a copy carried into another Texture Set, by uid: the layer, whether
+#: its mask holds the paint, and the paint effect it stands in for, ``{"layer", "mask", "effect"}``.
+CARRIED_PAINT_KEY = "carried_paint"
 #: Where a copy of the project is written to read its document, beside the sessions.
 DOCUMENTS_FOLDER = "painter_documents"
 
@@ -60,7 +67,8 @@ SPACES = {
 #: The channels Painter holds as signed values, -1..1.
 _SIGNED = {textureset.ChannelType.Height}
 _BITS = 32
-_MASK = "mask"
+#: The name an export knows a layer's mask by, and a picture of paint in a mask is filed under.
+MASK = "mask"
 
 
 class Frozen:
@@ -76,7 +84,7 @@ class Frozen:
         self.name = name
 
 
-def _document():
+def document():
     """The project's document as it stands: the project written as a copy beside the sessions,
     read, and the copy deleted."""
     folder = arena_module.default_root().parent / DOCUMENTS_FOLDER
@@ -111,7 +119,8 @@ def _identifiers(texture_set):
 def _standing():
     """What the fills standing in for paint stand in for: the effects, and per layer the stacks
     whose own strokes they cover."""
-    records = remembered().values()
+    records = list(remembered().values()) + [
+        record for key, record in dict(project_facts.read(CARRIED_PAINT_KEY) or {}).items() if exists(key)]
     return ({int(record["effect"]) for record in records if record["effect"] is not None},
             {(int(record["layer"]), bool(record["mask"])) for record in records if record["effect"] is None})
 
@@ -120,10 +129,34 @@ def find(texture_set, problems):
     """Every piece of the Texture Set's paint laid out in UV space that no fill stands in for yet,
     ``[Frozen]``; what stands in the way of making one pixels goes into ``problems``."""
     try:
-        bound = project_document.bound(_document(), texture_set.name)
+        bound = project_document.bound(document(), texture_set.name)
     except project_document.DocumentError as error:
         problems.append("the project file holds its strokes in a form the bridge does not read: {0}".format(error))
         return []
+    return _standing_free(texture_set, bound, problems, True)
+
+
+def root_of(node):
+    """The root layer a node lies under, the node itself for a root layer."""
+    while node.get_parent() is not None:
+        node = node.get_parent()
+    return node
+
+
+def carried(texture_set, held, roots, problems):
+    """Every piece of the Texture Set's paint under these root layers (uids) that a copy of them in
+    another Texture Set cannot cast again where it lay -- laid out in UV space, or picked by polygon
+    as the Texture Set's own triangles -- and no fill stands in for yet, ``[Frozen]``, read from the
+    project's document ``held``; what stands in the way of making one pixels goes into
+    ``problems``."""
+    bound = [entry for entry in project_document.bound(held, texture_set.name, triangles=True)
+             if root_of(layerstack.get_node_by_uid(entry.layer)).uid() in roots]
+    return _standing_free(texture_set, bound, problems, False)
+
+
+def _standing_free(texture_set, bound, problems, alone):
+    """The paint of ``bound`` no fill stands in for yet, as the stack holds it now; with ``alone``,
+    paint other Texture Sets show through instances is a problem -- it lies elsewhere there."""
     effects_standing, stacks_standing = _standing()
     bound = [entry for entry in bound if entry.uid not in effects_standing
              and not (entry.own and (entry.layer, entry.mask) in stacks_standing)]
@@ -138,7 +171,7 @@ def find(texture_set, problems):
             problems.append("{0}: the project file and the layer stack disagree about where its paint "
                             "lies".format(name))
             continue
-        elsewhere = _shown_elsewhere(layer if effect is None else effect, texture_set.name)
+        elsewhere = _shown_elsewhere(layer if effect is None else effect, texture_set.name) if alone else set()
         if elsewhere:
             problems.append("{0} holds {1}, and {2} show(s) it through instances, where that paint lies "
                             "elsewhere".format(name, ", ".join(entry.reasons), ", ".join(sorted(elsewhere))))
@@ -160,7 +193,9 @@ def _space(channel):
     return "signed" if channel in _SIGNED else "raw"
 
 
-def _save(uid, channel, path, coverage):
+def save(uid, channel, path, coverage):
+    """Export one layer's channel as Painter holds it, 32-bit, padded past the islands; with
+    ``coverage``, the coverage as alpha."""
     substance_painter.js.evaluate("alg.mapexport.save([{0}, {1}], {2}, {3})".format(
         uid, json.dumps(channel), json.dumps(path.replace("\\", "/")),
         json.dumps({"bitDepth": _BITS, "padding": "Infinite", "keepAlpha": coverage})))
@@ -222,7 +257,7 @@ def _content(frozen, staging, clear):
         found = []
         for channel in channels:
             file_name = "frozen_{0}_{1}.exr".format(frozen.bound.uid, channel.name)
-            _save(layer.uid(), channel.name.lower(), str(staging.path(file_name)), True)
+            save(layer.uid(), channel.name.lower(), str(staging.path(file_name)), True)
             found.append({"channel": channel.name, "space": _space(channel), "file": file_name})
         return found
     finally:
@@ -248,8 +283,8 @@ def _mask(frozen, staging):
     stem = "frozen_{0}_mask".format(frozen.bound.uid)
     try:
         if effect is None:
-            _save(layer.uid(), _MASK, str(staging.path(stem + ".exr")), False)
-            return [{"channel": _MASK, "space": "raw", "file": stem + ".exr"}]
+            save(layer.uid(), MASK, str(staging.path(stem + ".exr")), False)
+            return [{"channel": MASK, "space": "raw", "file": stem + ".exr"}]
         under = layerstack.insert_fill(layerstack.InsertPosition.below_node(effect))
         under.set_blending_mode(layerstack.BlendingMode.Replace)
         held = (effect.get_blending_mode(), effect.get_opacity())
@@ -261,8 +296,8 @@ def _mask(frozen, staging):
         for value, key in ((0.0, "zero"), (1.0, "one")):
             under.set_source(None, colormanagement.Color(value, value, value))
             files[key] = "{0}_{1}.exr".format(stem, key)
-            _save(layer.uid(), _MASK, str(staging.path(files[key])), False)
-        return [dict(files, channel=_MASK, space="raw")]
+            save(layer.uid(), MASK, str(staging.path(files[key])), False)
+        return [dict(files, channel=MASK, space="raw")]
     finally:
         if under is not None:
             layerstack.delete_node(under)
@@ -303,7 +338,8 @@ def capture(found, staging):
     return entries
 
 
-def _exists(uid):
+def exists(uid):
+    """Whether a node of that uid is in the project."""
     try:
         layerstack.get_node_by_uid(int(uid))
     except ValueError:
@@ -314,7 +350,7 @@ def _exists(uid):
 def remembered():
     """The fills standing in for paint whose fill, and effect when there is one, are still there."""
     return {key: record for key, record in dict(project_facts.read(FROZEN_KEY) or {}).items()
-            if _exists(key) and (record["effect"] is None or _exists(record["effect"]))}
+            if exists(key) and (record["effect"] is None or exists(record["effect"]))}
 
 
 def thawing(texture_set):
@@ -342,13 +378,33 @@ def problem(uid, target):
     return ""
 
 
+def held(target, directory):
+    """A piece of paint Blender made pixels, its pictures -- delivered beside the record in
+    ``directory``, ``{"file", "hash", "space"}`` -- where Painter imports them from, ``{"path",
+    "space"}``."""
+    return dict(target, pictures={name: {"path": held_imports.delivered(directory, picture), "space": picture["space"]}
+                                  for name, picture in target["pictures"].items()})
+
+
 def freeze(uid, target, records):
-    """Lay the pictures Blender made of a piece of paint in a fill standing in for it -- at the
-    bottom of its stack, Replace, for a stack's own strokes; right above an effect, blending as
-    the effect does, the effect hidden -- each picture read back the way its values are stored,
-    and remember it (``records``). Returns the fill, still reading set 0."""
+    """Lay the pictures Blender made of a piece of paint in a fill standing in for it
+    (``stand_in``) and remember it (``records``). Returns the fill, still reading set 0."""
     layer = layerstack.get_node_by_uid(int(target["layer"]))
     effect = None if target["own"] else layerstack.get_node_by_uid(uid)
+    shown = True if effect is None else effect.is_visible()
+    fill = stand_in(layer, effect, target)
+    records[str(fill.uid())] = {"texture_set": target["texture_set"], "layout": target["layout"],
+                                "layer": int(target["layer"]), "mask": bool(target["mask"]),
+                                "effect": None if effect is None else uid, "visible": shown}
+    return fill
+
+
+def stand_in(layer, effect, target):
+    """Lay the pictures Blender made of a piece of paint in a fill standing in for it -- at the
+    bottom of ``layer``'s stack, Replace, for the stack's own strokes (no ``effect``); right above
+    ``effect``, blending as it does, the effect hidden -- each picture read back the way its values
+    are stored. ``target`` says whether the mask holds the paint and names the pictures, ``{"mask",
+    "pictures": {channel: {"path", "space"}}}``. Returns the fill, still reading set 0."""
     if effect is None:
         effects = layer.mask_effects() if target["mask"] else layer.content_effects()
         position = (layerstack.InsertPosition.below_node(effects[-1]) if effects else
@@ -362,7 +418,7 @@ def freeze(uid, target, records):
                 for name, entry in target["pictures"].items()}
     fill = layerstack.insert_fill(position)
     if target["mask"]:
-        identifier, space = pictures[_MASK]
+        identifier, space = pictures[MASK]
         fill.set_source(None, identifier).set_color_space(space)
         fill.set_blending_mode(layerstack.BlendingMode.Replace if effect is None else effect.get_blending_mode())
         fill.set_opacity(1.0 if effect is None else effect.get_opacity())
@@ -380,10 +436,16 @@ def freeze(uid, target, records):
     fill.set_visible(shown)
     if effect is not None:
         effect.set_visible(False)
-    records[str(fill.uid())] = {"texture_set": target["texture_set"], "layout": target["layout"],
-                                "layer": int(target["layer"]), "mask": bool(target["mask"]),
-                                "effect": None if effect is None else uid, "visible": shown}
     return fill
+
+
+def rename(renames):
+    """Texture Sets renamed, old name to new: the fills standing in for paint follow the name."""
+    records = dict(project_facts.read(FROZEN_KEY) or {})
+    if any(record["texture_set"] in renames for record in records.values()):
+        project_facts.write(FROZEN_KEY, {uid: dict(record, texture_set=renames.get(record["texture_set"],
+                                                                                   record["texture_set"]))
+                                         for uid, record in records.items()})
 
 
 def thaw(uid, records):

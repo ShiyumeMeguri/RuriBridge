@@ -26,6 +26,14 @@ both in one step -- and sends them with every surface. The texturing
 side keeps the tables it last applied and, before a surface goes in, works out
 where everything addressed through a chart has to read from now (``rebind``); a
 retarget makes the same check before it changes anything (``retargeted``).
+
+A Texture Set holding **guests** -- faces whose paint lives in another Texture Set's
+stack, carried over when the faces moved -- declares one more UV set, under the
+reserved chart ``PAINTED_CHART``: there every face holds the coordinates its paint
+is laid out in, a guest those of the Texture Set it was painted in, any other face
+its own layout. Content carried over for guests reads it, and so reads, on every
+face of every Texture Set showing it, the coordinates it was laid out for
+(``with_guests``).
 """
 
 from __future__ import annotations
@@ -37,6 +45,9 @@ import uuid
 MAX_UV_SETS = 8
 #: The chart a Texture Set is laid out in before any retarget.
 ORIGINAL_CHART = ""
+#: The chart of the UV set where every face holds the coordinates its paint is laid out
+#: in. Never a minted chart: those are hexadecimal.
+PAINTED_CHART = "painted"
 
 
 class LayoutError(RuntimeError):
@@ -95,6 +106,53 @@ def uv_set_count(tables):
 
 def new_chart():
     return uuid.uuid4().hex
+
+
+def painted_index(table):
+    """The UV set holding the coordinates every face's paint is laid out in, or None when
+    the Texture Set holds no guests. ``table`` is either shape."""
+    for index, entry in table["extra"].items():
+        if (entry if isinstance(entry, str) else entry["chart"]) == PAINTED_CHART:
+            return int(index)
+    return None
+
+
+def with_guests(table, layer, readers, tables, texture_set):
+    """The table with a UV set declared for guests (``PAINTED_CHART``), read from ``layer``.
+
+    ``readers`` are the fills the guests' content is carried with, ``[(uid, index,
+    members)]``: each is about to read the painted UV set in every Texture Set showing it,
+    so in each of the others that UV set has to hold what the fill reads there now.
+    ``tables`` are the tables the texturing side applies (charts only), by Texture Set. A
+    Texture Set that holds guests already keeps its UV set for them; otherwise the lowest
+    one this table leaves free and every other Texture Set agrees to is taken.
+    ``LayoutError`` names the fills no UV set can serve.
+    """
+    table = normalized(table)
+    others = {name: charts(value) for name, value in dict(tables).items() if name != texture_set}
+
+    def stranded_at(index):
+        return [uid for uid, read, members in readers
+                if not all(chart_at(others.get(member) or empty(), index)
+                           == chart_at(others.get(member) or empty(), read)
+                           for member in members if member != texture_set)]
+
+    held = painted_index(table)
+    if held is not None:
+        stranded = stranded_at(held)
+        if stranded:
+            raise LayoutError("layer(s) {0} cannot read UV set {1}, which {2} keeps for its guests: other "
+                              "Texture Sets showing them hold something else there".format(
+                                  ", ".join(str(uid) for uid in sorted(stranded)), held, texture_set))
+        return table
+    for index in range(1, MAX_UV_SETS):
+        if str(index) in table["extra"] or stranded_at(index):
+            continue
+        extra = dict(table["extra"])
+        extra[str(index)] = {"layer": str(layer), "chart": PAINTED_CHART}
+        return {"layout": table["layout"], "extra": extra}
+    raise LayoutError("no UV set of the surface is free for the guests of {0} in every Texture Set showing "
+                      "what is carried with them".format(texture_set))
 
 
 def _wanted(table, member, index, following):

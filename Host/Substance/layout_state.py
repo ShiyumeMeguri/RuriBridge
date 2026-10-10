@@ -133,8 +133,8 @@ MESH_MAPS = {
 
 #: A normal leaning along both axes, so neither can be mistaken for the other: the one a
 #: picture Painter has never seen holds, to read off how Painter takes a fresh picture of
-#: normals (``_readings``), and the one laid over the whole normal channel while the
-#: project's convention is read (``_convention_maps``).
+#: normals (``readings``), and the one laid over the whole normal channel while the
+#: project's convention is read (``convention_maps``).
 _LEANING_NORMAL = (0.65, 0.8, 0.87)
 #: The height laid over the whole height channel while the project's convention is read.
 _LEVEL_HEIGHT = 0.5
@@ -384,7 +384,7 @@ def _visit(nodes, member, found, unplaceable, unprojected, in_mask=False):
                 _visit([node.instance_source()], member, found, unplaceable, unprojected, in_mask)
 
 
-def _mesh_map_pictures(texture_set):
+def mesh_map_pictures(texture_set):
     found = set()
     for usage in MESH_MAPS:
         resource = texture_set.get_mesh_map_resource(usage)
@@ -407,7 +407,7 @@ def readers():
     unprojected = {}
     mesh_maps = {}
     for texture_set in textureset.all_texture_sets():
-        mesh_maps[texture_set.name] = _mesh_map_pictures(texture_set)
+        mesh_maps[texture_set.name] = mesh_map_pictures(texture_set)
         for stack in texture_set.all_stacks():
             _visit(layerstack.get_root_layer_nodes(stack), texture_set.name, found, unplaceable, unprojected)
     fills = [entry for entry in found.values() if entry is not None and not (
@@ -430,7 +430,7 @@ def applied():
             for name, state in dict(project_facts.read(LAYOUTS_KEY) or {}).items()}
 
 
-def _tables(states):
+def tables_of(states):
     return {name: {"layout": state["layout"], "extra": state["extra"]} for name, state in states.items()}
 
 
@@ -482,7 +482,7 @@ def plan(record, directory):
     desired = {name: layout_module.charts(table)
                for name, table in dict(record.get("layouts") or {}).items()}
     states = applied()
-    before = _tables(states)
+    before = tables_of(states)
     changed = sorted(name for name in desired
                      if desired[name] != layout_module.charts(before.get(name)))
     fills, unplaceable, unprojected = readers()
@@ -510,8 +510,7 @@ def plan(record, directory):
             relayouts[name] = ("kept", old, new, kept)
         elif delivered is not None and delivered["chart"] == new and delivered["mesh_maps"]:
             relayouts[name] = ("delivered", old, new, {
-                usage: dict(entry, held=held_imports.hold(os.path.join(directory, entry["file"]),
-                                                          entry["hash"]))
+                usage: dict(entry, held=held_imports.delivered(directory, entry))
                 for usage, entry in delivered["mesh_maps"].items()})
         elif texture_set is not None and _current_mesh_maps(texture_set):
             problems.append("{0} moves to a layout nobody laid its mesh maps out in; retarget it "
@@ -530,7 +529,9 @@ def plan(record, directory):
                 problems.append("{0}: the layer Blender laid the normals of ({1}) out for is gone "
                                 "or no longer lays normals".format(name, uid))
                 continue
-            replaced[int(uid)] = dict(replacement, layout=layout)
+            replaced[int(uid)] = dict(replacement, layout=layout, pictures={
+                channel: held_imports.delivered(directory, picture)
+                for channel, picture in replacement["pictures"].items()})
         for uid in entry.get("restored") or []:
             if int(uid) not in known or str(uid) not in records:
                 problems.append("{0}: the layer whose own normals were to come back ({1}) is gone or "
@@ -545,7 +546,7 @@ def plan(record, directory):
                 problems.append("{0}: the effect whose picture Blender laid out anew ({1}) is gone or "
                                 "reads no picture there any more".format(name, key))
                 continue
-            pictures[key] = replacement
+            pictures[key] = {"path": held_imports.delivered(directory, replacement)}
     frozen = {}
     thawed = []
     remembered = paint_pixels.remembered()
@@ -556,7 +557,7 @@ def plan(record, directory):
             if problem:
                 problems.append("{0}: {1}".format(name, problem))
                 continue
-            frozen[int(uid)] = dict(target, texture_set=name, layout=layout)
+            frozen[int(uid)] = dict(paint_pixels.held(target, directory), texture_set=name, layout=layout)
         for uid in entry.get("thawed") or []:
             if str(uid) not in remembered:
                 problems.append("{0}: the fill standing in for paint ({1}) is gone".format(name, uid))
@@ -577,7 +578,7 @@ def plan(record, directory):
 
 # -- applying it -----------------------------------------------------------------------------
 
-def _bind(uid, index):
+def bind(uid, index):
     node = layerstack.get_node_by_uid(uid)
     old = node.get_projection_parameters()
     if index == 0:
@@ -594,10 +595,10 @@ def before_surface(chosen):
     """Moves that read set 0 again go first: set 0 is on every surface."""
     for uid, index in sorted(chosen.moves.items()):
         if index == 0 and uid not in chosen.generators:
-            _bind(uid, index)
+            bind(uid, index)
 
 
-def _import_delivered(name, chart, files):
+def import_delivered(name, chart, files):
     maps = {}
     for usage_name, entry in sorted(files.items()):
         resource = project_imports.take_in(entry["held"], substance_painter.resource.Usage.TEXTURE,
@@ -607,7 +608,7 @@ def _import_delivered(name, chart, files):
     return maps
 
 
-def _assign(texture_set, maps):
+def assign_mesh_maps(texture_set, maps):
     for usage in MESH_MAPS:
         entry = maps.get(usage.name)
         texture_set.set_mesh_map_resource(
@@ -637,7 +638,7 @@ def _restore(uid, records):
         node.set_source(getattr(textureset.ChannelType, name),
                         substance_painter.resource.ResourceID.from_project(picture["name"], picture["version"]))
     if remembered["pixels"]:
-        _bind(uid, 0)
+        bind(uid, 0)
 
 
 def _turned(uid, replacement, records):
@@ -660,7 +661,7 @@ def _turned(uid, replacement, records):
                                            name=os.path.splitext(os.path.basename(path))[0])
         node.set_source(channel, resource.identifier())
     if replacement["pixels"]:
-        _bind(uid, 0)
+        bind(uid, 0)
 
 
 def _copied(identifier, inner, target):
@@ -712,7 +713,7 @@ def _carry(uid, index, texture_set, maps, layout, carried):
     fill.set_blending_mode(generator.get_blending_mode())
     fill.set_opacity(generator.get_opacity())
     fill.set_visible(generator.is_visible())
-    _bind(fill.uid(), index)
+    bind(fill.uid(), index)
     carried[str(fill.uid())] = {"texture_set": texture_set.name, "layout": layout}
     layerstack.delete_node(generator)
 
@@ -759,12 +760,12 @@ def after_surface(chosen):
     generators carried to the layout they computed in or back, and the tables now applied."""
     for uid, index in sorted(chosen.moves.items()):
         if index != 0 and uid not in chosen.generators:
-            _bind(uid, index)
+            bind(uid, index)
     standing = paint_pixels.remembered()
     for uid in chosen.thawed:
         paint_pixels.thaw(uid, standing)
     for uid, target in sorted(chosen.frozen.items()):
-        _bind(paint_pixels.freeze(uid, target, standing).uid(), target["index"])
+        bind(paint_pixels.freeze(uid, target, standing).uid(), target["index"])
     project_facts.write(paint_pixels.FROZEN_KEY, standing)
     records = {key: value for key, value in dict(project_facts.read(NORMALS_KEY) or {}).items()
                if int(key) in chosen.nodes}
@@ -784,9 +785,9 @@ def after_surface(chosen):
         current = _current_mesh_maps(texture_set)
         state.setdefault("mesh_maps", {})[old] = current
         if how == "delivered":
-            maps = _import_delivered(name, new, maps)
+            maps = import_delivered(name, new, maps)
         state["mesh_maps"][new] = maps
-        _assign(texture_set, maps)
+        assign_mesh_maps(texture_set, maps)
         replaced[name] = {usage: (current[usage], maps[usage]) for usage in current if usage in maps}
     carried = {key: value for key, value in dict(project_facts.read(CARRIED_KEY) or {}).items()
                if int(key) in chosen.nodes}
@@ -803,7 +804,6 @@ def after_surface(chosen):
                                            name=os.path.splitext(os.path.basename(replacement["path"]))[0])
         _read_picture(chosen.unprojected[key], resource.identifier())
     _settle(states, chosen.desired, names)
-    _hold_surface(chosen.fingerprints, names)
     moved = len(chosen.moves)
     relaid = sorted(name for name in chosen.relayouts if name in names)
     if moved or relaid:
@@ -832,9 +832,38 @@ def _settle(states, desired, names):
     _keep_recorded(states)
 
 
-def _hold_surface(fingerprints, names):
+def hold_surface(fingerprints):
+    """Remember the fingerprints of the surface the project holds now, per Texture Set it has: the
+    last thing a surface does once everything it brought is in place, so the side that sent it
+    learns it went in only then."""
+    names = {one.name for one in textureset.all_texture_sets()}
     project_facts.write(SURFACE_KEY, {name: str(fingerprint) for name, fingerprint
                                       in dict(fingerprints).items() if name in names})
+
+
+def hold_mesh_maps(texture_set, maps):
+    """Give a Texture Set these mesh maps, ``{usage: {"name", "version"}}``, as the maps of the
+    layout it has: faces moving in changed its maps and not its layout, and a retarget that leaves
+    the layout and comes back takes these again."""
+    assign_mesh_maps(texture_set, maps)
+    states = applied()
+    state = states.setdefault(texture_set.name, {"layout": "", "extra": {}, "mesh_maps": {}})
+    state.setdefault("mesh_maps", {})[state["layout"]] = dict(maps)
+    _settle(states, tables_of(states), {one.name for one in textureset.all_texture_sets()})
+
+
+def rename(renames):
+    """Texture Sets renamed, old name to new: the tables applied to each, the surface it holds and the
+    generators carried in it follow the name."""
+    for key in (LAYOUTS_KEY, SURFACE_KEY):
+        held = dict(project_facts.read(key) or {})
+        if set(held) & set(renames):
+            project_facts.write(key, {renames.get(name, name): value for name, value in held.items()})
+    carried = dict(project_facts.read(CARRIED_KEY) or {})
+    if any(entry["texture_set"] in renames for entry in carried.values()):
+        project_facts.write(CARRIED_KEY, {uid: dict(entry, texture_set=renames.get(entry["texture_set"],
+                                                                                   entry["texture_set"]))
+                                          for uid, entry in carried.items()})
 
 
 def adopt(layouts, fingerprints):
@@ -842,13 +871,13 @@ def adopt(layouts, fingerprints):
     desired = {name: layout_module.charts(table) for name, table in dict(layouts).items()}
     names = {one.name for one in textureset.all_texture_sets()}
     _settle({}, desired, names)
-    _hold_surface(fingerprints, names)
+    hold_surface(fingerprints)
 
 
 def read_layout(node):
     """Make a fill read its source through set 0, the Texture Set's own layout."""
     if node.get_projection_mode() == layerstack.ProjectionMode.UVSetToUVSet:
-        _bind(node.uid(), 0)
+        bind(node.uid(), 0)
 
 
 def _keep_recorded(states):
@@ -864,12 +893,12 @@ def _keep_recorded(states):
 
 # -- answering a coming layout change -------------------------------------------------------
 
-def _save_mesh_map(texture_set_name, identifier, path):
+def save_mesh_map(texture_set_name, identifier, path):
     substance_painter.js.evaluate("alg.mapexport.saveMeshMap({0}, {1}, {2}, {{bitDepth: 32}})".format(
         json.dumps(texture_set_name), json.dumps(identifier), json.dumps(path.replace("\\", "/"))))
 
 
-def _convention_maps(texture_set, directory):
+def convention_maps(texture_set, directory):
     """The maps that tell which way the stored tangent maps point their green: the combined
     OpenGL normal export and the normal channel it is combined from, with a fill on top of
     everything for as long as they render -- the normal channel replaced by one leaning
@@ -927,7 +956,7 @@ def _file_of(url):
     return path if path and os.path.isfile(path) else ""
 
 
-def _normal_fills(fills, texture_set, staging, records):
+def normal_fills(fills, texture_set, staging, records):
     """Every fill of the Texture Set laying tangent normals through a chart, with where they
     come from, laid out in the chart the fill reads: a picture's own file while it is on
     disk, else the normals rendered as the fill lays them -- the picture as Painter reads
@@ -965,7 +994,7 @@ def _unprojected_pictures(unprojected, texture_set, problems):
     """Every picture an effect of the Texture Set reads with no projection of its own,
     other than its own mesh maps, with the file it is: each is laid out in the Texture Set's
     current layout. A picture that is no file on this computer any more is a problem."""
-    own = _mesh_map_pictures(texture_set)
+    own = mesh_map_pictures(texture_set)
     found = []
     for entry in unprojected:
         if texture_set.name not in entry.members:
@@ -1004,7 +1033,7 @@ def _render_own(node, path):
             node.set_blending_mode(layerstack.BlendingMode.Replace, normal)
             node.set_opacity(1.0, normal)
         if projection is not None:
-            _bind(node.uid(), 0)
+            bind(node.uid(), 0)
         substance_painter.js.evaluate("alg.mapexport.save([{0}, 'normal'], {1}, {{bitDepth: 32, "
                                       "padding: 'Passthrough'}})".format(
                                           layer.uid(), json.dumps(path.replace("\\", "/"))))
@@ -1050,7 +1079,7 @@ def _render_alone(stack, resource_id, path):
         layerstack.delete_node(layer)
 
 
-def _readings(texture_set, normal_fills, fills, staging):
+def readings(texture_set, normal_fills, fills, staging):
     """How Painter takes the green of the pictures of normals involved: each fill's own
     picture that is on disk, and a picture it has never seen -- which is what a picture
     Blender lays out anew comes in as. Painter takes a picture by the first use it is put
@@ -1105,12 +1134,12 @@ def answer(publisher, texture_set_name, request_number):
     readers_here += [{"uid": one.bound.uid, "index": 0, "members": [texture_set_name], "following": []}
                      for one in found]
     states = applied()
-    tables = _tables(states)
+    tables = tables_of(states)
     kept = sorted(dict((states.get(texture_set_name) or {}).get("mesh_maps") or {}))
     with publisher.staging() as staging:
         mesh_maps = {}
         convention = {}
-        normal_fills = []
+        laying = []
         frozen = []
         if texture_set is not None and not refused:
             frozen = paint_pixels.capture(found, staging)
@@ -1118,20 +1147,19 @@ def answer(publisher, texture_set_name, request_number):
                 if texture_set.get_mesh_map_resource(usage) is None:
                     continue
                 file_name = "{0}.exr".format(identifier)
-                _save_mesh_map(texture_set_name, identifier, str(staging.path(file_name)))
+                save_mesh_map(texture_set_name, identifier, str(staging.path(file_name)))
                 mesh_maps[usage.name] = {"file": file_name, "kind": kind}
-            normal_fills = _normal_fills(fills, texture_set, staging,
-                                         dict(project_facts.read(NORMALS_KEY) or {}))
-            pictured = [entry for entry in normal_fills if not entry["untouched"]]
+            laying = normal_fills(fills, texture_set, staging, dict(project_facts.read(NORMALS_KEY) or {}))
+            pictured = [entry for entry in laying if not entry["untouched"]]
             normal_paint = any(channel["space"] == "normal" for entry in frozen for channel in entry["channels"])
-            if normal_fills or normal_paint or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
-                convention = _convention_maps(texture_set, staging.directory)
+            if laying or normal_paint or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
+                convention = convention_maps(texture_set, staging.directory)
             if pictured:
-                convention["fresh"] = _readings(texture_set, pictured, fills, staging)
+                convention["fresh"] = readings(texture_set, pictured, fills, staging)
         fingerprint = dict(project_facts.read(SURFACE_KEY) or {}).get(texture_set_name, "")
         staging.publish(record_module.layout_answer(
             "Substance", texture_set_name, request_number, fingerprint, readers_here, tables,
-            kept, mesh_maps, normal_fills, pictures, convention, frozen,
+            kept, mesh_maps, laying, pictures, convention, frozen,
             paint_pixels.thawing(texture_set_name), refused))
     if refused:
         return "cannot change the layout of {0}: {1}".format(texture_set_name, refused)

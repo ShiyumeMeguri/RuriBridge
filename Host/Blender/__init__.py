@@ -19,6 +19,9 @@ The same verbs as Painter's end, from this side, and one table:
   Source UV holds to the one its Target UV holds (``layout_retarget``): the two maps
   swap on its faces, and Painter keeps every layer, reading what was laid out in the old
   layout through the map that holds it now.
+* Faces that moved into another Texture Set take their paint along with **Update Mesh**
+  (``guest_carry``): every surface goes one way (``surface_crossing``), and the record of
+  where each face's paint lives (``face_ledger``) follows once Painter holds it.
 
 Nothing is sent on its own. Every crossing is somebody pressing a button, here or
 in Painter, so a timer here only reads a few integers out of the mapped control
@@ -43,17 +46,17 @@ from ...Kernel import session as session_module
 from ...Kernel import summon as summon_module
 from ...Kernel import topic as topic_module
 
-from . import (chart_resample, fbx_surface, glb_ingest, layout_retarget, layout_triangles,
-               layouts, material_inputs, material_relayout, mesh_publish, pixels, shader_ingest,
-               slot_compose, texture_ingest)
+from . import (chart_resample, face_ledger, fbx_surface, glb_ingest, guest_carry, layout_retarget,
+               layout_triangles, layouts, material_inputs, material_relayout, mesh_publish, pixels,
+               shader_ingest, slot_compose, surface_crossing, texture_ingest)
 
 # Kernel.host is deliberately absent: it holds the bound driver, and reloading it
 # would clear the binding while everything that already imported it kept the old
 # module object -- "no application is bound", from the next call on.
 for _module in (arena_module, record_module, topic_module, session_module, layout_module,
-                glb_ingest, fbx_surface, layouts, mesh_publish, pixels, slot_compose,
+                glb_ingest, fbx_surface, layouts, face_ledger, mesh_publish, pixels, slot_compose,
                 texture_ingest, material_inputs, shader_ingest, chart_resample, layout_triangles,
-                material_relayout, layout_retarget):
+                material_relayout, surface_crossing, layout_retarget, guest_carry):
     importlib.reload(_module)
 
 LOG = log_module.logger("blender")
@@ -304,16 +307,36 @@ def project_frame(context):
 
 
 def send_mesh(context):
-    """Send the model. Painter keeps every layer it has: it only swaps the surface."""
+    """Send the model. Painter keeps every layer it has: it only swaps the surface -- and faces
+    that moved into another Texture Set take their paint along: Painter is asked first, and the
+    surface goes with its answer (``guest_carry``). Returns one line about it."""
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
     objects = mesh_publish.scope(context.view_layer)
     if not objects:
         raise RuntimeError("no visible mesh object to send")
-    generation = mesh_publish.publish(
-        CONNECTION.session.publisher(topic_module.MESH), objects, project_frame(context))
+    if guest_carry.waiting():
+        raise RuntimeError("the paint of faces moving between Texture Sets waits for Painter's answer")
+    painter = painter_state()
+    found = guest_carry.survey(objects, painter)
+    if found.problems:
+        raise RuntimeError("; ".join(found.problems))
+    if found.moves:
+        if not painter_is_attached():
+            raise RuntimeError("faces moved into other Texture Sets, and their paint goes along only while Painter "
+                               "is attached")
+        line = guest_carry.begin(CONNECTION.session, found)
+    else:
+        generation = surface_crossing.send(CONNECTION.session, context, project_frame(context), painter,
+                                           surface_crossing.Beside())
+        line = "sent the mesh, generation {0}".format(generation.number)
+    if found.relaid:
+        named = ", ".join("{0} ({1})".format(name, count) for name, count in sorted(found.relaid.items()))
+        LOG.warning("faces laid out anew in place since Painter last held them, so paint laid out in UV space "
+                    "no longer lies on them: %s", named)
+        line += "; faces laid out anew in place, without Retarget Layout: {0}".format(named)
     refresh_view(force=True)
-    return generation
+    return line
 
 
 def selected_texture_set(context):
@@ -426,6 +449,7 @@ def bind(texture_set, material_name):
         return "{0} now paints into {1}, with {2}".format(
             material.name, texture_set, ", ".join(one.name for one in owners))
     mesh_publish.paint_into(material, material.name)
+    face_ledger.rename(texture_set, material.name)
     _ask(record_module.ASK_TO_RENAME, renames={texture_set: material.name})
     refresh_view(force=True)
     return "asked Painter to call {0} {1}".format(texture_set, material.name)
@@ -455,16 +479,22 @@ def retarget_layout(context):
     if not texture_set:
         raise RuntimeError("{0} is kept out of Painter".format(material.name))
     settings = context.scene.ruri_bridge_retarget
+    found = guest_carry.survey(mesh_publish.scope(context.view_layer), painter_state())
+    if found.moves:
+        raise RuntimeError("faces moved into other Texture Sets; Update Mesh carries their paint first")
     return layout_retarget.begin(CONNECTION.session, texture_set, settings.source, settings.target)
 
 
 def follow_rename(material_name):
-    """A material renamed here: rename its Texture Set to match, and keep painting it."""
+    """A material renamed here: rename its Texture Set to match, and keep painting it -- with every
+    material that paints it, and every face whose paint lives in it."""
     material = bpy.data.materials.get(material_name)
     if material is None:
         raise RuntimeError("there is no material called {0!r} here".format(material_name))
     old = mesh_publish.texture_set_of(material)
-    mesh_publish.paint_into(material, material.name)
+    for one in mesh_publish.painted_by(old):
+        mesh_publish.paint_into(one, material.name)
+    face_ledger.rename(old, material.name)
     _ask(record_module.ASK_TO_RENAME, renames={old: material.name})
     refresh_view(force=True)
 
@@ -555,7 +585,10 @@ def _receive(topic, generation):
     if topic is topic_module.TEXTURES:
         if generation.kind == record_module.LAYOUT_ANSWER:
             line = layout_retarget.complete(bpy.context, CONNECTION.session, generation,
-                                            project_frame(bpy.context), textures_directory())
+                                            project_frame(bpy.context), textures_directory(), painter_state())
+        elif generation.kind == record_module.CARRY_ANSWER:
+            line = guest_carry.complete(bpy.context, CONNECTION.session, generation,
+                                        project_frame(bpy.context), painter_state())
         else:
             line = texture_ingest.ingest(generation)
         refresh_view(force=True)
@@ -571,7 +604,7 @@ def _receive(topic, generation):
         if not topic_module.can_answer(asked, HOST.capabilities):
             return None
         if asked == record_module.ASK_FOR_MESH:
-            return send_mesh(bpy.context).number
+            return send_mesh(bpy.context)
         if asked == record_module.ASK_TO_BIND:
             return bind(generation.record["texture_set"], generation.record["material"])
         if asked == record_module.ASK_FOR_SHADING:
@@ -647,6 +680,10 @@ def pump():
         if endpoint.topic is topic_module.PRESENCE:
             CONNECTION.peers[endpoint.peer] = payload
             remember_painter_executable(payload.get("host_executable"))
+            if endpoint.peer == PAINTER.name:
+                settled = surface_crossing.settle(payload)
+                if settled:
+                    say(settled)
             _tag_redraw()
         elif endpoint.topic is topic_module.SHADING:
             try:
@@ -791,12 +828,11 @@ class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
     def execute(self, context):
         try:
             started = _start_painter()
-            generation = send_mesh(context)
+            line = send_mesh(context)
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        say("sent the mesh{0}".format(
-            "; Painter is starting and takes it as it opens" if started else ""))
+        say("{0}{1}".format(line, "; Painter is starting and takes it as it opens" if started else ""))
         return {"FINISHED"}
 
 
@@ -1524,7 +1560,7 @@ class RURIBRIDGE_PT_layout(bpy.types.Panel):
             box.prop(settings, "source")
             box.prop(settings, "target")
         try:
-            table = layouts.table_of_texture_set(texture_set, layout_retarget.painted_by(texture_set))
+            table = layouts.table_of_texture_set(texture_set, mesh_publish.painted_by(texture_set))
         except Exception as error:
             _wrapped(layout, context, str(error), "ERROR")
             return

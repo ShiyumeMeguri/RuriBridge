@@ -79,9 +79,10 @@ def _tangents(mesh, uv_map):
     return tangent.reshape(-1, 3), sign
 
 
-def _split_copy(mesh, triangle_loops, normals, uv_maps):
+def _split_copy(mesh, triangle_loops, normals, coordinates):
     """The mesh with every face of more than four corners split into its triangles, as a
-    temporary mesh, and for each of the mesh's triangles the corners it became there."""
+    temporary mesh carrying ``coordinates`` -- per corner, by name -- as UV maps, and for each
+    of the mesh's triangles the corners it became there."""
     polygon_count = len(mesh.polygons)
     starts = numpy.empty(polygon_count, dtype=numpy.int64)
     mesh.polygons.foreach_get("loop_start", starts)
@@ -107,9 +108,9 @@ def _split_copy(mesh, triangle_loops, normals, uv_maps):
     faces.extend(vertex_of_loop[triangle_loops[one]].tolist() for one in split)
     copy = bpy.data.meshes.new("ruri_bridge_frames")
     copy.from_pydata(positions.reshape(-1, 3).tolist(), [], faces)
-    for name in uv_maps:
-        values = _coordinates(mesh, name)[source]
-        copy.uv_layers.new(name=name).uv.foreach_set("vector", values.reshape(-1))
+    for name, values in coordinates.items():
+        copy.uv_layers.new(name=name).uv.foreach_set(
+            "vector", numpy.ascontiguousarray(values[source], dtype=numpy.float32).reshape(-1))
     copy.normals_split_custom_set(normals[source])
     return copy, corners
 
@@ -121,9 +122,16 @@ def _frames_of(mesh, triangle_loops, normals, uv_maps):
     mesh.polygons.foreach_get("loop_total", totals)
     if (totals <= 4).all():
         return {name: tuple(values[triangle_loops] for values in _tangents(mesh, name)) for name in uv_maps}
-    copy, corners = _split_copy(mesh, triangle_loops, normals, uv_maps)
+    return frames_of(mesh, triangle_loops, normals, {name: _coordinates(mesh, name) for name in uv_maps})
+
+
+def frames_of(mesh, triangle_loops, normals, coordinates):
+    """Per corner of each of the mesh's triangles, the MikkTSpace tangent and bitangent sign each of
+    ``coordinates`` -- per corner of the mesh, by name -- gives it, as Blender's renderer computes
+    them: read through a copy carrying them as UV maps."""
+    copy, corners = _split_copy(mesh, triangle_loops, normals, coordinates)
     try:
-        return {name: tuple(values[corners] for values in _tangents(copy, name)) for name in uv_maps}
+        return {name: tuple(values[corners] for values in _tangents(copy, name)) for name in coordinates}
     finally:
         bpy.data.meshes.remove(copy)
 

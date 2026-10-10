@@ -56,13 +56,25 @@ def _folder():
     return _state["folder"]
 
 
+def folder():
+    """Where files the open project imports are kept until it closes."""
+    return _folder()
+
+
 def hold(path, digest):
-    """Where to import a delivered file from: the same bytes, under a name nothing
-    retires before the project closes."""
-    held = _folder() / (digest + os.path.splitext(path)[1])
+    """Where to import a delivered file from: the same bytes, under its own name in a folder
+    its digest names, which nothing retires before the project closes."""
+    held = _folder() / digest / os.path.basename(path)
     if not held.exists():
+        held.parent.mkdir(exist_ok=True)
         os.link(path, held)
     return str(held)
+
+
+def delivered(directory, entry):
+    """Where to import a file delivered beside a record from, ``entry`` naming it ``{"file",
+    "hash"}`` in the record's ``directory``."""
+    return hold(os.path.join(directory, entry["file"]), entry["hash"])
 
 
 def release():
@@ -74,6 +86,9 @@ def release():
         if entry.name == _LOCK_NAME:
             continue
         try:
-            entry.unlink()
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
         except OSError as error:
             LOG.warning("could not let go of %s: %s", entry.name, error)

@@ -30,7 +30,8 @@ import substance_painter.textureset
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import mesh_ingest, shader_state, slot_recipe
+from . import (guest_state, layout_state, material_seed, mesh_ingest, paint_pixels, project_facts, shader_state,
+               slot_recipe)
 
 LOG = logger("painter.textures")
 
@@ -437,6 +438,10 @@ def rename(renames):
         by_name[old].name = "__ruri_rename_{0}".format(index)
     for index, old in enumerate(sorted(wanted)):
         by_name[old].name = wanted[old]
+    layout_state.rename(wanted)
+    guest_state.rename(wanted)
+    material_seed.rename(wanted)
+    paint_pixels.rename(wanted)
     if wanted:
         LOG.info("renamed %s", ", ".join("{0} -> {1}".format(old, new)
                                          for old, new in sorted(wanted.items())))
@@ -456,7 +461,9 @@ def map_names(texture_set):
 
 
 def _texture_set_state(texture_set):
-    state = {"name": texture_set.name, "layers": mesh_ingest.layer_count(texture_set)}
+    resolution = texture_set.get_resolution()
+    state = {"name": texture_set.name, "layers": mesh_ingest.layer_count(texture_set),
+             "resolution": [resolution.width, resolution.height]}
     try:
         state["maps"] = map_names(texture_set)
     except TexturePublishError as error:
@@ -466,8 +473,9 @@ def _texture_set_state(texture_set):
 
 
 def current_project_state():
-    """What Painter has open: the project file, every Texture Set with its layers and the
-    maps an export of it writes, and the frame its surface lives in."""
+    """What Painter has open: the project file, every Texture Set with its layers, its resolution
+    and the maps an export of it writes, the frame its surface lives in and the fingerprints of the
+    surface it holds."""
     if not substance_painter.project.is_open():
         return record_module.presence("Substance", "")
     texture_sets = [_texture_set_state(texture_set)
@@ -475,4 +483,6 @@ def current_project_state():
     return record_module.presence(
         "Substance", substance_painter.project.file_path() or "(unsaved project)",
         texture_sets=sorted(texture_sets, key=lambda entry: entry["name"]),
-        frame_of_project=mesh_ingest.project_frame())
+        frame_of_project=mesh_ingest.project_frame(),
+        surface=project_facts.read(layout_state.SURFACE_KEY) or {},
+        guests={name: list(events) for name, events in guest_state.known().items()})

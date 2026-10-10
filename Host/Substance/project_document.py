@@ -9,7 +9,11 @@ surface, one made in the 2D view on the same UV coordinates -- on whatever the n
 puts there, or nowhere. A stroke made in 3D still takes its stamp from the UVs when its brush
 is aligned to them, sized in texture space or lays a material; a polygon fill clicked in the
 2D view picks polygons by UV position, and one filling UV chunks picks them by the UV islands.
-Content holding any of these is laid out in UV space, like a picture (``bound``).
+Content holding any of these is laid out in UV space, like a picture (``bound``). Every polygon
+fill, wherever it was clicked, is kept as the triangles of its Texture Set it picked, so none of
+it follows a face into another Texture Set (``bound`` with ``triangles``); and paint of any kind
+-- strokes, paths, polygon fills -- shows only in the Texture Set its layer belongs to
+(``painted``).
 
 The project file is HDF5: a small file system whose ``paint/document.bin`` is the document --
 every Texture Set, stack, layer and action -- in Painter's own self-describing stream. A
@@ -281,7 +285,7 @@ class Bound:
         self.reasons = reasons
 
 
-def _reasons(action):
+def _reasons(action, triangles):
     found = set()
     strokes = [stroke for stroke in action.get("strokes") or [] if stroke]
     paths = [stroke for stroke in action.get("strokes3D") or [] if stroke]
@@ -296,15 +300,26 @@ def _reasons(action):
         if (action.get("$type") != _STENCIL_PAINT and brush.get("$type") == _STAMP_BRUSH
                 and any(source and source.get("$type") != _UNIFORM for source in action.get("sourceColor") or [])):
             found.add("a brush laying a material")
-    for hit in action.get("hits") or []:
+    hits = action.get("hits") or []
+    for hit in hits:
         if hit.get("viewType") == VIEW_2D:
             found.add("polygon fills made in the 2D view")
         if hit.get("granularity") == GRANULARITY_UV_CHUNK:
             found.add("polygon fills of whole UV chunks")
+    if triangles and hits:
+        found.add("polygon fills, kept as the Texture Set's triangles")
     for item in (action.get("subStack") or {}).get("items") or []:
         if item:
-            found |= _reasons(item)
+            found |= _reasons(item, triangles)
     return found
+
+
+def _holds_paint(action):
+    if any(stroke for stroke in action.get("strokes") or []) or any(path for path in action.get("strokes3D") or []):
+        return True
+    if action.get("hits"):
+        return True
+    return any(_holds_paint(item) for item in (action.get("subStack") or {}).get("items") or [] if item)
 
 
 def _layers(items):
@@ -315,11 +330,11 @@ def _layers(items):
         yield from _layers((layer.get(_GROUP_LAYER_CHILDREN) or {}).get("items") or [])
 
 
-def bound(document, texture_set):
+def bound(document, texture_set, triangles=False):
     """Everything of one Texture Set laid out in UV space, ``[Bound]``: of every layer, the
     content and the mask -- the first action of each is the stack's own, every later one an
     effect -- each action holding strokes or polygon fills that take where they land from the
-    UVs."""
+    UVs; with ``triangles``, every action holding polygon fills as well."""
     found = []
     for material in document.get("materials") or []:
         if not material or material.get("sceneMaterialName") != texture_set:
@@ -328,8 +343,22 @@ def bound(document, texture_set):
             for layer in _layers(((stack or {}).get("stack") or {}).get("items") or []):
                 for mask, holder in ((False, layer.get("actions")), (True, layer.get("maskActions"))):
                     for index, action in enumerate((holder or {}).get("items") or []):
-                        reasons = _reasons(action) if action else set()
+                        reasons = _reasons(action, triangles) if action else set()
                         if reasons:
                             found.append(Bound(int(action["uid"]), int(layer["uid"]), mask, index == 0,
                                                sorted(reasons)))
+    return found
+
+
+def painted(document):
+    """The uids of every layer of the project whose content or mask holds paint of any kind:
+    strokes, paths or polygon fills."""
+    found = set()
+    for material in document.get("materials") or []:
+        for stack in (material or {}).get("stacks") or []:
+            for layer in _layers(((stack or {}).get("stack") or {}).get("items") or []):
+                actions = ((layer.get("actions") or {}).get("items") or []) + (
+                    (layer.get("maskActions") or {}).get("items") or [])
+                if any(action and _holds_paint(action) for action in actions):
+                    found.add(int(layer["uid"]))
     return found

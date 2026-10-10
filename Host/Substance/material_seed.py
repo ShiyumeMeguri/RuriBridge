@@ -34,8 +34,6 @@ Nothing is removed:
 
 from __future__ import annotations
 
-import os
-
 import substance_painter.layerstack as layerstack
 import substance_painter.project
 import substance_painter.resource
@@ -105,6 +103,13 @@ def seeded(names):
     return sorted(name for name in names if name in remembered)
 
 
+def rename(renames):
+    """Texture Sets renamed, old name to new: what the bridge stood up in each follows the name."""
+    seeded_now = _remembered()
+    if set(seeded_now) & set(renames):
+        _remember({renames.get(name, name): state for name, state in seeded_now.items()})
+
+
 def follow_mesh_maps(replaced):
     """A mesh map the bridge set and a layout change replaced with the same map laid out
     anew stays the bridge's: its record follows, so the next delivery replaces it as it
@@ -145,7 +150,7 @@ def _resource(item, directory, known, label):
         if substance_painter.resource.Resource.retrieve(identifier):
             return identifier.url()
     resource = project_imports.take_in(
-        held_imports.hold(os.path.join(directory, item["file"]), item["hash"]),
+        held_imports.delivered(directory, item),
         substance_painter.resource.Usage.TEXTURE, name=label)
     identifier = resource.identifier()
     known[item["input"]] = {"hash": item["hash"], "name": identifier.name,

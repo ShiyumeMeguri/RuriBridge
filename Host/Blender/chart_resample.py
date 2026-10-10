@@ -176,13 +176,14 @@ def _carried_block(vectors, weights, owners, frames):
     for axis, reciprocal in enumerate(across):
         carried[solvable, axis] = (numpy.sum(surface[solvable] * reciprocal[solvable], axis=1)
                                    / determinant[solvable])
-    length = numpy.linalg.norm(vectors, axis=1, keepdims=True)
-    return _unit(carried) * length
+    return _unit(carried)
 
 
 def _carried(vectors, weights, owners, frames):
     """Tangent-space normals decoded in the frames before, encoded in the frames after,
-    at the points ``weights`` place in the triangles ``owners``."""
+    at the points ``weights`` place in the triangles ``owners``: directions, at unit length.
+    A stored normal's length is no part of it -- Painter normalizes what it unpacks, and a
+    vector longer than one turned into new frames would leave what a picture can store."""
     out = numpy.empty_like(vectors)
     for start in range(0, len(vectors), _BLOCK):
         span = slice(start, start + _BLOCK)
@@ -238,15 +239,39 @@ def nearest(covered):
     return seed_row, seed_column
 
 
-def pad(picture, covered):
-    """Fill every texel no triangle covers with the value of the nearest one that is."""
+def pad(picture, covered, seeds=None):
+    """Fill every texel no triangle covers with the value of the nearest one that is; ``seeds``
+    are ``nearest(covered)`` when they are known already."""
     if covered.all() or not covered.any():
         return picture
-    seed_row, seed_column = nearest(covered)
+    seed_row, seed_column = seeds if seeds is not None else nearest(covered)
     filled = picture.copy()
     uncovered = ~covered
     filled[uncovered] = picture[seed_row[uncovered], seed_column[uncovered]]
     return filled
+
+
+def pad_near(picture, covered, steps):
+    """Fill every texel no triangle covers but one within ``steps`` texels of one that is with a
+    covered neighbour's value, a ring at a time; texels farther out keep what they hold."""
+    values = picture.copy()
+    known = covered.copy()
+    height, width = covered.shape
+    for _step in range(steps):
+        grown = known.copy()
+        for delta_row in (-1, 0, 1):
+            for delta_column in (-1, 0, 1):
+                if not delta_row and not delta_column:
+                    continue
+                target = (slice(max(0, -delta_row), height - max(0, delta_row)),
+                          slice(max(0, -delta_column), width - max(0, delta_column)))
+                source = (slice(max(0, delta_row), height - max(0, -delta_row)),
+                          slice(max(0, delta_column), width - max(0, -delta_column)))
+                taking = known[source] & ~grown[target]
+                values[target][taking] = values[source][taking]
+                grown[target] |= taking
+        known = grown
+    return values
 
 
 def _decoded(lanes, green):
@@ -296,6 +321,21 @@ def turned_apart(picture, triangles, frames, green=1.0):
     return _degrees(carried[:len(again)][both], carried[len(again):][both])
 
 
+def laid_at(picture, old_triangles, new_triangles, kind, frames=None, green=1.0, green_after=None, size=None):
+    """What ``relaid`` lays at the texel centres the new triangles cover, and nothing past them:
+    flat texel indices of a picture of ``size`` (width, height) and their values."""
+    picture = numpy.asarray(picture, dtype=numpy.float64)
+    height, width = picture.shape[:2]
+    out_width, out_height = size if size is not None else (width, height)
+    texels, owners, weights = rasterize(new_triangles, out_width, out_height)
+    old_triangles = numpy.asarray(old_triangles, dtype=numpy.float64)
+    old_uv = numpy.einsum("kc,kcd->kd", weights, old_triangles[owners])
+    values = (_nearest if kind == "label" else _bilinear)(picture, old_uv)
+    if kind == "tangent":
+        values = _carried_lanes(values, weights, owners, frames, green, green_after)
+    return texels, values
+
+
 def relaid(picture, old_triangles, new_triangles, kind, frames=None, green=1.0, green_after=None, size=None):
     """``picture`` (height, width, channels), laid out in ``old_triangles``, laid out
     again in ``new_triangles``; ``size`` is the (width, height) of the result, the
@@ -307,12 +347,8 @@ def relaid(picture, old_triangles, new_triangles, kind, frames=None, green=1.0, 
     picture = numpy.asarray(picture, dtype=numpy.float64)
     height, width = picture.shape[:2]
     out_width, out_height = size if size is not None else (width, height)
-    texels, owners, weights = rasterize(new_triangles, out_width, out_height)
-    old_triangles = numpy.asarray(old_triangles, dtype=numpy.float64)
-    old_uv = numpy.einsum("kc,kcd->kd", weights, old_triangles[owners])
-    values = (_nearest if kind == "label" else _bilinear)(picture, old_uv)
-    if kind == "tangent":
-        values = _carried_lanes(values, weights, owners, frames, green, green_after)
+    texels, values = laid_at(picture, old_triangles, new_triangles, kind, frames, green, green_after,
+                             (out_width, out_height))
     out = numpy.zeros((out_height * out_width, picture.shape[2]))
     out[texels] = values
     covered = numpy.zeros(out_height * out_width, dtype=bool)

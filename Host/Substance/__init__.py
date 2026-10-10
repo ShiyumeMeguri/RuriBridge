@@ -49,7 +49,7 @@ from ...Kernel import record as record_module
 from ...Kernel import session as session_module
 from ...Kernel import topic as topic_module
 
-from . import (held_imports, layout_state, material_seed, mesh_ingest, project_imports,
+from . import (guest_state, held_imports, layout_state, material_seed, mesh_ingest, project_imports,
                shader_state, texture_publish)
 
 LOG = log_module.logger("painter")
@@ -859,6 +859,11 @@ def _handle(topic, generation):
             _panel.set_status(layout_state.answer(
                 CONNECTION.session.publisher(topic_module.TEXTURES), record["texture_set"],
                 generation.number))
+            return False
+        if asked == record_module.ASK_TO_CARRY:
+            _panel.set_status(guest_state.answer(
+                CONNECTION.session.publisher(topic_module.TEXTURES), record["moves"],
+                set(record["emptied"]), generation.number))
             return False
         if asked == record_module.ASK_TO_RENAME:
             renamed = texture_publish.rename(generation.record.get("renames") or {})

@@ -31,7 +31,9 @@ its frame is measured and written.
 What preserving cannot carry is a polygon selection on faces that changed: Painter
 records it against the triangles of the Texture Set, so a face that moved to
 another Texture Set, or a quad re-triangulated, takes its part of the selection
-with it. That is Painter's own limit and the same with or without the bridge.
+with it. That is Painter's own limit and the same with or without the bridge. A
+face that moves into another Texture Set takes its paint along with the surface
+(``guest_state``), and a source left with no face goes with that surface.
 
 Everything here is asynchronous and refuses while Painter is busy, so each step is
 queued behind ``execute_when_not_busy`` and reports through a callback.
@@ -47,7 +49,7 @@ from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import layout_state, project_facts
+from . import guest_state, layout_state, project_facts
 
 LOG = logger("painter.mesh")
 
@@ -125,12 +127,18 @@ def incoming_texture_sets(record):
     return {name for entry in record.get("scene", []) for name in entry.get("texture_sets", {})}
 
 
+def emptied_texture_sets(record):
+    """The Texture Sets whose every face this payload carries into others, paint and all."""
+    return set((record.get("carry") or {}).get("emptied") or [])
+
+
 def would_lose(record):
     """Texture Sets with layers that nothing in this payload paints into."""
     incoming = incoming_texture_sets(record)
+    emptied = emptied_texture_sets(record)
     lost = []
     for texture_set in substance_painter.textureset.all_texture_sets():
-        if texture_set.name in incoming or texture_set.name in _allowed_drops:
+        if texture_set.name in incoming or texture_set.name in _allowed_drops or texture_set.name in emptied:
             continue
         layers = layer_count(texture_set)
         if layers:
@@ -194,8 +202,14 @@ def apply(generation, texture_resolution, on_finished=None):
 
     try:
         chosen = layout_state.plan(record, str(generation.directory))
-    except layout_module.LayoutError as error:
+        guests = guest_state.plan(record, str(generation.directory))
+        guest_state.before_surface(guests)
+    except (layout_module.LayoutError, guest_state.GuestError) as error:
         raise MeshIngestError("{0}. The mesh was not swapped".format(error)) from error
+    emptied = sorted(emptied_texture_sets(record))
+    if emptied:
+        LOG.info("%s keep no face and go with this swap, their paint carried where the faces went",
+                 ", ".join(emptied))
 
     def finished(status):
         _allowed_drops.clear()
@@ -205,6 +219,8 @@ def apply(generation, texture_resolution, on_finished=None):
             LOG.info("mesh generation %d swapped in", generation.number)
             try:
                 applied = layout_state.after_surface(chosen)
+                carried = guest_state.after_surface(guests)
+                layout_state.hold_surface(chosen.fingerprints)
             except Exception as error:
                 LOG.exception("mesh generation %d is in, but its layouts were not carried over: %s",
                               generation.number, error)
@@ -212,6 +228,8 @@ def apply(generation, texture_resolution, on_finished=None):
                     generation.number, error)
             else:
                 LOG.info("layouts: %s", applied.line)
+                if carried:
+                    LOG.info("guests: %s", carried)
         else:
             LOG.error("Painter refused mesh generation %d (%s); its log says why",
                       generation.number, status)
