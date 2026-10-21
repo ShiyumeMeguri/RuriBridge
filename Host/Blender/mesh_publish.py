@@ -190,23 +190,40 @@ def texture_set_rows(objects):
 
 @contextlib.contextmanager
 def surface_only(objects):
-    """Evaluate these objects as the surface, with render-time modifiers off.
+    """Evaluate these objects as the surface: render-time modifiers off, and every armature
+    that deforms them in its rest pose.
 
-    Switched off for the duration of one read and back on in ``finally``, so the
-    file holds exactly what it held before. Only modifiers that were on are
-    touched -- one the user had switched off stays off.
+    The surface crosses in the default pose of its rig and never in whatever frame of an
+    animation is showing: the far side paints one surface, the axes the shader reads off the
+    object (see ``object_basis``) are the rest ones, and a mesh that followed the animation
+    would be a different one from the axes it is sent with.
+
+    Everything is switched back in ``finally``, so the file holds exactly what it held before.
+    Only modifiers that were on are touched -- one the user had switched off stays off -- and
+    only an armature that was posing is put at rest.
     """
     switched = []
+    posed = []
     try:
         for object_reference in objects:
             for modifier in object_reference.modifiers:
                 if modifier.type in RENDER_TIME_MODIFIERS and modifier.show_viewport:
                     modifier.show_viewport = False
                     switched.append(modifier)
+            carriers = [modifier.object for modifier in object_reference.modifiers
+                        if modifier.type == 'ARMATURE' and modifier.show_viewport and modifier.object is not None]
+            if object_reference.parent is not None and object_reference.parent.type == 'ARMATURE':
+                carriers.append(object_reference.parent)
+            for carrier in carriers:
+                if carrier.data.pose_position == 'POSE' and carrier.data not in [held.data for held in posed]:
+                    carrier.data.pose_position = 'REST'
+                    posed.append(carrier)
         yield
     finally:
         for modifier in switched:
             modifier.show_viewport = True
+        for carrier in posed:
+            carrier.data.pose_position = 'POSE'
 
 
 # -- reading one object ----------------------------------------------------------

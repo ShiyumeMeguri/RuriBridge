@@ -18,6 +18,11 @@ What Painter does not have is not made up:
 
 * a lane whose channel this Painter stack lacks keeps what the material's own texture
   says there -- Painter has no opinion about it, so nothing changes;
+* a lane whose map is one flat value over the whole texture has nothing painted into it,
+  even when the texture's other lanes were painted: it keeps the material's own too.
+  Standing it up from the flat map would paint Painter's defaults over the material
+  (a specular level of one half over whatever the material had), and a texture one lane
+  of which is painted would take them all;
 * a lane the manifest keeps verbatim (a texture's leftover lanes) is the material's own;
 * a texture whose every map from Painter is one flat value has nothing painted into it,
   and the material keeps its own -- standing it up from a blank channel would paint
@@ -122,13 +127,24 @@ class _Painter:
         return True
 
 
-def _stand_up(recipe, painter, original, size):
+def flat_lanes(recipe, painter):
+    """The lanes of one texture whose map from Painter is one value over the whole texture."""
+    return {index for index, lane in enumerate(recipe)
+            if "raw" not in lane and lane["map"] and painter.flat([lane["map"]])}
+
+
+def _stand_up(recipe, painter, original, size, kept=frozenset()):
     """One texture's lanes per its recipe. ``original`` is the material's own texture in
-    this size, or None when the slot has none; returns (lanes, wide) or raises with why."""
+    this size, or None when the slot has none; ``kept`` are the lanes that hold what the
+    material's own texture says because nothing is painted into them. Returns
+    (lanes, wide) or raises with why."""
     height, width = size[1], size[0]
     planes = []
     wide = original is not None and original[1]
     for index, lane in enumerate(recipe):
+        if index in kept and original is not None:
+            planes.append(original[0][..., index])
+            continue
         if "raw" in lane:
             if original is None:
                 planes.append(numpy.full((height, width), lane["absent"], dtype=numpy.float32))
@@ -154,8 +170,8 @@ def _stand_up(recipe, painter, original, size):
     return numpy.stack(planes, axis=-1), wide
 
 
-def _needs_original(recipe):
-    return any("raw" in lane or not lane["map"] for lane in recipe)
+def _needs_original(recipe, kept=frozenset()):
+    return bool(kept) or any("raw" in lane or not lane["map"] for lane in recipe)
 
 
 def _colour_space(recipe, painter, original_image):
@@ -192,10 +208,12 @@ def compose(entry, directory, materials, declaration_key):
     report = {"taken": {}, "flat": False, "refused": dict(entry.get("slots_refused") or {})}
     painter = _Painter(directory, entry["maps"])
     recipes = {}
+    unpainted = {}
     for slot, recipe in entry["slots"].items():
         painted = sorted({lane["map"] for lane in recipe if "raw" not in lane and lane["map"]})
         if painted and not painter.flat(painted):
             recipes[slot] = recipe
+            unpainted[slot] = flat_lanes(recipe, painter)
     if not recipes:
         report["flat"] = True
         return report
@@ -211,7 +229,7 @@ def compose(entry, directory, materials, declaration_key):
             recipe = recipes[slot]
             original_image = held.get(slot)
             original = None
-            if _needs_original(recipe) and original_image is not None:
+            if _needs_original(recipe, unpainted[slot]) and original_image is not None:
                 path = pixels.file_of(original_image)
                 if not path:
                     report["refused"][slot] = "{0} keeps lanes of {1}, which is not a file".format(
@@ -224,7 +242,7 @@ def compose(entry, directory, materials, declaration_key):
                 if any(path == stem for path in written.values()):
                     stem = "{0}_{1}_{2}".format(name, material.name, slot.lstrip("_"))
                 try:
-                    lanes, wide = _stand_up(recipe, painter, original, size)
+                    lanes, wide = _stand_up(recipe, painter, original, size, unpainted[slot])
                 except RuntimeError as error:
                     report["refused"][slot] = str(error)
                     continue
