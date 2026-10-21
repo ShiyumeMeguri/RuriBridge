@@ -750,8 +750,10 @@ _presence_due = [False]
 
 
 def apply_shading(record):
-    """Put Blender's shading on the Texture Sets it names: the shader and every parameter,
-    and nothing else. Returns one line about it."""
+    """Put Blender's shading on the Texture Sets it names: the shader and every parameter, and the
+    textures the shader reads whole -- its ramps, lookups and masks. Those are parameters of the
+    shader and nothing is painted into them, so they travel with the shader and are not left to a
+    textures pull; no layer is touched. Returns one line about it."""
     if not substance_painter.project.is_open():
         return "a material arrived and no project is open"
     report = shader_state.apply_by_texture_set(
@@ -774,6 +776,16 @@ def apply_shading(record):
         LOG.info("%s takes same-named parameters only: %s", texture_set, why)
     for texture_set, problems in sorted(report["mismatched"].items()):
         LOG.warning("%s: not written, %s", texture_set, "; ".join(problems))
+    requests, skipped = _stand_up_requests(sorted(record.get("by_texture_set") or {}),
+                                           material_seed.SHADER_KINDS)
+    _say_skipped("shader textures", skipped)
+    if requests:
+        _ask(record_module.ASK_FOR_INPUTS, texture_sets=requests)
+        parts.append("asked for the shader textures of {0}".format(
+            _named([request["name"] for request in requests])))
+    if skipped:
+        parts.append("shader textures skipped: " + ", ".join(
+            "{0} ({1})".format(texture_set, why) for texture_set, why in sorted(skipped.items())))
     return "; ".join(parts)
 
 
