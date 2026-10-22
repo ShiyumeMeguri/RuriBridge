@@ -190,6 +190,8 @@ def plan_stack(preset_name, texture_set, stack, stem_suffix=""):
         document_names, other_names, channels = _map_sources(output_map, channels_by_name)
         key = _map_key(output_map.get("fileName", ""), document_names, other_names, index)
         if any(entry.key == key for entry in planned):
+            key = "_".join([key] + sorted(document_names or other_names))
+        if any(entry.key == key for entry in planned):
             raise TexturePublishError(
                 "preset {0!r} produces two maps that both resolve to the name {1!r} for "
                 "stack {2}; they would overwrite each other on disk".format(
@@ -361,6 +363,8 @@ def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False, 
         suffix = ""
         isolation = contextlib.nullcontext()
 
+    if not layer:
+        material_seed.reevaluate(texture_sets)
     with isolation:
         configuration, plan_by_stack = build_configuration(
             directory, preset_name, texture_sets, suffix)

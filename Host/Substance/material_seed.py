@@ -20,8 +20,8 @@ Nothing is removed:
   found again and refilled on the next sync, never stacked twice -- every layer somebody
   painted stays above it and keeps covering what it covered;
 * a channel the stack lacks is added, in the format the manifest states and, for a user
-  channel, labelled with the input's semantic name -- the label the importer gives it,
-  and the one Painter's export names the channel's file after;
+  channel, labelled with the input's label -- the label the importer gives it, and the
+  one Painter's export names the channel's file after;
 * a mesh map is set where the Texture Set has none and refreshed where it is the one the
   bridge set; a bake somebody made is not the bridge's to replace, and nothing is imported
   for it;
@@ -87,6 +87,41 @@ def _channel_type(identifier):
         if name.lower() == wanted:
             return getattr(textureset.ChannelType, name)
     raise LookupError("Painter has no channel called {0}".format(identifier))
+
+
+def _relabel_stale(stack, wanted):
+    """Labels follow slots. ``wanted`` is the label the manifest gives each user channel. A
+    channel wearing a label the manifest gives another slot is a label left over from
+    another generation of the shader's table: it takes its own slot's label, or none, so
+    no two channels of a stack share a label -- Painter names an export after it."""
+    taken = set(wanted.values())
+    for channel_type, channel in list(stack.all_channels().items()):
+        label = channel.label()
+        if label and label in taken and wanted.get(channel_type) != label:
+            stack.edit_channel(channel_type, channel.format(), wanted.get(channel_type, ""))
+
+
+def reevaluate(texture_sets):
+    """Make Painter evaluate these Texture Sets' stacks again, from what they hold now.
+
+    After a bulk change -- a model's channels added and its shaders recompiled all at once,
+    which on a card with 11 GB of memory runs it dry -- Painter can keep an evaluation of a
+    stack for exports that is half made, every lane of it one flat value, and nothing
+    invalidates it until the stack is edited. Hiding and showing the bridge's own layer, which a
+    bulk change touches in every stack it stood up, is that edit. Painter's evaluation going
+    wrong under load is the cause and is not mended here; this is the way out of it for now."""
+    remembered = _remembered()
+    for texture_set in texture_sets:
+        uid = (remembered.get(texture_set.name) or {}).get("layer")
+        if uid is None:
+            continue
+        try:
+            node = layerstack.get_node_by_uid(int(uid))
+        except ValueError:
+            continue
+        shown = node.is_visible()
+        node.set_visible(not shown)
+        node.set_visible(shown)
 
 
 def _remembered():
@@ -186,6 +221,8 @@ def apply(entry, directory):
     if manifest is None:
         raise LookupError("no manifest for {0} on this shelf".format(entry["shader"]))
     declared = {one["Id"]: one for one in manifest.get("inputs") or []}
+    _relabel_stale(stack, {_channel_type(one["Id"]): one["Label"] for one in declared.values()
+                           if one["Kind"] == "OverflowChannel" and one.get("Label")})
     seeded = _remembered()
     state = dict(seeded.get(name) or {})
     known = dict(state.get("inputs") or {})
@@ -219,7 +256,7 @@ def apply(entry, directory):
             continue
         channel_type = _channel_type(input_entry["Id"])
         if not stack.has_channel(channel_type):
-            label = input_entry.get("Semantic") if input_entry["Kind"] == "OverflowChannel" else None
+            label = input_entry.get("Label") if input_entry["Kind"] == "OverflowChannel" else None
             stack.add_channel(channel_type, getattr(textureset.ChannelFormat, input_entry["Format"]),
                               label)
             report["added_channels"].append(input_entry["Id"])
@@ -233,6 +270,9 @@ def apply(entry, directory):
             layer.set_source(channel_type, substance_painter.resource.ResourceID.from_url(url))
         state["layer"] = layer.uid()
         report["channels"] = sorted(str(one).split(".")[-1] for one in channels)
+    state["inputs"] = known
+    seeded[name] = state
+    _remember(seeded)
     if parameters:
         layout = shader_state.Layout()
         identifier = layout.instance_by_texture_set.get(name)
@@ -244,9 +284,6 @@ def apply(entry, directory):
         else:
             shader_state.set_parameters(identifier, parameters)
             report["parameters"] = sorted(parameters)
-    state["inputs"] = known
-    seeded[name] = state
-    _remember(seeded)
     for key, why in sorted(report["missing"].items()):
         LOG.warning("%s: %s not set: %s", name, key or "nothing", why)
     LOG.info("%s from %s: channels %s, mesh maps %s (kept %s), shader textures %s", name,
