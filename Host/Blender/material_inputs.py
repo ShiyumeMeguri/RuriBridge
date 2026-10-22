@@ -83,11 +83,12 @@ def bake(publisher, request, worn):
     """
     answered = []
     written = 0
-    with publisher.staging() as staging:
-        encode = []
+    with publisher.staging() as staging, concurrent.futures.ThreadPoolExecutor(
+            max_workers=os.cpu_count() or 4) as pool:
         for entry in request["texture_sets"]:
             files = []
             missing = {}
+            encode = []
             material = worn.get(entry["material"])
             held = _held_images(material) if material is not None else None
             if held is None:
@@ -111,19 +112,16 @@ def bake(publisher, request, worn):
                 name = "{0}_{1}.png".format(entry["name"], job["input"])
                 encode.append((staging.path(name), lanes, job["wide"] or wide))
                 files.append({"input": job["input"], "file": name})
+            digests = {}
+            for path, payload in pool.map(lambda job: (job[0], pixels.png(job[1], job[2])), encode):
+                with open(path, "wb") as handle:
+                    handle.write(payload)
+                digests[os.path.basename(str(path))] = hashlib.sha1(payload).hexdigest()
+                written += 1
+            for item in files:
+                item["hash"] = digests[item["file"]]
             answered.append({"name": entry["name"], "material": entry["material"],
                              "shader": entry["shader"], "inputs": files, "missing": missing})
-        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
-            encoded = list(pool.map(lambda job: (job[0], pixels.png(job[1], job[2])), encode))
-        digests = {}
-        for path, payload in encoded:
-            with open(path, "wb") as handle:
-                handle.write(payload)
-            digests[os.path.basename(str(path))] = hashlib.sha1(payload).hexdigest()
-            written += 1
-        for entry in answered:
-            for item in entry["inputs"]:
-                item["hash"] = digests[item["file"]]
         staging.publish(record_module.inputs("Blender", answered))
     refused = sum(len(entry["missing"]) for entry in answered)
     LOG.info("cut %d input(s) for %d Texture Set(s); %d not cut", written, len(answered), refused)
