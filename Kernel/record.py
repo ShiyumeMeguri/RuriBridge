@@ -18,13 +18,21 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 15
+FORMAT_VERSION = 16
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
 #: the channel a record arrived on.
 ASK_FOR_MESH = "mesh"
-ASK_FOR_TEXTURES = "textures"
+#: "State your materials for these Texture Sets": what is painted, rendered into the
+#: folder named, and the shading parameters it is painted with. Answered by the
+#: application with Texture Sets, on the textures topic and the shading topic -- one
+#: errand, because textures that arrive without the parameters they were painted with
+#: show something nobody painted.
+ASK_FOR_MATERIALS = "materials"
+#: "Render the layer you have selected, on its own": answered by the application with
+#: Texture Sets, on the textures topic, as images kept out of every material.
+ASK_FOR_LAYER = "layer"
 ASK_FOR_ANIMATION = "anim"
 #: "This Texture Set is painted by that material": answered by the application
 #: that owns the materials, because it is the one that names what crosses.

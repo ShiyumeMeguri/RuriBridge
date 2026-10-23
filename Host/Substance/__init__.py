@@ -7,14 +7,16 @@ one table:
 * **Update Mesh** -- Blender sends the surface, and it is swapped in under every
   layer the project already has; nothing else changes. A Texture Set with layers
   that nothing in the payload paints into stops the swap instead of being dropped.
-* **Pull / Push Shader** -- every Texture Set, or only the selected one, takes the
-  shader of the Blender material that paints it with every parameter; or gives its
-  parameters back to that material.
-* **Pull / Push Textures** -- every Texture Set, or only the selected one, is stood up
-  from the textures of the Blender material that paints it, where it runs the same
-  shader; or is exported into the Blender document's own textures folder, and Blender
-  puts the files into its materials. **Push Selected Layer** is Blender's Pull Selected
-  Layer. Each is the same as its opposite pressed in Blender.
+* **Pull Shader** -- every Texture Set, or only the selected one, takes the shader of
+  the Blender material that paints it with every parameter.
+* **Pull Textures** -- every Texture Set, or only the selected one, is stood up from the
+  textures of the Blender material that paints it, where it runs the same shader.
+* **Push Materials** -- every Texture Set, or only the selected one, is exported into the
+  Blender document's own textures folder and its shader parameters are stated beside the
+  files; Blender puts both into the materials that paint it, because textures that arrive
+  without the parameters they were painted with show something nobody painted. **Push
+  Selected Layer** is Blender's Pull Selected Layer. Each is the same as its opposite
+  pressed in Blender.
 * **Pull Into Selected Layer** -- one of the images a Blender material samples
   becomes the mask, or the reference fill, of the layer selected here. Blender has
   no layers, so that is the only shape anything coming this way can take, and it
@@ -263,17 +265,16 @@ def pull_shader(texture_sets=None):
     return asked, skipped
 
 
-def push_shader(texture_sets=None):
-    """Push the shader parameters every Texture Set here, or these, holds into the Blender
-    materials painting them. Blender's Pull Shader asks for exactly this. Returns the
-    Texture Sets pushed."""
-    if not CONNECTION.is_open:
-        raise RuntimeError("not attached to a bridge session")
+def _shading(texture_sets):
+    """The shading of every Texture Set here, or these: each one's shader instance with every
+    parameter it holds. Returns the record -- None when no Texture Set has an instance -- and the
+    Texture Sets that have none, with why."""
     layout = shader_state.Layout()
-    values, shaders, identities = {}, {}, {}
+    values, shaders, identities, bare = {}, {}, {}, {}
     for texture_set in _texture_sets(texture_sets):
         identifier = layout.instance_by_texture_set.get(texture_set)
         if identifier is None:
+            bare[texture_set] = "no shader instance, so no shader parameters"
             continue
         shader = layout.shader_by_instance.get(identifier, "")
         manifest = shader_state.shader_manifest(shader) if shader else None
@@ -281,11 +282,23 @@ def push_shader(texture_sets=None):
         shaders[texture_set] = shader
         identities[texture_set] = str((manifest or {}).get("identity") or "")
     if not values:
-        raise RuntimeError("none of those Texture Sets has a shader instance")
-    CONNECTION.session.writer(topic_module.SHADING).write(record_module.shading(
+        return None, bare
+    return record_module.shading(
         HOST.name, values, vocabulary_by_texture_set=shaders, shader_name_by_texture_set=shaders,
-        identity_by_texture_set=identities))
-    return sorted(values)
+        identity_by_texture_set=identities), bare
+
+
+def push_shader(texture_sets=None):
+    """Push the shader parameters every Texture Set here, or these, holds into the Blender
+    materials painting them: what a request for the shading is answered with. Returns the
+    Texture Sets pushed."""
+    if not CONNECTION.is_open:
+        raise RuntimeError("not attached to a bridge session")
+    shading, _bare = _shading(texture_sets)
+    if shading is None:
+        raise RuntimeError("none of those Texture Sets has a shader instance")
+    CONNECTION.session.writer(topic_module.SHADING).write(shading)
+    return sorted(shading["by_texture_set"])
 
 
 def _stand_up_requests(texture_sets, kinds):
@@ -331,13 +344,9 @@ def pull_textures(texture_sets=None):
     return [request["name"] for request in requests], skipped
 
 
-def push_textures(layer=False, directory=None, texture_sets=None):
-    """Push what is painted here into the Blender materials painting it: every Texture
-    Set, or these by name, exported into the folder Blender named; or the layer selected
-    here alone, which Blender keeps out of its materials. Blender's Pull Textures asks for
-    exactly this."""
-    if not CONNECTION.is_open:
-        raise RuntimeError("not attached to a bridge session")
+def _export(directory, texture_sets, layer):
+    """Render into the folder Blender named, or the one it last said its textures live in, and
+    publish what landed."""
     blender = blender_state()
     target = directory or blender.get("textures_directory") or ""
     if not target:
@@ -350,6 +359,31 @@ def push_textures(layer=False, directory=None, texture_sets=None):
         texture_sets=(None if texture_sets is None else
                       [substance_painter.textureset.TextureSet.from_name(name)
                        for name in texture_sets]))
+
+
+def push_materials(directory=None, texture_sets=None):
+    """Push what is painted here, and the shader parameters it is painted with, into the Blender
+    materials painting it: every Texture Set, or these by name -- the textures exported into the
+    folder Blender named, and the parameters of each one's shader instance beside them. Blender's
+    Pull Materials asks for exactly this. Returns the generation of the textures, the Texture Sets
+    whose parameters went, and the ones whose could not, with why."""
+    if not CONNECTION.is_open:
+        raise RuntimeError("not attached to a bridge session")
+    shading, bare = _shading(texture_sets)
+    _say_skipped("shader parameters", bare)
+    generation = _export(directory, texture_sets, False)
+    if shading is None:
+        return generation, [], bare
+    CONNECTION.session.writer(topic_module.SHADING).write(shading)
+    return generation, sorted(shading["by_texture_set"]), bare
+
+
+def push_layer(directory=None):
+    """Push the layer selected here, alone, into the folder Blender named: images, which Blender
+    keeps out of its materials. Blender's Pull Selected Layer asks for exactly this."""
+    if not CONNECTION.is_open:
+        raise RuntimeError("not attached to a bridge session")
+    return _export(directory, None, True)
 
 
 # -- pulling an image into the selected layer ----------------------------------------
@@ -503,15 +537,13 @@ class RuriBridgePanel(QtWidgets.QWidget):
             "Only the selected layer goes to Blender, as images kept out of the materials")
         layout.addWidget(self.mesh_button)
         actions = (
+            ("Push {0} Materials", "{0}'s paint and shader parameters go into the Blender "
+                                   "materials painting it", self._push_materials),
             ("Pull {0} Shader", "{0} takes the shader of the Blender material that paints it, "
                                 "with every parameter", self._pull_shader),
-            ("Push {0} Shader", "{0}'s shader parameters go into the Blender material that "
-                                "paints it", self._push_shader),
             ("Pull {0} Textures", "{0} is stood up from the textures of the Blender material "
                                   "that paints it, in a layer of its own under every other",
              self._pull_textures),
-            ("Push {0} Textures", "{0}'s paint goes into the Blender materials painting it",
-             self._push_textures),
         )
         for label, tip, act in actions:
             pair = QtWidgets.QHBoxLayout()
@@ -542,7 +574,7 @@ class RuriBridgePanel(QtWidgets.QWidget):
         layout.addWidget(self.status_label)
 
         self.mesh_button.clicked.connect(self._ask_for_mesh)
-        self.push_layer_button.clicked.connect(lambda: self._push_textures(False, layer=True))
+        self.push_layer_button.clicked.connect(self._push_layer)
         self.mask_button.clicked.connect(lambda: self._pull_image(True))
         self.reference_button.clicked.connect(lambda: self._pull_image(False))
         self._shown = None
@@ -673,14 +705,6 @@ class RuriBridgePanel(QtWidgets.QWidget):
         self.set_status(_with_skipped(
             "pulling the shader of {0} from Blender".format(_named(asked)), skipped))
 
-    def _push_shader(self, selected_only):
-        try:
-            pushed = push_shader(self._scope(selected_only))
-        except Exception as error:
-            self.set_status("could not push the shader: {0}".format(error))
-            return
-        self.set_status("pushed the shader of {0} to Blender".format(_named(pushed)))
-
     def _pull_textures(self, selected_only):
         try:
             asked, skipped = pull_textures(self._scope(selected_only))
@@ -690,17 +714,25 @@ class RuriBridgePanel(QtWidgets.QWidget):
         self.set_status(_with_skipped(
             "pulling the textures of {0} from Blender".format(_named(asked)), skipped))
 
-    def _push_textures(self, selected_only, layer=False):
+    def _push_materials(self, selected_only):
         try:
-            texture_sets = None if layer else self._scope(selected_only)
-            push_textures(layer=layer, texture_sets=texture_sets)
+            texture_sets = self._scope(selected_only)
+            _generation, _shaded, bare = push_materials(texture_sets=texture_sets)
         except Exception as error:
             LOG.error("push failed: %s", error)
             self.set_status("could not push: {0}".format(error))
             return
-        self.set_status("pushed {0} to Blender".format(
-            "the selected layer" if layer else
-            "the textures of " + (texture_sets[0] if texture_sets else "every Texture Set")))
+        self.set_status(_with_skipped("pushed the materials of {0} to Blender".format(
+            _named(_texture_sets(texture_sets))), bare))
+
+    def _push_layer(self):
+        try:
+            push_layer()
+        except Exception as error:
+            LOG.error("push failed: %s", error)
+            self.set_status("could not push: {0}".format(error))
+            return
+        self.set_status("pushed the selected layer to Blender")
 
     def _pull_image(self, as_mask):
         path = self.image_box.currentData()
@@ -841,13 +873,15 @@ def _handle(topic, generation):
         if not topic_module.can_answer(asked, HOST.capabilities):
             return False
         record = generation.record
-        if asked == record_module.ASK_FOR_TEXTURES:
-            push_textures(layer=record["layer"], directory=record["directory"],
-                          texture_sets=record["texture_sets"])
-            _panel.set_status("pushed {0} to Blender".format(
-                "the selected layer" if record["layer"] else
-                "the textures of " + _named(record["texture_sets"]) if record["texture_sets"]
-                else "the textures of every Texture Set"))
+        if asked == record_module.ASK_FOR_MATERIALS:
+            _generation, _shaded, bare = push_materials(
+                directory=record["directory"], texture_sets=record["texture_sets"])
+            _panel.set_status(_with_skipped("pushed the materials of {0} to Blender".format(
+                _named(_texture_sets(record["texture_sets"]))), bare))
+            return False
+        if asked == record_module.ASK_FOR_LAYER:
+            push_layer(directory=record["directory"])
+            _panel.set_status("pushed the selected layer to Blender")
             return False
         if asked == record_module.ASK_FOR_SHADING:
             _panel.set_status("pushed the shader of {0} to Blender".format(

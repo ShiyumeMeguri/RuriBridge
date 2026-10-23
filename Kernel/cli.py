@@ -376,15 +376,15 @@ def _body(*lines):
 def command_publish_mesh(arguments):
     lines = ["generation = module.send_mesh(bpy.context)",
              "print({0!r}, 'published', generation.number)".format(MARKER)]
-    if arguments.then_pull_textures:
-        lines += ["generation = module.pull_textures()",
+    if arguments.then_pull_materials:
+        lines += ["generation = module.pull_materials()",
                   "print({0!r}, 'requested', generation.number)".format(MARKER)]
     return _run_blender(arguments, _body(*lines))
 
 
 def command_request_export(arguments):
     return _run_blender(arguments, _body(
-        "generation = module.pull_textures()",
+        "generation = module.pull_materials()",
         "print({0!r}, 'requested', generation.number)".format(MARKER)))
 
 
@@ -407,20 +407,23 @@ def command_shaders(arguments):
     return 0
 
 
-def command_pull_textures(arguments):
-    """Ask Painter for its textures and wait for them to land in the materials."""
+def command_pull_materials(arguments):
+    """Ask Painter for its materials -- textures and shader parameters -- or, with ``--layer``,
+    its selected layer, and wait for them to land."""
     lines = [
-        "module.{0}()".format("pull_selected_layer" if arguments.layer else "pull_textures"),
+        "module.{0}()".format("pull_selected_layer" if arguments.layer else "pull_materials"),
+        "wanted = {0}".format("{'tex'}" if arguments.layer else "{'tex', 'shade'}"),
         "deadline = time.time() + {0}".format(arguments.timeout),
-        "received = []",
-        "while time.time() < deadline and not received:",
+        "received = set()",
+        "while time.time() < deadline and received != wanted:",
         "    for key, number, report in module.pump():",
         "        print({0!r}, key, number, report)".format(MARKER),
-        "        if key == 'tex':",
-        "            received.append(number)",
+        "        if key in wanted:",
+        "            received.add(key)",
         "    time.sleep(0.5)",
-        "if not received:",
-        "    raise SystemExit('no textures arrived within {0}s')".format(arguments.timeout),
+        "if received != wanted:",
+        "    raise SystemExit('{{}} did not arrive within {0}s'.format("
+        "', '.join(sorted(wanted - received))))".format(arguments.timeout),
     ]
     if arguments.save:
         lines += ["bpy.ops.wm.save_mainfile()",
@@ -614,8 +617,8 @@ def build_parser():
 
     publish = subparsers.add_parser("publish-mesh")
     add_blender_arguments(publish)
-    publish.add_argument("--then-pull-textures", action="store_true",
-                         help="ask for the textures right behind the mesh, from the same "
+    publish.add_argument("--then-pull-materials", action="store_true",
+                         help="ask for the materials right behind the mesh, from the same "
                               "Blender run, so both reach Painter in one batch")
     publish.set_defaults(handler=command_publish_mesh)
 
@@ -627,13 +630,13 @@ def build_parser():
     shaders.add_argument("--name", default=None, help="only parameters containing this text")
     shaders.set_defaults(handler=command_shaders)
 
-    pull = subparsers.add_parser("pull-textures")
+    pull = subparsers.add_parser("pull-materials")
     add_blender_arguments(pull)
     pull.add_argument("--layer", action="store_true",
                       help="only the layer selected in Painter")
     pull.add_argument("--timeout", type=float, default=180.0)
     pull.add_argument("--save", action="store_true", help="save the blend after ingesting")
-    pull.set_defaults(handler=command_pull_textures)
+    pull.set_defaults(handler=command_pull_materials)
 
     install = subparsers.add_parser("install")
     install.add_argument("--cascadeur",

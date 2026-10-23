@@ -151,7 +151,8 @@ TOPICS = (MESH, TEXTURES, INPUTS, ANIMATION, SHADING, PRESENCE, REQUEST)
 #: has the capability for without anybody editing a list of names.
 ANSWERED_WITH = {
     record_module.ASK_FOR_MESH: host_port.SCENE_GRAPH,
-    record_module.ASK_FOR_TEXTURES: host_port.TEXTURE_SETS,
+    record_module.ASK_FOR_MATERIALS: host_port.TEXTURE_SETS,
+    record_module.ASK_FOR_LAYER: host_port.TEXTURE_SETS,
     record_module.ASK_FOR_ANIMATION: host_port.ANIMATION,
     record_module.ASK_TO_BIND: host_port.SCENE_GRAPH,
     record_module.ASK_FOR_SHADING: host_port.SHADING_PARAMETERS,

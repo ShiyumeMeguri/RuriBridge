@@ -34,15 +34,14 @@ Cascadeur 收一份生成的入口脚本。一份代码,不复制、不分叉。
 **选中**在 Painter 里是当前选中的纹理集,在 Blender 里是活动物体的活动材质画进的那个纹理集;
 **全部**是每个纹理集。
 
-着色器和贴图分开推拉:
+Blender → Painter 的着色器和贴图分开推;Painter → Blender 的画和着色器参数一起拉,不分开:
 
 | 做什么 | Blender | Painter |
 |---|---|---|
 | 网格:只换网格本身 | Update Mesh | Update Mesh |
-| 着色器 + 全部参数:Blender → Painter | Push All / Selected Shader | Pull All / Selected Shader |
-| 着色器参数:Painter → Blender | Pull All / Selected Shader | Push All / Selected Shader |
-| 材质自己的贴图:Blender → Painter | Push All / Selected Textures | Pull All / Selected Textures |
-| Painter 画的 → Blender 的材质 | Pull All / Selected Textures | Push All / Selected Textures |
+| 着色器 + 全部参数:Blender → Painter | 推送全部 / 选中材质参数 | Pull All / Selected Shader |
+| 材质自己的贴图:Blender → Painter | 推送全部 / 选中贴图 | Pull All / Selected Textures |
+| Painter 画的 + 着色器参数 → Blender 的材质 | 拉取全部 / 选中材质 | Push All / Selected Materials |
 | Painter 选中的那一层 → Blender(只是图片) | Pull Selected Layer | Push Selected Layer |
 | 纹理集换到另一套 UV 布局,图层全留 | UV Layout ▸ Source UV / Target UV ▸ Retarget | — |
 | 面换了纹理集,画跟着面走 | Update Mesh(自动) | — |
@@ -57,12 +56,13 @@ Cascadeur 收一份生成的入口脚本。一份代码,不复制、不分叉。
   没有材质的面不发 —— 桥不替你建材质(建出来的名字没人起过,还会改掉物体的渲染);面板列出这些物体。
 - **着色器 Blender → Painter**:纹理集换上画它的那个材质的着色器,写入全部参数;身份不同只写同名
   参数(见下文「材质:身份决定搬多少」)。不碰图层、不碰贴图。材质不在生成着色器上的纹理集跳过并说明。
-- **着色器 Painter → Blender**:纹理集着色器实例上的参数,按材质自己的声明反向写回材质记录
-  (伽马色还原成作者值,材质常量不动);材质照记录更新。从库 link 进来的材质写不进去,先本地化。
 - **贴图 Blender → Painter**:按着色器清单把材质的贴图切进纹理集(见下文),只在货架上是同一代
   着色器时做;没有图层的纹理集(比如补回一张脸)就靠这一下初始化,然后在上面补画。
-- **贴图 Painter → Blender**:导出到 .blend 旁边的 `textures` 文件夹,接进画进那个纹理集的
-  材质里;生成材质按它自己着色器的贴图布局重新拼好再换进它的记录(见下文「贴图」)。
+- **材质 Painter → Blender**:一次拉回两样。贴图导出到 .blend 旁边的 `textures` 文件夹,接进画进那个
+  纹理集的材质里,生成材质按它自己着色器的贴图布局重新拼好再换进它的记录(见下文「贴图」);纹理集
+  着色器实例上的参数,按材质自己的声明反向写回材质记录(伽马色还原成作者值,材质常量不动),材质照
+  记录更新,从库 link 进来的材质写不进去,先本地化。两样不分开拉:贴图没带上画它时用的参数,
+  Blender 里就是另一个模样。没有着色器实例的纹理集只拉贴图,状态栏说明。
 - **选中的那一层**:单独导出,进来的是图片,不接进材质 —— 一层不是材质该显示的全部,接进去就把
   完整结果顶掉了。
 - **一张表**(Blender 面板):每个材质画进哪个纹理集,两边都能改。
@@ -404,7 +404,7 @@ python -m RuriBridge.Kernel.cli textures --into <目录>  # 列出 Painter 最�
 python -m RuriBridge.Kernel.cli sessions / remove
 python -m RuriBridge.Kernel.cli publish-mesh   --blender <blender.exe> --blend <场景>
 python -m RuriBridge.Kernel.cli request-export --blender <blender.exe> --blend <场景>
-python -m RuriBridge.Kernel.cli pull-textures  --blender <blender.exe> --blend <场景>
+python -m RuriBridge.Kernel.cli pull-materials --blender <blender.exe> --blend <场景>
 ```
 
 `verify-mesh` 是判据不是打印:每个面角都落在顶点 / UV / 法线表内,每个物体画进每个纹理集的面数

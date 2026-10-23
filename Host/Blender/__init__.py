@@ -5,12 +5,15 @@ The same verbs as Painter's end, from this side, and one table:
 
 * **Update Mesh** sends the model -- the surface somebody paints on -- and Painter
   swaps it in under every layer it already has; nothing else changes.
-* **Push / Pull Shader** -- every Texture Set, or the one the active material paints
-  into: the shader of the material that paints it, with every parameter, into Painter;
-  or Painter's parameters back into that material.
-* **Push / Pull Textures** -- the material's own textures stood up in Painter, where it
-  runs the same shader; or what is painted in Painter rendered into this document's
-  textures folder and put into the materials that paint into it.
+* **Push Shader** -- every Texture Set, or the one the active material paints into: the
+  shader of the material that paints it, with every parameter, into Painter.
+* **Push Textures** -- the material's own textures stood up in Painter, where it runs the
+  same shader.
+* **Pull Materials** -- every Texture Set, or the one the active material paints into: what
+  is painted in Painter rendered into this document's textures folder and put into the
+  materials that paint into it, with Painter's shader parameters written into those
+  materials -- one pull, because textures taken without the parameters they were painted
+  with show something nobody painted.
 * **Pull Selected Layer** asks Painter for the one layer selected over there, on
   its own, as images in the same folder.
 * **The table** is Painter's Texture Sets and the materials painting them: one each,
@@ -415,12 +418,6 @@ def _ask(what, **details):
         record_module.request(HOST.name, what, **details))
 
 
-def pull_shader(texture_sets=None):
-    """Pull Painter's shader parameters into the materials here: every Texture Set's, or
-    these. Painter's Push Shader does exactly this."""
-    return _ask(record_module.ASK_FOR_SHADING, texture_sets=texture_sets)
-
-
 def push_textures(texture_sets=None):
     """Push the materials' own textures into Painter: every Texture Set, or these, stood
     up from them where Painter runs the same shader. Painter's Pull Textures does exactly
@@ -428,18 +425,17 @@ def push_textures(texture_sets=None):
     return _ask(record_module.ASK_TO_TAKE_TEXTURES, texture_sets=texture_sets)
 
 
-def pull_textures(texture_sets=None):
-    """Pull what is painted in Painter into the materials here: every Texture Set, or
-    these, rendered into this document's textures folder. Painter's Push Textures does
-    exactly this."""
-    return _ask(record_module.ASK_FOR_TEXTURES, directory=_textures_folder(), layer=False,
+def pull_materials(texture_sets=None):
+    """Pull what is painted in Painter, and the shader parameters it is painted with, into the
+    materials here: every Texture Set, or these -- the textures rendered into this document's
+    textures folder, the parameters beside them. Painter's Push Materials does exactly this."""
+    return _ask(record_module.ASK_FOR_MATERIALS, directory=_textures_folder(),
                 texture_sets=texture_sets)
 
 
 def pull_selected_layer():
     """Ask Painter for the layer selected over there, on its own."""
-    return _ask(record_module.ASK_FOR_TEXTURES, directory=_textures_folder(), layer=True,
-                texture_sets=None)
+    return _ask(record_module.ASK_FOR_LAYER, directory=_textures_folder())
 
 
 def painter_texture_sets():
@@ -689,18 +685,20 @@ def pump():
     if not CONNECTION.is_open:
         return []
     handled = []
+    said = []
     for endpoint, generation in CONNECTION.session.incoming():
         try:
             result = _receive(endpoint.topic, generation)
             handled.append((endpoint.topic.key, generation.number, result))
             if isinstance(result, str):
-                say(result)
+                said.append(result)
             elif endpoint.topic is topic_module.TEXTURES:
-                say(_describe(result))
+                said.append(_describe(result))
         except Exception as error:
             LOG.error("%s generation %d from %s failed and is being skipped: %s",
                       endpoint.topic.key, generation.number, endpoint.peer, error)
-            say("{0} from {1} failed: {2}".format(endpoint.topic.key, endpoint.peer, error))
+            said.append("{0} from {1} failed: {2}".format(
+                endpoint.topic.key, endpoint.peer, error))
             handled.append((endpoint.topic.key, generation.number, None))
         endpoint.reader.acknowledge(generation)
     for endpoint, payload in CONNECTION.session.changed_state():
@@ -710,14 +708,19 @@ def pump():
             if endpoint.peer == PAINTER.name:
                 settled = surface_crossing.settle(payload)
                 if settled:
-                    say(settled)
+                    said.append(settled)
             _tag_redraw()
         elif endpoint.topic is topic_module.SHADING:
             try:
-                say(shader_ingest.take(payload, mesh_publish.scope(bpy.context.view_layer)))
+                line = shader_ingest.take(payload, mesh_publish.scope(bpy.context.view_layer))
             except Exception as error:
                 LOG.error("the shader from %s could not be taken: %s", endpoint.peer, error)
-                say("shader not taken: {0}".format(error))
+                line = "shader not taken: {0}".format(error)
+            handled.append((endpoint.topic.key, None, line))
+            said.append(line)
+    said = [line for line in said if line]
+    if said:
+        say("; ".join(said))
     return handled
 
 
@@ -888,24 +891,20 @@ def _pushed_shader(context, texture_sets, named):
     return line
 
 
-def _pulled_shader(_context, texture_sets, named):
-    pull_shader(texture_sets)
-    return "正在从 Painter 拉取 {0} 的材质参数".format(named)
-
-
 def _pushed_textures(_context, texture_sets, named):
     push_textures(texture_sets)
     return "正在把 {0} 的贴图推送到 Painter".format(named)
 
 
-def _pulled_textures(_context, texture_sets, named):
-    pull_textures(texture_sets)
-    return "正在从 Painter 拉取 {0} 的贴图".format(named)
+def _pulled_materials(_context, texture_sets, named):
+    pull_materials(texture_sets)
+    return "正在从 Painter 拉取 {0} 的材质(贴图和着色器参数)".format(named)
 
 
 class RURIBRIDGE_OT_push_shader(bpy.types.Operator):
     bl_idname = "ruri_bridge.push_shader"
-    bl_label = "推送材质参数"
+    verb, subject = "推送", "材质参数"
+    bl_label = verb + subject
     selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
 
     @classmethod
@@ -917,22 +916,10 @@ class RURIBRIDGE_OT_push_shader(bpy.types.Operator):
         return _scoped(self, context, _pushed_shader)
 
 
-class RURIBRIDGE_OT_pull_shader(bpy.types.Operator):
-    bl_idname = "ruri_bridge.pull_shader"
-    bl_label = "拉取材质参数"
-    selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
-
-    @classmethod
-    def description(cls, _context, properties):
-        return "把 Painter 里 {0} 的着色器参数写进这边画它的材质".format(_scope(properties))
-
-    def execute(self, context):
-        return _scoped(self, context, _pulled_shader)
-
-
 class RURIBRIDGE_OT_push_textures(bpy.types.Operator):
     bl_idname = "ruri_bridge.push_textures"
-    bl_label = "推送贴图"
+    verb, subject = "推送", "贴图"
+    bl_label = verb + subject
     selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
 
     @classmethod
@@ -944,18 +931,19 @@ class RURIBRIDGE_OT_push_textures(bpy.types.Operator):
         return _scoped(self, context, _pushed_textures)
 
 
-class RURIBRIDGE_OT_pull_textures(bpy.types.Operator):
-    bl_idname = "ruri_bridge.pull_textures"
-    bl_label = "拉取贴图"
+class RURIBRIDGE_OT_pull_materials(bpy.types.Operator):
+    bl_idname = "ruri_bridge.pull_materials"
+    verb, subject = "拉取", "材质"
+    bl_label = verb + subject
     selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
 
     @classmethod
     def description(cls, _context, properties):
-        return "把 Painter 里 {0} 画的内容拉回画它的材质:导出到本文档的贴图文件夹并接进这些材质".format(
-            _scope(properties))
+        return ("把 Painter 里 {0} 画的内容和着色器参数一起拉回画它的材质:贴图导出到本文档的"
+                "贴图文件夹并接进这些材质,参数写进这些材质".format(_scope(properties)))
 
     def execute(self, context):
-        return _scoped(self, context, _pulled_textures)
+        return _scoped(self, context, _pulled_materials)
 
 
 class RURIBRIDGE_OT_pull_selected_layer(bpy.types.Operator):
@@ -1408,6 +1396,16 @@ def _draw_table(layout):
             box.label(text=name, icon="MESH_DATA")
 
 
+def _draw_scoped(column, operator, icon):
+    """One operator's two buttons -- every Texture Set, or the active material's -- each naming
+    the act, the scope and what it acts on."""
+    row = column.row(align=True)
+    row.operator(operator.bl_idname, text=operator.verb + "全部" + operator.subject,
+                 icon=icon).selected = False
+    row.operator(operator.bl_idname,
+                 text=operator.verb + "选中" + operator.subject).selected = True
+
+
 class RURIBRIDGE_PT_panel(bpy.types.Panel):
     bl_label = "RuriBridge"
     bl_idname = "RURIBRIDGE_PT_panel"
@@ -1421,13 +1419,7 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         column = layout.column(align=True)
         column.enabled = attached
         column.scale_y = 1.3
-        for operator, icon in ((RURIBRIDGE_OT_pull_shader, "NODE_MATERIAL"),
-                               (RURIBRIDGE_OT_pull_textures, "IMPORT")):
-            row = column.row(align=True)
-            row.operator(operator.bl_idname, text="全部" + operator.bl_label[2:],
-                         icon=icon).selected = False
-            row.operator(operator.bl_idname,
-                         text="选中" + operator.bl_label[2:]).selected = True
+        _draw_scoped(column, RURIBRIDGE_OT_pull_materials, "IMPORT")
         column.operator(RURIBRIDGE_OT_pull_selected_layer.bl_idname, icon="RENDERLAYERS")
         if attached:
             _draw_table(layout)
@@ -1449,13 +1441,8 @@ class RURIBRIDGE_PT_push(bpy.types.Panel):
         column.enabled = CONNECTION.is_open
         column.scale_y = 1.3
         column.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
-        for operator, icon in ((RURIBRIDGE_OT_push_shader, "MATERIAL"),
-                               (RURIBRIDGE_OT_push_textures, "TEXTURE")):
-            row = column.row(align=True)
-            row.operator(operator.bl_idname, text="全部" + operator.bl_label[2:],
-                         icon=icon).selected = False
-            row.operator(operator.bl_idname,
-                         text="选中" + operator.bl_label[2:]).selected = True
+        _draw_scoped(column, RURIBRIDGE_OT_push_shader, "MATERIAL")
+        _draw_scoped(column, RURIBRIDGE_OT_push_textures, "TEXTURE")
 
 
 def _lane_text(lane):
@@ -1644,8 +1631,8 @@ class RURIBRIDGE_PT_cascadeur(bpy.types.Panel):
 
 
 _CLASSES = (RuriBridgePreferences, RuriBridgeRetargetSettings,
-            RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_push_shader, RURIBRIDGE_OT_pull_shader,
-            RURIBRIDGE_OT_push_textures, RURIBRIDGE_OT_pull_textures,
+            RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_push_shader, RURIBRIDGE_OT_push_textures,
+            RURIBRIDGE_OT_pull_materials,
             RURIBRIDGE_OT_pull_selected_layer, RURIBRIDGE_OT_bind, RURIBRIDGE_OT_drop_in_painter,
             RURIBRIDGE_OT_exclude, RURIBRIDGE_OT_retarget_layout,
             RURIBRIDGE_OT_map_texture, RURIBRIDGE_OT_invert_lane,
