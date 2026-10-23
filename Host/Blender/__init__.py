@@ -835,11 +835,9 @@ class RuriBridgePreferences(bpy.types.AddonPreferences):
 
 class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
     bl_idname = "ruri_bridge.send_mesh"
-    bl_label = "Update Mesh"
-    bl_description = ("Update the mesh in Painter: every visible mesh is swapped in under the layers "
-                      "Painter already has. A Texture Set whose material was renamed takes the new name, "
-                      "and faces painting another Texture Set take their paint along. A Texture Set with "
-                      "layers that nothing here paints into stops the swap")
+    bl_label = "更新网格"
+    bl_description = ("把所有可见网格换进 Painter,保留 Painter 已有的图层。材质改名的 Texture Set 会跟着改名,"
+                      "换了 Texture Set 的面会带着颜料一起走。有图层但这边没有任何材质在画的 Texture Set 会让替换中止")
 
     def invoke(self, context, event):
         refresh_view()
@@ -851,7 +849,7 @@ class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
         if not lines:
             return self.execute(context)
         return context.window_manager.invoke_confirm(
-            self, event, title="Update Mesh", message="; ".join(lines), confirm_text="Update")
+            self, event, title="更新网格", message="; ".join(lines), confirm_text="更新")
 
     def execute(self, context):
         try:
@@ -860,19 +858,19 @@ class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        say("{0}{1}".format(line, "; Painter is starting and takes it as it opens" if started else ""))
+        say("{0}{1}".format(line, ";Painter 正在启动,打开后会接收" if started else ""))
         return {"FINISHED"}
 
 
 def _scope(properties):
-    return "the active material's Texture Set" if properties.selected else "every Texture Set"
+    return "当前材质的 Texture Set" if properties.selected else "全部 Texture Set"
 
 
 def _scoped(operator, context, act):
     """Run one push or pull on every Texture Set, or the active material's, and say so."""
     try:
         texture_sets = [selected_texture_set(context)] if operator.selected else None
-        line = act(context, texture_sets, texture_sets[0] if texture_sets else "every Texture Set")
+        line = act(context, texture_sets, texture_sets[0] if texture_sets else "全部 Texture Set")
     except Exception as error:
         operator.report({"ERROR"}, str(error))
         return {"CANCELLED"}
@@ -882,39 +880,38 @@ def _scoped(operator, context, act):
 
 def _pushed_shader(context, texture_sets, named):
     rows, skipped = push_shader(context, texture_sets)
-    line = "pushed the shader of {0} to Painter".format(
-        named if texture_sets else "{0} Texture Set(s)".format(len(rows)))
+    line = "已把 {0} 的材质参数推送到 Painter".format(
+        named if texture_sets else "{0} 个 Texture Set".format(len(rows)))
     if skipped:
-        line += "; skipped " + ", ".join("{0} ({1})".format(texture_set, why)
+        line += ";已跳过 " + ", ".join("{0} ({1})".format(texture_set, why)
                                          for texture_set, why in sorted(skipped.items()))
     return line
 
 
 def _pulled_shader(_context, texture_sets, named):
     pull_shader(texture_sets)
-    return "pulling the shader of {0} from Painter".format(named)
+    return "正在从 Painter 拉取 {0} 的材质参数".format(named)
 
 
 def _pushed_textures(_context, texture_sets, named):
     push_textures(texture_sets)
-    return "pushing the textures of {0} to Painter".format(named)
+    return "正在把 {0} 的贴图推送到 Painter".format(named)
 
 
 def _pulled_textures(_context, texture_sets, named):
     pull_textures(texture_sets)
-    return "pulling the textures of {0} from Painter".format(named)
+    return "正在从 Painter 拉取 {0} 的贴图".format(named)
 
 
 class RURIBRIDGE_OT_push_shader(bpy.types.Operator):
     bl_idname = "ruri_bridge.push_shader"
-    bl_label = "Push Shader"
+    bl_label = "推送材质参数"
     selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
 
     @classmethod
     def description(cls, _context, properties):
-        return ("Put {0} in Painter on the shader of the material that paints it, with every "
-                "parameter. The same shader by identity takes the whole row; another shader "
-                "only the parameters both name".format(_scope(properties)))
+        return ("把 {0} 在 Painter 里设成画它的材质的着色器,带全部参数。同一着色器整行照搬,"
+                "不同着色器只推双方都有的参数".format(_scope(properties)))
 
     def execute(self, context):
         return _scoped(self, context, _pushed_shader)
@@ -922,13 +919,12 @@ class RURIBRIDGE_OT_push_shader(bpy.types.Operator):
 
 class RURIBRIDGE_OT_pull_shader(bpy.types.Operator):
     bl_idname = "ruri_bridge.pull_shader"
-    bl_label = "Pull Shader"
+    bl_label = "拉取材质参数"
     selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
 
     @classmethod
     def description(cls, _context, properties):
-        return ("Write the shader parameters Painter holds for {0} into the material that "
-                "paints it here".format(_scope(properties)))
+        return "把 Painter 里 {0} 的着色器参数写进这边画它的材质".format(_scope(properties))
 
     def execute(self, context):
         return _scoped(self, context, _pulled_shader)
@@ -936,14 +932,13 @@ class RURIBRIDGE_OT_pull_shader(bpy.types.Operator):
 
 class RURIBRIDGE_OT_push_textures(bpy.types.Operator):
     bl_idname = "ruri_bridge.push_textures"
-    bl_label = "Push Textures"
+    bl_label = "推送贴图"
     selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
 
     @classmethod
     def description(cls, _context, properties):
-        return ("Stand {0} up in Painter from the textures of the material that paints it, "
-                "in a layer of its own under every other, where Painter runs the same "
-                "shader".format(_scope(properties)))
+        return ("用画 {0} 的材质的贴图在 Painter 里立起一个独立图层,垫在其余图层之下,"
+                "前提是 Painter 跑的是同一着色器".format(_scope(properties)))
 
     def execute(self, context):
         return _scoped(self, context, _pushed_textures)
@@ -951,14 +946,13 @@ class RURIBRIDGE_OT_push_textures(bpy.types.Operator):
 
 class RURIBRIDGE_OT_pull_textures(bpy.types.Operator):
     bl_idname = "ruri_bridge.pull_textures"
-    bl_label = "Pull Textures"
+    bl_label = "拉取贴图"
     selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
 
     @classmethod
     def description(cls, _context, properties):
-        return ("Pull what is painted in Painter on {0} into the materials painting it: "
-                "exported into this document's textures folder and put into those "
-                "materials".format(_scope(properties)))
+        return "把 Painter 里 {0} 画的内容拉回画它的材质:导出到本文档的贴图文件夹并接进这些材质".format(
+            _scope(properties))
 
     def execute(self, context):
         return _scoped(self, context, _pulled_textures)
@@ -966,10 +960,8 @@ class RURIBRIDGE_OT_pull_textures(bpy.types.Operator):
 
 class RURIBRIDGE_OT_pull_selected_layer(bpy.types.Operator):
     bl_idname = "ruri_bridge.pull_selected_layer"
-    bl_label = "Pull Selected Layer"
-    bl_description = ("Have Painter export only the layer selected there, on its own, "
-                      "into this document's textures folder. It arrives as images and "
-                      "is not put into any material")
+    bl_label = "拉取选中图层"
+    bl_description = "让 Painter 单独导出它那边选中的图层到本文档的贴图文件夹,只以图片形式到达,不会接进任何材质"
 
     def execute(self, context):
         try:
@@ -977,7 +969,7 @@ class RURIBRIDGE_OT_pull_selected_layer(bpy.types.Operator):
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        say("asked Painter for its selected layer")
+        say("已向 Painter 请求选中图层")
         return {"FINISHED"}
 
 
@@ -1429,22 +1421,41 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         column = layout.column(align=True)
         column.enabled = attached
         column.scale_y = 1.3
-        column.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
-        for operator, icon in ((RURIBRIDGE_OT_push_shader, "MATERIAL"),
-                               (RURIBRIDGE_OT_pull_shader, "NODE_MATERIAL"),
-                               (RURIBRIDGE_OT_push_textures, "TEXTURE"),
+        for operator, icon in ((RURIBRIDGE_OT_pull_shader, "NODE_MATERIAL"),
                                (RURIBRIDGE_OT_pull_textures, "IMPORT")):
-            verb, noun = operator.bl_label.split(" ", 1)
             row = column.row(align=True)
-            row.operator(operator.bl_idname, text="{0} All {1}".format(verb, noun),
+            row.operator(operator.bl_idname, text="全部" + operator.bl_label[2:],
                          icon=icon).selected = False
             row.operator(operator.bl_idname,
-                         text="{0} Selected {1}".format(verb, noun)).selected = True
+                         text="选中" + operator.bl_label[2:]).selected = True
         column.operator(RURIBRIDGE_OT_pull_selected_layer.bl_idname, icon="RENDERLAYERS")
         if attached:
             _draw_table(layout)
         if _status[0]:
             layout.label(text=_status[0], icon="INFO")
+
+
+class RURIBRIDGE_PT_push(bpy.types.Panel):
+    bl_label = "推送(会覆盖 Painter,谨慎)"
+    bl_idname = "RURIBRIDGE_PT_push"
+    bl_parent_id = "RURIBRIDGE_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "RuriBridge"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        column = self.layout.column(align=True)
+        column.enabled = CONNECTION.is_open
+        column.scale_y = 1.3
+        column.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
+        for operator, icon in ((RURIBRIDGE_OT_push_shader, "MATERIAL"),
+                               (RURIBRIDGE_OT_push_textures, "TEXTURE")):
+            row = column.row(align=True)
+            row.operator(operator.bl_idname, text="全部" + operator.bl_label[2:],
+                         icon=icon).selected = False
+            row.operator(operator.bl_idname,
+                         text="选中" + operator.bl_label[2:]).selected = True
 
 
 def _lane_text(lane):
@@ -1642,7 +1653,7 @@ _CLASSES = (RuriBridgePreferences, RuriBridgeRetargetSettings,
             RURIBRIDGE_OT_start_painter, RURIBRIDGE_OT_reattach,
             RURIBRIDGE_OT_locate_painter, RURIBRIDGE_OT_locate_cascadeur,
             RURIBRIDGE_OT_send_animation, RURIBRIDGE_OT_fetch_animation,
-            RURIBRIDGE_PT_panel, RURIBRIDGE_PT_layout, RURIBRIDGE_PT_pull_mapping,
+            RURIBRIDGE_PT_panel, RURIBRIDGE_PT_push, RURIBRIDGE_PT_layout, RURIBRIDGE_PT_pull_mapping,
             RURIBRIDGE_PT_cascadeur)
 
 
