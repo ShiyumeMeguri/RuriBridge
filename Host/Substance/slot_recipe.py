@@ -38,13 +38,15 @@ def _exported(maps):
     return found
 
 
-def recipes(manifest, maps):
+def recipes(manifest, maps, paintable):
     """``({slot: [lane]}, {slot: why not})`` for this Texture Set's export.
 
-    A lane is ``{"map", "component", "operation", "encoding", "absent"}`` when an input
-    feeds it, ``map`` empty when this stack has no such channel; ``{"raw", "component",
-    "absent"}`` when it is a lane of the material's own texture the shader keeps
-    verbatim.
+    A lane is ``{"map", "component", "operation", "encoding", "absent", "paintable"}`` when
+    an input feeds it, ``map`` empty when this stack has no such channel; ``{"raw",
+    "component", "absent"}`` when it is a lane of the material's own texture the shader
+    keeps verbatim. ``paintable`` says whether anyone can paint the input: ``paintable`` is
+    the set of input ids whose channel this stack has, and an input that is only baked --
+    the occlusion -- is in none, so a map it varies in shows nothing was painted.
     """
     exported = _exported(maps)
     inputs = {entry["Id"]: entry for entry in manifest.get("inputs") or []}
@@ -82,7 +84,7 @@ def recipes(manifest, maps):
             source = BAKED_EXPORTS[baked] if baked else entry["Id"]
             lanes.append({"map": exported.get(source, ""), "component": int(lane["Component"]),
                           "operation": lane["Operation"], "encoding": entry["Encoding"],
-                          "absent": float(lane["Absent"])})
+                          "absent": float(lane["Absent"]), "paintable": entry["Id"] in paintable})
         else:
             slots[slot] = lanes
     return slots, refused

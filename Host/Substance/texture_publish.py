@@ -313,7 +313,7 @@ def _safe(name):
     return _UNSAFE_IN_FILE_NAMES.sub("_", name).strip("_") or "layer"
 
 
-def _attach_recipes(entry, shader, manifests):
+def _attach_recipes(entry, shader, manifests, stack):
     """Say how the generated shader this Texture Set's materials run is stood up again
     from this export, or why it is not. Only for the very shader on this shelf: another
     generation of it reads its channels differently, and a recipe written from the
@@ -328,7 +328,9 @@ def _attach_recipes(entry, shader, manifests):
         entry["slots_refused"] = {"": "{0} on this shelf is {1}, the material says {2}".format(
             shader["name"], shelved or "unstamped", shader["identity"] or "nothing")}
         return
-    entry["slots"], refused = slot_recipe.recipes(manifest, entry["maps"])
+    paintable = {one["Id"] for one in manifest.get("inputs") or []
+                 if material_seed.has_channel(stack, one["Id"])}
+    entry["slots"], refused = slot_recipe.recipes(manifest, entry["maps"], paintable)
     if refused:
         entry["slots_refused"] = refused
 
@@ -405,7 +407,7 @@ def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False, 
         }
         shader = (shaders or {}).get(texture_set.name)
         if shader is not None and not layer:
-            _attach_recipes(entry, shader, manifests)
+            _attach_recipes(entry, shader, manifests, stack)
         exported.append(entry)
     if not exported:
         raise TexturePublishError("the export wrote nothing: {0}".format(result.message))

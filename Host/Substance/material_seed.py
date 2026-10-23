@@ -94,6 +94,15 @@ def _channel_type(identifier):
     raise LookupError("Painter has no channel called {0}".format(identifier))
 
 
+def has_channel(stack, identifier):
+    """Whether this stack has the channel a manifest input is painted in. An input with no
+    channel of that name -- the occlusion, which Painter only bakes -- cannot be painted."""
+    try:
+        return stack.has_channel(_channel_type(identifier))
+    except LookupError:
+        return False
+
+
 def _relabel_stale(stack, wanted):
     """Labels follow slots. ``wanted`` is the label the manifest gives each user channel. A
     channel wearing a label the manifest gives another slot is a label left over from

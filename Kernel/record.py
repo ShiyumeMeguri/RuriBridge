@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 14
+FORMAT_VERSION = 15
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -264,8 +264,9 @@ def textures(source, document, directory, texture_sets):
 
     A Texture Set whose materials run a generated shader the texturing side holds
     the same generation of also carries ``slots``: for each texture that shader
-    samples, lane by lane, which exported map and component stands it up again and
-    through which operation -- or ``slots_refused``, saying why not.
+    samples, lane by lane, which exported map and component stands it up again, through
+    which operation, and whether anyone can paint the input -- or ``slots_refused``,
+    saying why not.
     """
     record = _base("tex", source)
     record.update({

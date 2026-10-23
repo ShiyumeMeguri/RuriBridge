@@ -27,7 +27,10 @@ What Painter does not have is not made up:
 * a texture whose every map from Painter is one flat value has nothing painted into it,
   and the material keeps its own -- standing it up from a blank channel would paint
   over the material with Painter's defaults. A Texture Set where that holds for every
-  texture is reported as having nothing painted at all.
+  texture is reported as having nothing painted at all;
+* a map that varies only because Painter bakes it -- the occlusion, an input with no channel
+  to paint in -- is no sign of paint either: a texture is stood up only when a lane
+  somebody can paint varies, so a texture the material never had is not made out of a bake.
 
 Values cross as stored: a byte of an sRGB channel stays the same byte in the texture,
 which is also how the import put it into the channel. Files are written directly, not
@@ -210,7 +213,8 @@ def compose(entry, directory, materials, declaration_key):
     recipes = {}
     unpainted = {}
     for slot, recipe in entry["slots"].items():
-        painted = sorted({lane["map"] for lane in recipe if "raw" not in lane and lane["map"]})
+        painted = sorted({lane["map"] for lane in recipe
+                          if "raw" not in lane and lane["map"] and lane["paintable"]})
         if painted and not painter.flat(painted):
             recipes[slot] = recipe
             unpainted[slot] = flat_lanes(recipe, painter)
