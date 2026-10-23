@@ -875,9 +875,12 @@ def adopt(layouts, fingerprints):
 
 
 def read_layout(node):
-    """Make a fill read its source through set 0, the Texture Set's own layout."""
-    if node.get_projection_mode() == layerstack.ProjectionMode.UVSetToUVSet:
-        bind(node.uid(), 0)
+    """Make a fill read its source through set 0, the Texture Set's own layout. Returns
+    whether the fill had to be changed."""
+    if node.get_projection_mode() != layerstack.ProjectionMode.UVSetToUVSet:
+        return False
+    bind(node.uid(), 0)
+    return True
 
 
 def _keep_recorded(states):

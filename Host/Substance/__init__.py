@@ -51,7 +51,7 @@ from ...Kernel import session as session_module
 from ...Kernel import topic as topic_module
 
 from . import (guest_state, held_imports, layout_state, material_seed, mesh_ingest, project_imports,
-               shader_state, texture_publish)
+               seeding, shader_state, texture_publish)
 
 LOG = log_module.logger("painter")
 
@@ -329,30 +329,6 @@ def pull_textures(texture_sets=None):
             "{0}: {1}".format(texture_set, why) for texture_set, why in sorted(skipped.items())))
     _ask(record_module.ASK_FOR_INPUTS, texture_sets=requests)
     return [request["name"] for request in requests], skipped
-
-
-def take_inputs(generation):
-    """Put a delivery of cut textures in place. Returns one line about it."""
-    reports = {}
-    failed = {}
-    for entry in generation.record["texture_sets"]:
-        try:
-            reports[entry["name"]] = material_seed.apply(entry, str(generation.directory))
-        except Exception as error:
-            LOG.error("%s could not be set up from Blender: %s", entry["name"], error)
-            failed[entry["name"]] = str(error)
-    channels = sum(len(report["channels"]) for report in reports.values())
-    mesh_maps = sum(len(report["mesh_maps"]) for report in reports.values())
-    parameters = sum(len(report["parameters"]) for report in reports.values())
-    missing = sum(len(report["missing"]) for report in reports.values())
-    line = ("set up {0} Texture Set(s) from Blender: {1} channel(s) in the Blender layer, "
-            "{2} mesh map(s), {3} shader texture(s)".format(len(reports), channels, mesh_maps,
-                                                            parameters))
-    if missing:
-        line += "; {0} input(s) not set (see the log)".format(missing)
-    if failed:
-        line += "; failed: " + ", ".join(sorted(failed))
-    return line
 
 
 def push_textures(layer=False, directory=None, texture_sets=None):
@@ -857,9 +833,9 @@ def _handle(topic, generation):
         if not substance_painter.project.is_open():
             _panel.set_status("textures arrived from Blender and no project is open")
             return False
-        _panel.set_status(take_inputs(generation))
-        _presence_due[0] = True
-        return False
+        _panel.set_status(seeding.begin(generation))
+        _presence_due[0] = not seeding.running()
+        return seeding.running()
     if topic is topic_module.REQUEST:
         asked = generation.record.get("for")
         if not topic_module.can_answer(asked, HOST.capabilities):
@@ -918,7 +894,7 @@ def pump():
                     "channel", MESH_LOAD_DEADLINE_SECONDS)
         _mesh_deadline[0] = None
     CONNECTION.session.touch()
-    if substance_painter.project.is_busy():
+    if seeding.running() or substance_painter.project.is_busy():
         return
     for endpoint, payload in CONNECTION.session.changed_state():
         if endpoint.topic is topic_module.PRESENCE:
@@ -945,6 +921,9 @@ def pump():
 def _on_timer():
     try:
         project_imports.settle_due(project_is_locked)
+        if seeding.running() and not substance_painter.project.is_busy():
+            _panel.set_status(seeding.advance(project_is_locked))
+            _presence_due[0] = not seeding.running()
         if _presence_due[0] and not substance_painter.project.is_busy():
             _presence_due[0] = False
             publish_presence()
@@ -971,6 +950,7 @@ def _on_project_changed(_event):
 
 
 def _on_project_closed(_event):
+    seeding.cancel()
     held_imports.release()
     project_imports.forget()
     _presence_due[0] = True

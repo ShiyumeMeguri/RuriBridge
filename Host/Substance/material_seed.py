@@ -30,6 +30,10 @@ Nothing is removed:
   next save (``project_imports``);
 * a texture is imported from where it is held until the project closes (``held_imports``),
   never from the delivery, which the transport retires before Painter may have read it.
+
+Painter computes a stack again for every write to it, one that changes nothing included, so
+only what differs from what the stack holds is written, and ``apply`` says how many writes
+it made: a Texture Set that took none leaves the engine idle.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from __future__ import annotations
 import substance_painter.layerstack as layerstack
 import substance_painter.project
 import substance_painter.resource
+import substance_painter.source as source_module
 import substance_painter.textureset as textureset
 
 from ...Kernel.log import logger
@@ -93,35 +98,16 @@ def _relabel_stale(stack, wanted):
     """Labels follow slots. ``wanted`` is the label the manifest gives each user channel. A
     channel wearing a label the manifest gives another slot is a label left over from
     another generation of the shader's table: it takes its own slot's label, or none, so
-    no two channels of a stack share a label -- Painter names an export after it."""
+    no two channels of a stack share a label -- Painter names an export after it. Returns
+    how many channels it edited."""
     taken = set(wanted.values())
+    edited = 0
     for channel_type, channel in list(stack.all_channels().items()):
         label = channel.label()
         if label and label in taken and wanted.get(channel_type) != label:
             stack.edit_channel(channel_type, channel.format(), wanted.get(channel_type, ""))
-
-
-def reevaluate(texture_sets):
-    """Make Painter evaluate these Texture Sets' stacks again, from what they hold now.
-
-    After a bulk change -- a model's channels added and its shaders recompiled all at once,
-    which on a card with 11 GB of memory runs it dry -- Painter can keep an evaluation of a
-    stack for exports that is half made, every lane of it one flat value, and nothing
-    invalidates it until the stack is edited. Hiding and showing the bridge's own layer, which a
-    bulk change touches in every stack it stood up, is that edit. Painter's evaluation going
-    wrong under load is the cause and is not mended here; this is the way out of it for now."""
-    remembered = _remembered()
-    for texture_set in texture_sets:
-        uid = (remembered.get(texture_set.name) or {}).get("layer")
-        if uid is None:
-            continue
-        try:
-            node = layerstack.get_node_by_uid(int(uid))
-        except ValueError:
-            continue
-        shown = node.is_visible()
-        node.set_visible(not shown)
-        node.set_visible(shown)
+            edited += 1
+    return edited
 
 
 def _remembered():
@@ -194,14 +180,14 @@ def _resource(item, directory, known, label):
 
 
 def _bridge_layer(stack, remembered_uid, material):
-    """The bridge's fill layer in this stack: the one made last time, else a new one at
-    the bottom, under everything already there."""
+    """The bridge's fill layer in this stack, and whether it had to be made: the one made
+    last time, else a new one at the bottom, under everything already there."""
     if remembered_uid is not None:
         try:
             node = layerstack.get_node_by_uid(int(remembered_uid))
             if (isinstance(node, layerstack.FillLayerNode)
                     and node.get_texture_set().name == stack.material().name):
-                return node
+                return node, False
         except ValueError:
             pass
     roots = layerstack.get_root_layer_nodes(stack)
@@ -209,11 +195,56 @@ def _bridge_layer(stack, remembered_uid, material):
                 else layerstack.InsertPosition.from_textureset_stack(stack))
     layer = layerstack.insert_fill(position)
     layer.set_name("Blender: {0}".format(material))
-    return layer
+    return layer, True
+
+
+def _same_resource(first, second):
+    """Whether two resource identifiers name the same bytes: by name and version, never by
+    the url, which carries the context the project was given when it was opened."""
+    return first.name == second.name and first.version == second.version
+
+
+def _reads(layer, channel_type, wanted):
+    """Whether this channel of the fill already reads this very resource."""
+    found = layer.get_source(channel_type)
+    return isinstance(found, source_module.SourceBitmap) and _same_resource(found.resource_id, wanted)
+
+
+def _fill(layer, channels):
+    """Make the fill's active channels, and what each reads, ``channels`` -- a resource url
+    per channel -- writing only what differs. Returns how many writes it made."""
+    writes = 0
+    if set(layer.active_channels) != set(channels):
+        layer.active_channels = set(channels)
+        writes += 1
+    for channel_type in sorted(channels, key=str):
+        wanted = substance_painter.resource.ResourceID.from_url(channels[channel_type])
+        if not _reads(layer, channel_type, wanted):
+            layer.set_source(channel_type, wanted)
+            writes += 1
+    return writes
+
+
+def _write_parameters(identifier, parameters):
+    """Give an instance these texture parameters -- a resource url per parameter -- where it
+    does not hold them already. Returns how many writes it made."""
+    held = shader_state.parameters(identifier)
+    changed = {}
+    for key, url in parameters.items():
+        current = (held.get(key) or {}).get("value")
+        wanted = substance_painter.resource.ResourceID.from_url(url)
+        if not current or not _same_resource(substance_painter.resource.ResourceID.from_url(current), wanted):
+            changed[key] = url
+    if changed:
+        shader_state.set_parameters(identifier, changed)
+    return len(changed)
 
 
 def apply(entry, directory):
-    """Put one Texture Set's delivered inputs in place. Returns what was done."""
+    """Put one Texture Set's delivered inputs in place. Returns what was done: how many edits
+    of the stack (``stack_writes``) and of the shader's texture parameters
+    (``parameter_writes``) Painter had to take in, and the bridge's layer (``layer``) when the
+    Texture Set has one."""
     name = entry["name"]
     texture_set = textureset.TextureSet.from_name(name)
     stack = texture_set.get_stack()
@@ -221,13 +252,15 @@ def apply(entry, directory):
     if manifest is None:
         raise LookupError("no manifest for {0} on this shelf".format(entry["shader"]))
     declared = {one["Id"]: one for one in manifest.get("inputs") or []}
-    _relabel_stale(stack, {_channel_type(one["Id"]): one["Label"] for one in declared.values()
-                           if one["Kind"] == "OverflowChannel" and one.get("Label")})
     seeded = _remembered()
     state = dict(seeded.get(name) or {})
     known = dict(state.get("inputs") or {})
     report = {"channels": [], "added_channels": [], "mesh_maps": [], "kept_mesh_maps": [],
-              "parameters": [], "missing": dict(entry.get("missing") or {})}
+              "parameters": [], "missing": dict(entry.get("missing") or {}), "stack_writes": 0,
+              "parameter_writes": 0, "layer": None}
+    report["stack_writes"] += _relabel_stale(
+        stack, {_channel_type(one["Id"]): one["Label"] for one in declared.values()
+                if one["Kind"] == "OverflowChannel" and one.get("Label")})
     channels = {}
     parameters = {}
     for item in entry["inputs"]:
@@ -248,6 +281,7 @@ def apply(entry, directory):
             if held is None or not _is_record(held, known[item["input"]]):
                 texture_set.set_mesh_map_resource(
                     usage, substance_painter.resource.ResourceID.from_url(url))
+                report["stack_writes"] += 1
             report["mesh_maps"].append(baked)
             continue
         url = _resource(item, directory, known, resource_name)
@@ -259,20 +293,21 @@ def apply(entry, directory):
             label = input_entry.get("Label") if input_entry["Kind"] == "OverflowChannel" else None
             stack.add_channel(channel_type, getattr(textureset.ChannelFormat, input_entry["Format"]),
                               label)
+            report["stack_writes"] += 1
             report["added_channels"].append(input_entry["Id"])
         channels[channel_type] = url
     if channels:
-        layer = _bridge_layer(stack, state.get("layer"), entry["material"])
+        layer, created = _bridge_layer(stack, state.get("layer"), entry["material"])
         # The material's textures are laid out in its current layout, which is set 0.
-        layout_state.read_layout(layer)
-        layer.active_channels = set(channels)
-        for channel_type, url in channels.items():
-            layer.set_source(channel_type, substance_painter.resource.ResourceID.from_url(url))
+        report["stack_writes"] += (int(created) + int(layout_state.read_layout(layer))
+                                   + _fill(layer, channels))
         state["layer"] = layer.uid()
+        report["layer"] = layer.uid()
         report["channels"] = sorted(str(one).split(".")[-1] for one in channels)
     state["inputs"] = known
-    seeded[name] = state
-    _remember(seeded)
+    if seeded.get(name) != state:
+        seeded[name] = state
+        _remember(seeded)
     if parameters:
         layout = shader_state.Layout()
         identifier = layout.instance_by_texture_set.get(name)
@@ -282,11 +317,12 @@ def apply(entry, directory):
                                            "first".format(running or "no shader", entry["shader"])
                                       for key in parameters})
         else:
-            shader_state.set_parameters(identifier, parameters)
+            report["parameter_writes"] += _write_parameters(identifier, parameters)
             report["parameters"] = sorted(parameters)
     for key, why in sorted(report["missing"].items()):
         LOG.warning("%s: %s not set: %s", name, key or "nothing", why)
-    LOG.info("%s from %s: channels %s, mesh maps %s (kept %s), shader textures %s", name,
-             entry["material"], report["channels"], report["mesh_maps"],
-             report["kept_mesh_maps"], report["parameters"])
+    LOG.info("%s from %s: channels %s, mesh maps %s (kept %s), shader textures %s; wrote %d to the "
+             "stack, %d to the shader", name, entry["material"], report["channels"],
+             report["mesh_maps"], report["kept_mesh_maps"], report["parameters"],
+             report["stack_writes"], report["parameter_writes"])
     return report

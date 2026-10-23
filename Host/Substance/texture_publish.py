@@ -363,8 +363,6 @@ def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False, 
         suffix = ""
         isolation = contextlib.nullcontext()
 
-    if not layer:
-        material_seed.reevaluate(texture_sets)
     with isolation:
         configuration, plan_by_stack = build_configuration(
             directory, preset_name, texture_sets, suffix)
