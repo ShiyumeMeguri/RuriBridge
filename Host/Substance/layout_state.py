@@ -6,7 +6,9 @@ identity UV transformation -- holds content made for one layout: a flattened mas
 baked or imported texture, the bridge's own layer of the Blender material. When the
 Texture Set moves to another layout it keeps its pixels and reads them through the
 old coordinates instead, with Painter's own UV-set-to-UV-set projection, so nothing
-is resampled into a picture that is not the one somebody made. What does not depend
+is resampled into a picture that is not the one somebody made. A fill that reads an anchor
+point of a canvas (``canvas_state``) is such a fill: the canvas holds, in the layout it was made
+in, everything the Texture Set was painted, and the Texture Set reads it through that layout. What does not depend
 on the layout is left to Painter: strokes and polygon fills are re-applied in 3D when
 the surface comes in, and the 3D projections never read UVs at all.
 
@@ -198,10 +200,17 @@ def _sources(node):
     return [node.get_source(None)]
 
 
+def _reads_canvas(source):
+    """Whether a source is a reference to an anchor point of a canvas: content laid out in the layout the canvas was made in. Painter's
+    interface hands over the anchor of a reference only when it lies in the Texture Set of the reference's own stack, and None for
+    the anchor of another Texture Set, which is what a canvas's is."""
+    return isinstance(source, source_module.SourceReference) and source.anchor is None
+
+
 def _reads_stack(source):
     """Whether a source reads the layer stack itself, which is laid out in set 0."""
     if isinstance(source, source_module.SourceReference):
-        return True
+        return not _reads_canvas(source)
     if isinstance(source, source_module.SourceSubstance):
         return any(_reads_stack(source.get_source(identifier)) for identifier in source.image_inputs)
     return False
@@ -232,7 +241,7 @@ def chart_index(node):
     else:
         return None
     sources = [source for source in _sources(node) if source is not None]
-    if not any(isinstance(source, _SPATIAL_SOURCES) for source in sources):
+    if not any(isinstance(source, _SPATIAL_SOURCES) or _reads_canvas(source) for source in sources):
         return None
     if any(_reads_stack(source) for source in sources):
         return None
