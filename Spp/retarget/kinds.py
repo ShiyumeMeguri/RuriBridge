@@ -20,6 +20,8 @@ def _holds_3d_keys(item):
 MESH_BOUND = (
     ("strokes kept as keys in space", _holds_3d_keys),
     ("strokes with several symmetry duplicates", lambda item: item.type == "DataStroke" and item.number("duplicateCount") > 1),
+    ("clone and projection paint, whose source places are not moved",
+     lambda item: item.type in ("DataActionClone", "DataActionPaintProj") and len(item["strokes"]) > 0),
 )
 
 #: The UV layout changed and the mesh stayed: paint that follows the layout and is not moved.
