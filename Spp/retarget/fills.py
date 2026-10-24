@@ -27,17 +27,21 @@ from .. import stream
 
 FILL = "DataActionFill"
 UV_PROJECTION = 0
+#: The projection that fits the content to each UV tile: it lays the content through the UV layout as the UV projection does.
+TILE_PROJECTION = 6
 UV_SET_TO_UV_SET = 9
+LAYOUT_PROJECTIONS = (UV_PROJECTION, TILE_PROJECTION)
 SPACE_PROJECTIONS = (1, 2, 3, 4, 7)
 #: The share of the surface that has to have moved as one rigid body for the frames to follow it.
 MAJORITY = 0.6
 
 
 def follow_layout(material, context):
-    """Lay every fill that goes through the UV layout through the set that holds the layout it was painted in."""
+    """Lay every fill that goes through the UV layout (the UV projection and the one that fits the content to each UV tile)
+    through the set that holds the layout it was painted in."""
     counts = Counter()
     for item in stream.walk(material):
-        if item.type != FILL or item.number("projection") != UV_PROJECTION:
+        if item.type != FILL or item.number("projection") not in LAYOUT_PROJECTIONS:
             continue
         item.set_number("projection", UV_SET_TO_UV_SET)
         item.set_number("uvTransferChannel", context.source_set)
