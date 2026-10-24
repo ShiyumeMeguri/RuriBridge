@@ -66,7 +66,9 @@ surface; the tables applied last live in the project, beside the layers they
 describe. Before a surface goes in, ``plan`` works out where every chart-addressed
 fill reads from afterwards -- a fill shared through instance layers is one node read
 by several Texture Sets, and has to keep each of them where it was -- and refuses,
-naming the layers, when that is impossible. The mesh maps belong to set 0, so a
+naming the layers, when that is impossible. A canvas lies on the surface it was made on for good, so it
+holds the very UV sets it reads at, and a fill it shows -- through instance layers -- stays where it is for it
+(``pins``). The mesh maps belong to set 0, so a
 Texture Set that changes layout takes the maps laid out in its new chart: the ones
 Blender sends with the surface, or the ones the project kept for that chart from
 before. Maps of a chart the project no longer reads are not kept.
@@ -412,21 +414,38 @@ def readers():
     generator the bridge can carry as such a fill; and every picture an effect it does not
     carry reads with no projection of its own. A generator other Texture Sets show too stays a
     generator, its mesh map inputs being each Texture Set's own; so does a turned tile
-    laying normals they show."""
+    laying normals they show. A canvas shows a fill too -- through the instance layers it holds
+    -- and is one of its members; what only canvases show is left out: it never moves."""
     found = {}
     unprojected = {}
     mesh_maps = {}
-    for texture_set in canvas_state.held():
-        mesh_maps[texture_set.name] = mesh_map_pictures(texture_set)
+    canvases = set(canvas_state.names())
+    for texture_set in textureset.all_texture_sets():
+        if texture_set.name not in canvases:
+            mesh_maps[texture_set.name] = mesh_map_pictures(texture_set)
         for stack in texture_set.all_stacks():
             _visit(layerstack.get_root_layer_nodes(stack), texture_set.name, found, unprojected)
-    fills = [entry for entry in found.values() if entry is not None and not (
+    fills = [entry for entry in found.values() if entry is not None and entry.members - canvases and not (
         len(entry.members) > 1 and (entry.generator or (entry.turn and entry.normal is not None)))]
     for fill in fills:
         fill.following = (set() if fill.generator else
                           {member for member in fill.members if fill.pictures & mesh_maps.get(member, set())})
     carried = {fill.uid for fill in fills if fill.generator}
-    return fills, [entry for uid, entries in unprojected.items() if uid not in carried for entry in entries]
+    return fills, [entry for uid, entries in unprojected.items() if uid not in carried for entry in entries
+                   if entry.members - canvases]
+
+
+def pins(fills):
+    """The tables of the canvases that show some of these fills: a canvas holds, at each UV set a fill reads it at, a chart of
+    its own and none of the others, so that fill keeps reading that set for it whatever any other Texture Set asks."""
+    canvases = set(canvas_state.names())
+    shown = {}
+    for fill in fills:
+        for member in fill.members & canvases:
+            shown.setdefault(member, set()).add(fill.index)
+    return {canvas: {"layout": "{0}#0".format(canvas),
+                     "extra": {str(index): "{0}#{1}".format(canvas, index) for index in sorted(indexes) if index}}
+            for canvas, indexes in shown.items()}
 
 
 # -- what the project applied last ------------------------------------------------------
@@ -491,8 +510,9 @@ def plan(record, directory):
     changed = sorted(name for name in desired
                      if desired[name] != layout_module.charts(before.get(name)))
     fills, unprojected = readers()
+    frozen = pins(fills)
     moves = layout_module.rebind([(fill.uid, fill.index, fill.members, fill.following) for fill in fills],
-                                 before, desired, int(record.get("uv_sets") or 1))
+                                 dict(before, **frozen), dict(desired, **frozen), int(record.get("uv_sets") or 1))
     problems = []
     relayouts = {}
     for name in changed:
@@ -1102,7 +1122,7 @@ def answer(publisher, texture_set_name, request_number):
                      "following": sorted(fill.following)}
                     for fill in fills if texture_set_name in fill.members]
     states = applied()
-    tables = tables_of(states)
+    tables = dict(tables_of(states), **pins(fills))
     kept = sorted(dict((states.get(texture_set_name) or {}).get("mesh_maps") or {}))
     with publisher.staging() as staging:
         mesh_maps = {}
