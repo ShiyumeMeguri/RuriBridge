@@ -4,6 +4,7 @@
     python -m RuriBridge.Spp.cli materials PROJECT
     python -m RuriBridge.Spp.cli clone PROJECT SOURCE NAME [--out PATH]
     python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL... --anchor uv|surface --old SCENE [--source-set N] [--out PATH]
+    python -m RuriBridge.Spp.cli split PROJECT SOURCE NAME --new SCENE [--out PATH]
 
 ``clone`` adds a material called NAME that is a copy of the material called SOURCE, with its stacks, layers,
 brushes and strokes, to the project at PATH -- or to PROJECT itself when there is no ``--out``.
@@ -13,6 +14,10 @@ the paint was made on: SCENE is that surface, a project file or a ``scene.assbin
 layout stayed and the mesh changed, ``--anchor surface`` that the mesh stayed and the layout changed.
 ``--source-set`` is the UV set of PROJECT's mesh that holds the layout the paint was made in; fills laid through
 the UV layout follow the surface to the new layout by way of it.
+
+``split`` adds a material called NAME that is a copy of SOURCE and takes out of it the strokes, polygon fills and layers that
+cannot touch the polygons NAME has in SCENE -- the scene (a project file or a ``scene.assbin``) of the mesh the material was
+split on, whose UV layout is PROJECT's own.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ def _clone(arguments):
     return {"cloned": arguments.source, "name": arguments.name, "uid": uid, "project": arguments.out or arguments.project}
 
 
-def _old_scene(path):
+def _scene_bytes(path):
     if path.lower().endswith(".spp"):
         with project.Project(path) as opened:
             return opened.read(project.SCENE)
@@ -47,10 +52,18 @@ def _old_scene(path):
 
 def _retarget(arguments):
     from .retarget import job
-    old = _old_scene(arguments.old)
+    old = _scene_bytes(arguments.old)
     with project.edited(arguments.project, arguments.out) as changing:
         report = job.run(changing, old, arguments.materials, arguments.anchor, arguments.uv_set, arguments.source_set)
     return {"anchor": arguments.anchor, "project": arguments.out or arguments.project, "report": report}
+
+
+def _split(arguments):
+    from .retarget import job
+    new = _scene_bytes(arguments.new)
+    with project.edited(arguments.project, arguments.out) as changing:
+        report = job.split(changing, changing.read(project.SCENE), new, arguments.source, arguments.name, arguments.uv_set)
+    return {"split": arguments.source, "name": arguments.name, "project": arguments.out or arguments.project, "report": report}
 
 
 def main(argv=None):
@@ -74,6 +87,14 @@ def main(argv=None):
     retargeting.add_argument("--source-set", type=int)
     retargeting.add_argument("--out")
     retargeting.set_defaults(run=_retarget)
+    splitting = commands.add_parser("split", help="copy a material under a new name and clean it for the polygons it has now")
+    splitting.add_argument("project")
+    splitting.add_argument("source")
+    splitting.add_argument("name")
+    splitting.add_argument("--new", required=True)
+    splitting.add_argument("--uv-set", type=int, default=0)
+    splitting.add_argument("--out")
+    splitting.set_defaults(run=_split)
     arguments = parser.parse_args(argv)
     json.dump(arguments.run(arguments), sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
