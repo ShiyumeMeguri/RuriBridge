@@ -63,8 +63,13 @@ COMPLAINT_NAME = "complaint.log"
 EVENTS_NAME = "events.json"
 #: The name the project as it stood before a swap is kept under.
 KEPT_NAME = "kept.spp"
+#: What a surface that asks for its paint to be repaired says stayed: every layout (the mesh changed), or the mesh (a layout changed).
+UV = "uv"
+SURFACE = "surface"
 #: The file of the surface a project with canvases is sent, canvases' surfaces included.
 COMBINED_NAME = "combined.fbx"
+#: The uids of layers that the bridge keeps facts about, which a canvas takes along under uids of their own.
+FOLLOW_NAME = "follow.json"
 #: How long what a Painter left in its folder waits before another sweeps it away.
 STALE_SECONDS = 24 * 3600.0
 #: Ticks a save or a close is given to announce itself before the project is asked whether it is done.
@@ -86,7 +91,7 @@ class _Repair:
 
     __slots__ = ("texture_sets", "interpreter", "project", "directory", "old", "held", "surface", "edited", "commands",
                  "resume", "fail", "stages", "index", "entered", "called", "ticks", "scouted", "swapped", "opened",
-                 "process", "started", "streams", "report", "line", "said", "inside", "reason")
+                 "process", "started", "streams", "report", "line", "said", "inside", "reason", "followed")
 
     def __init__(self, texture_sets, interpreter, project_path, directory, old, held, surface, edited, commands, stages,
                  swapped, resume, fail):
@@ -117,6 +122,7 @@ class _Repair:
         self.said = ""
         self.inside = False
         self.reason = ""
+        self.followed = None
 
 
 _current = [None]
@@ -164,17 +170,19 @@ def needed(record):
     return bool(record) or bool(canvas_state.names())
 
 
-def begin(generation, record, interpreter, resume, fail):
+def begin(generation, record, interpreter, resume, fail, follow=(), followed=None):
     """Take a repair in hand: ``record`` is what the surface asks to have repaired (see ``record.mesh``), or None for a surface that asks
     nothing and goes into a project that has canvases; ``generation`` is the surface. ``resume`` is called with the path of the surface
-    to swap in when the project is repaired and open, ``fail`` with a line when it could not be and the project is as it was. Returns one
-    line about it. Nothing is touched when it raises."""
+    to swap in when the project is repaired and open, ``fail`` with a line when it could not be and the project is as it was. ``follow``
+    are the uids of layers of the Texture Sets the bridge keeps facts about, which a canvas takes along under uids of their own;
+    ``followed`` is called with ``{uid: the uid it became}`` once the project is repaired. Returns one line about it. Nothing is touched
+    when it raises."""
     if running():
         raise RepairError("a repair is still running")
     anchor = record.get("anchor") if record else None
-    if record and anchor not in kinds.BY_ANCHOR:
+    if record and anchor not in (UV, SURFACE):
         raise RepairError("the paint can be repaired for a surface whose mesh changed under layouts that stayed ({0!r}) or whose layouts "
-                          "changed under a mesh that stayed ({1!r}), not for {2!r}".format(kinds.UV, kinds.SURFACE, anchor))
+                          "changed under a mesh that stayed ({1!r}), not for {2!r}".format(UV, SURFACE, anchor))
     check(interpreter)
     canvases = canvas_state.names()
     if not record and not canvases:
@@ -193,12 +201,15 @@ def begin(generation, record, interpreter, resume, fail):
     surface = directory / "surface.fbx"
     combined = directory / COMBINED_NAME
     carrying = ["canvas", str(old), "--surface", str(surface), "--surface-out", str(combined)]
-    if anchor == kinds.UV:
+    if anchor == UV:
         stages = _LAYING
         commands = {_lay: ["canvas", project_path, *texture_sets, "--surface", str(surface), "--surface-out", str(combined), "--out", str(edited)]}
-    elif anchor == kinds.SURFACE:
+        if follow:
+            (directory / FOLLOW_NAME).write_text(json.dumps(sorted(follow)), encoding="utf-8")
+            commands[_lay] += ["--follow", str(directory / FOLLOW_NAME)]
+    elif anchor == SURFACE:
         stages = _FORWARD_WITH_CANVASES if canvases else _FORWARD
-        commands = {_edit: ["retarget", project_path, *texture_sets, "--anchor", anchor, "--old", str(old), "--out", str(edited)]}
+        commands = {_edit: ["retarget", project_path, *texture_sets, "--old", str(old), "--out", str(edited)]}
         if record.get("passes"):
             commands[_edit] += ["--passes", *record["passes"]]
         if canvases:
@@ -208,6 +219,7 @@ def begin(generation, record, interpreter, resume, fail):
         commands = {_attach: carrying}
     repair = _Repair(texture_sets or canvases, interpreter, project_path, directory, old, old, surface, edited, commands, stages, False,
                      resume, fail)
+    repair.followed = followed
     try:
         shutil.copyfile(generation.path(generation.record["scene_file"]), repair.surface)
     except OSError:
@@ -247,7 +259,7 @@ def _discard(repair):
     for path in (repair.old, repair.held, repair.edited, repair.surface, repair.directory / COMBINED_NAME):
         if path is not None:
             path.unlink(missing_ok=True)
-    for name in (REPORT_NAME, COMPLAINT_NAME, EVENTS_NAME):
+    for name in (REPORT_NAME, COMPLAINT_NAME, EVENTS_NAME, FOLLOW_NAME):
         (repair.directory / name).unlink(missing_ok=True)
     try:
         repair.directory.rmdir()
@@ -345,7 +357,10 @@ def _finish(repair):
         return
     made = dict((repair.report or {}).get("canvases") or {})
     if made:
-        canvas_state.remember(made.values())
+        canvas_state.remember(made)
+    moved = dict((repair.report or {}).get("followed") or {})
+    if moved and repair.followed is not None:
+        repair.followed({int(old): new for old, new in moved.items()})
     LOG.info("the paint is repaired: %s", _summary(repair.report))
     repair.line = "repaired the paint: {0}".format(_summary(repair.report))
     if repair.stages is _CARRYING:
@@ -385,8 +400,8 @@ def _summary(report):
     if not report:
         return "nothing reported"
     if "canvases" in report:
-        return "{0} canvas(es) made, {1} Texture Set(s) already read one, {2} canvas(es) carried along".format(
-            len(report["canvases"]), len(report["kept"]), len(report["attached"]))
+        return "{0} canvas(es) made, {1} Texture Set(s) with a surface that did not change, {2} already reading one, {3} canvas(es) carried along".format(
+            len(report["canvases"]), len(report["unchanged"]), len(report["kept"]), len(report["attached"]))
     strokes = hits = split = left = 0
     for passes in dict(report.get("report") or {}).values():
         for name, counts in passes.items():

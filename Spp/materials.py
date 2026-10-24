@@ -74,7 +74,8 @@ def _scene_uid(name, streams):
 
 
 def clone(streams, source, name):
-    """Add a material called ``name`` that is a copy of the one called ``source``; the uid of the new one.
+    """Add a material called ``name`` that is a copy of the one called ``source``: ``(uid, mapping)``, the uid of the new one and
+    the new uid of each uid the copy had.
 
     Everything under the copy takes new uids, so it shares nothing with the original but the pictures its
     layers and shader name by URL, which a project holds once however many materials use them. What inside the
@@ -94,7 +95,7 @@ def clone(streams, source, name):
     copy.set_number(_SHADER, shader)
     streams.materials.append(copy)
     _clone_baking(streams.baking.root, original.number(document.UID), copy.number(document.UID))
-    return copy.number(document.UID)
+    return copy.number(document.UID), mapping
 
 
 def _clone_shader(streams, index, name):

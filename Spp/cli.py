@@ -3,21 +3,21 @@
 
     python -m RuriBridge.Spp.cli materials PROJECT
     python -m RuriBridge.Spp.cli clone PROJECT SOURCE NAME [--out PATH]
-    python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL...|--all --anchor uv|surface --old SCENE [--source-set N] [--passes NAME...] [--out PATH]
+    python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL...|--all --old SCENE [--source-set N] [--passes NAME...] [--out PATH]
     python -m RuriBridge.Spp.cli split PROJECT SOURCE NAME --new SCENE [--out PATH]
     python -m RuriBridge.Spp.cli carry PROJECT --old SCENE --events FILE [--uv-set N] [--out PATH]
-    python -m RuriBridge.Spp.cli canvas PROJECT MATERIAL... --surface FBX --surface-out FBX [--out PATH]
+    python -m RuriBridge.Spp.cli canvas PROJECT MATERIAL... --surface FBX --surface-out FBX [--follow FILE] [--out PATH]
     python -m RuriBridge.Spp.cli templates PROJECT --out FILE
 
 ``clone`` adds a material called NAME that is a copy of the material called SOURCE, with its stacks, layers,
 brushes and strokes, to the project at PATH -- or to PROJECT itself when there is no ``--out``.
 
-``retarget`` repairs the paint of the MATERIALs of PROJECT (``--all``: every one both surfaces have polygons of) for the surface PROJECT holds, which is not the one
-the paint was made on: SCENE is that surface, a project file or a ``scene.assbin``. ``--anchor uv`` says the UV
-layout stayed and the mesh changed, ``--anchor surface`` that the mesh stayed and the layout changed.
-``--source-set`` is the UV set of PROJECT's mesh that holds the layout the paint was made in; fills laid through
-the UV layout follow the surface to the new layout by way of it. ``--passes`` names the passes to run (``strokes``,
-``hits``, ``fills``) when something else takes care of the rest; every pass of the anchor otherwise.
+``retarget`` repairs the paint of the MATERIALs of PROJECT (``--all``: every one both surfaces have polygons of) for a UV layout that changed
+under a mesh that stayed: the surface PROJECT holds is not the one the paint was made on, and SCENE is that one, a project file or a
+``scene.assbin``. ``--source-set`` is the UV set of PROJECT's mesh that holds the layout the paint was made in; fills laid through
+the UV layout follow the surface to the new layout by way of it. ``--passes`` names the passes to run (``strokes``, ``hits``,
+``fills``) when something else takes care of the rest; every pass otherwise. A mesh that changed under a layout that stayed is not
+retargeted: its materials are given canvases (``canvas``).
 
 ``carry`` repairs the paint of layers copied into a material for the faces carried into it from another one. FILE is JSON,
 ``[{"source": material the faces came from, "target": material the copies are in, "roots": [uid of each copied layer], "canvases":
@@ -29,7 +29,8 @@ when there are ``canvases``, whose layers are read from its document -- and the 
 the material is copied with all its paint, and left reading the copy. FBX is the surface the project is to have, written by ``Spp.fbx``;
 the file at ``--surface-out`` holds it and, after it, the surface of every canvas the project has, from PROJECT's own scene: the surface
 the paint was made on. With no MATERIAL it only puts the canvases the project has beside a surface, which every surface a project with
-canvases is sent needs. ``templates`` makes the file the canvases are made from (``retarget/canvas_templates.bin``) from a project
+canvases is sent needs. ``--follow`` is a JSON list of uids of layers of the MATERIALs that something outside the project's document keeps,
+and ``followed`` in the report says what each became: the layers move to the canvas under uids of their own. ``templates`` makes the file the canvases are made from (``retarget/canvas_templates.bin``) from a project
 Painter saved that holds a folder with an anchor in its effects, a fill that reads references, and a fill layer.
 
 ``split`` adds a material called NAME that is a copy of SOURCE and takes out of it the strokes, polygon fills and layers that
@@ -54,7 +55,7 @@ def _materials(arguments):
 def _clone(arguments):
     with project.edited(arguments.project, arguments.out) as changing:
         streams = materials.Streams(changing)
-        uid = materials.clone(streams, arguments.source, arguments.name)
+        uid, _mapping = materials.clone(streams, arguments.source, arguments.name)
         streams.save(changing)
     return {"cloned": arguments.source, "name": arguments.name, "uid": uid, "project": arguments.out or arguments.project}
 
@@ -81,16 +82,22 @@ def _retarget(arguments):
         raise SystemExit("name the materials to retarget, or give --all")
     old = _scene_bytes(arguments.old)
     with project.edited(arguments.project, arguments.out) as changing:
-        report = job.run(changing, old, None if arguments.all else arguments.materials, arguments.anchor, arguments.uv_set, arguments.source_set,
-                         arguments.passes)
-    return {"anchor": arguments.anchor, "project": arguments.out or arguments.project, "report": report}
+        report = job.run(changing, old, None if arguments.all else arguments.materials, arguments.uv_set, arguments.source_set, arguments.passes)
+    return {"project": arguments.out or arguments.project, "report": report}
+
+
+def _uids(path):
+    if path is None:
+        return []
+    with open(path, encoding="utf-8") as handle:
+        return [int(uid) for uid in json.load(handle)]
 
 
 def _canvas(arguments):
     from .retarget import job
     if arguments.materials:
         with project.edited(arguments.project, arguments.out) as changing:
-            report = job.lay_canvases(changing, arguments.materials, arguments.surface, arguments.surface_out)
+            report = job.lay_canvases(changing, arguments.materials, arguments.surface, arguments.surface_out, _uids(arguments.follow))
     else:
         with project.Project(arguments.project) as opened:
             report = job.lay_canvases(opened, [], arguments.surface, arguments.surface_out)
@@ -140,7 +147,6 @@ def main(argv=None):
     retargeting.add_argument("project")
     retargeting.add_argument("materials", nargs="*")
     retargeting.add_argument("--all", action="store_true")
-    retargeting.add_argument("--anchor", choices=("uv", "surface"), required=True)
     retargeting.add_argument("--old", required=True)
     retargeting.add_argument("--uv-set", type=int, default=0)
     retargeting.add_argument("--source-set", type=int)
@@ -167,6 +173,7 @@ def main(argv=None):
     laying.add_argument("materials", nargs="*")
     laying.add_argument("--surface", required=True)
     laying.add_argument("--surface-out", required=True)
+    laying.add_argument("--follow")
     laying.add_argument("--out")
     laying.set_defaults(run=_canvas)
     making = commands.add_parser("templates", help="make the file canvases are made from")

@@ -297,6 +297,26 @@ def _exists(uid):
     return True
 
 
+def folder_uids(names):
+    """The uids of the folders and the masks of the faces carried into these Texture Sets."""
+    return {int(entry[field]) for target, events in dict(project_facts.read(GUESTS_KEY) or {}).items() if target in names
+            for entry in dict(events).values() for field in ("group", "mask")}
+
+
+def follow(moved):
+    """Layers moved to other uids (``{uid: the uid it became}``): the folder of each event, and its mask, are the ones they became."""
+    held = dict(project_facts.read(GUESTS_KEY) or {})
+    changed = False
+    for events in held.values():
+        for entry in dict(events).values():
+            for field in ("group", "mask"):
+                if int(entry[field]) in moved:
+                    entry[field] = moved[int(entry[field])]
+                    changed = True
+    if changed:
+        project_facts.write(GUESTS_KEY, held)
+
+
 def known():
     """Every event the project holds whose folder is still there, by Texture Set."""
     found = {}

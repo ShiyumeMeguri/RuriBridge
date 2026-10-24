@@ -115,24 +115,6 @@ def length_ratio(old, old_triangles, new, new_triangles):
     return float(np.exp(0.25 * np.mean(log_area(new_frames[usable]) - log_area(old_frames[usable]))))
 
 
-def rigid_fit(old, new):
-    """The 4x4 rigid motion taking the points ``old`` (n, 3) as near as it can to ``new``, least squares (Kabsch);
-    the identity where the points do not pin one down (fewer than three, or all on a line)."""
-    if len(old) < 3:
-        return np.eye(4)
-    old_centre, new_centre = old.mean(axis=0), new.mean(axis=0)
-    covariance = (old - old_centre).T @ (new - new_centre)
-    left, spread, right = np.linalg.svd(covariance)
-    if spread[1] <= 1e-12 * max(spread[0], 1e-300):
-        return np.eye(4)
-    sign = np.sign(np.linalg.det(right.T @ left.T))
-    rotation = right.T @ np.diag([1.0, 1.0, sign if sign != 0 else 1.0]) @ left.T
-    motion = np.eye(4)
-    motion[:3, :3] = rotation
-    motion[:3, 3] = new_centre - rotation @ old_centre
-    return motion
-
-
 def storage(matrix):
     """The sixteen floats Painter keeps for the 4x4 ``matrix``: column by column."""
     return tuple(float(value) for value in matrix.T.reshape(-1))
@@ -159,16 +141,6 @@ def perspective(focal, near, far):
     matrix[2, 3] = 2.0 * near * far / (near - far)
     matrix[3, 2] = -1.0
     return matrix
-
-
-def moved_view(view, transform):
-    """The sixteen floats of the view that sees the world moved by ``transform`` the way ``view`` sees the world."""
-    return storage(np.array(view, dtype=np.float64).reshape(4, 4).T @ np.linalg.inv(transform))
-
-
-def moved_inverse(inverse, transform):
-    """The sixteen floats of the inverse of projection and view together after the camera follows ``transform``."""
-    return storage(transform @ np.array(inverse, dtype=np.float64).reshape(4, 4).T)
 
 
 def _cells(low, high, origin, size, resolution):

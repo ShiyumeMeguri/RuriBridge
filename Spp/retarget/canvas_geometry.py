@@ -20,8 +20,81 @@ from .. import fbx, scene
 from .canvas import CanvasError
 
 
+#: How far, as a share of the surface's diagonal, two positions of a corner may lie apart and be the same, and how far two coordinates of a UV
+#: layout may.
+SAME_PLACE = 1e-5
+SAME_COORDINATE = 1e-6
+
+
 def _array(values, columns):
     return numpy.frombuffer(values, dtype=numpy.float32).reshape(-1, columns)
+
+
+#: How many corners of one surface may have no equal in the other, because the rounding of a coordinate fell on its other side, before the
+#: surfaces count as different without further look.
+LEFTOVER_LIMIT = 8192
+#: How many corners are matched to the leftovers of the other surface at a time.
+_CHUNK = 256
+
+
+def _corner_keys(positions, sets, step):
+    """The corners of a surface as a set of rows, each where the corner lies and its coordinates in each UV set, rounded."""
+    rows = numpy.concatenate([numpy.round(positions / step)] + [numpy.round(each / SAME_COORDINATE) for each in sets], axis=1).astype(numpy.int32)
+    return set(map(tuple, rows.tolist()))
+
+
+def _same_keys(first, second):
+    """Whether two sets of corner rows are one, but for rows that differ by one step in some coordinate: a position the float arithmetic
+    of two ways of getting it left either side of a rounding."""
+    only_first, only_second = first - second, second - first
+    if not only_first and not only_second:
+        return True
+    if not only_first or not only_second or max(len(only_first), len(only_second)) > LEFTOVER_LIMIT:
+        return False
+    one, other = numpy.array(sorted(only_first), dtype=numpy.int32), numpy.array(sorted(only_second), dtype=numpy.int32)
+    for each, against in ((one, other), (other, one)):
+        for start in range(0, len(each), _CHUNK):
+            near = numpy.abs(each[start:start + _CHUNK, None, :] - against[None, :, :]).max(axis=2).min(axis=1) <= 1
+            if not near.all():
+                return False
+    return True
+
+
+def unchanged(surface, found, material):
+    """Whether the surface ``surface`` (the parts of an FBX) paints into the material called ``material`` with the very meshes
+    -- names, corners, coordinates in every UV set -- the scene ``found`` holds on it: paint replayed on one is replayed on the other.
+    Corners are compared to the grain of ``SAME_PLACE``; where one falls on the other side of a rounding the surface counts as changed,
+    which costs a canvas and no more."""
+    transform = scene.import_transform(found)
+    meshes = [mesh for mesh in found.meshes if found.materials[mesh.material] == material]
+    parts = [(part, index) for part in surface for index, name in enumerate(part.texture_sets) if name == material]
+    if transform is None or not meshes or not parts:
+        return False
+    if sorted(mesh.name for mesh in meshes) != sorted(part.name for part, _index in parts):
+        return False
+    count = {len(mesh.uvs) for mesh in meshes}
+    if len(count) != 1 or count != {len(part.uv_sets) for part, _index in parts}:
+        return False
+    scale, offset = transform
+    corners = [numpy.frombuffer(mesh.indices, dtype=numpy.uint32) for mesh in meshes]
+    old_positions = numpy.concatenate([((_array(mesh.positions, 3).astype(numpy.float64) - numpy.array(offset)) / scale)[each]
+                                       for mesh, each in zip(meshes, corners)])
+    step = SAME_PLACE * float(numpy.linalg.norm(old_positions.max(axis=0) - old_positions.min(axis=0)))
+    if step <= 0.0:
+        return False
+    old_sets = [numpy.concatenate([_array(mesh.uvs[number][1], 3)[:, :2][each] for mesh, each in zip(meshes, corners)]).astype(numpy.float64)
+                for number in range(count.pop())]
+    new_positions, new_sets, triangles = [], [[] for _number in old_sets], 0
+    for part, index in parts:
+        chosen = numpy.repeat(part.polygon_texture_set == index, part.polygon_totals)
+        new_positions.append(part.positions.astype(numpy.float64)[part.corner_vertex][chosen])
+        for number, coordinates in enumerate(part.uv_sets):
+            new_sets[number].append(coordinates[chosen].astype(numpy.float64))
+        triangles += int(numpy.maximum(part.polygon_totals[part.polygon_texture_set == index] - 2, 0).sum())
+    if triangles != sum(len(each) // 3 for each in corners):
+        return False
+    return _same_keys(_corner_keys(old_positions, old_sets, step),
+                      _corner_keys(numpy.concatenate(new_positions), [numpy.concatenate(each) for each in new_sets], step))
 
 
 def part(mesh, name, scale, offset, uv_set_count):

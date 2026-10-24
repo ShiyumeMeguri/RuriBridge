@@ -46,7 +46,7 @@ import substance_painter.textureset as textureset
 
 from ...Kernel.log import logger
 
-from . import held_imports, layout_state, project_facts, project_imports, shader_state
+from . import canvas_state, held_imports, layout_state, project_facts, project_imports, shader_state
 
 LOG = logger("painter.seed")
 
@@ -127,6 +127,23 @@ def _remember(seeded):
     project_facts.write(SEED_KEY, seeded)
 
 
+def layer_uids(names):
+    """The uids of the bridge's layers in these Texture Sets."""
+    return {int(state["layer"]) for name, state in _remembered().items() if name in names and state.get("layer") is not None}
+
+
+def follow(moved):
+    """Layers moved to other uids (``{uid: the uid it became}``): the bridge's layer is the one it became."""
+    seeded_now = _remembered()
+    changed = False
+    for state in seeded_now.values():
+        if state.get("layer") is not None and int(state["layer"]) in moved:
+            state["layer"] = moved[int(state["layer"])]
+            changed = True
+    if changed:
+        _remember(seeded_now)
+
+
 def seeded(names):
     """Of these Texture Sets, the ones the bridge stood up from a Blender material."""
     remembered = _remembered()
@@ -194,8 +211,8 @@ def _bridge_layer(stack, remembered_uid, material):
     if remembered_uid is not None:
         try:
             node = layerstack.get_node_by_uid(int(remembered_uid))
-            if (isinstance(node, layerstack.FillLayerNode)
-                    and node.get_texture_set().name == stack.material().name):
+            lives = {stack.material().name, *canvas_state.canvases_of(stack.material().name)}
+            if isinstance(node, layerstack.FillLayerNode) and node.get_texture_set().name in lives:
                 return node, False
         except ValueError:
             pass

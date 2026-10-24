@@ -14,16 +14,6 @@ from . import geometry, selection
 SOURCE_TOLERANCE = 1e-5
 #: How many triangles of the material are looked at to check that copy.
 SOURCE_SAMPLES = 4000
-#: How far apart, in the UV layout, the corners of a triangle of the old surface and of the new one with the same number may lie
-#: for them to be the same polygon.
-SAME_LAYOUT = 1e-9
-#: How many triangles of the material are looked at to find the rigid motion between the surfaces.
-MOTION_SAMPLES = 4000
-#: How far, as a share of the model's diagonal, a polygon may lie from where a rigid motion takes it and still be on it.
-MOTION_TOLERANCE = 1e-3
-#: Candidate motions are fitted to the polygons around this many seed polygons, this many each.
-MOTION_SEEDS = 48
-MOTION_NEIGHBOURS = 12
 
 
 class Context:
@@ -64,42 +54,6 @@ class Context:
             raise ValueError("UV set {0} of the new mesh is not the layout {1} was painted in: it differs by up to {2:.6f} over {3:.1f}% of the triangles".format(
                 self._source_set, self.material, float(difference.max()), 100.0 * float((difference > SOURCE_TOLERANCE).mean())))
         return self._source_set
-
-    @cached_property
-    def motion(self):
-        """The rigid motion (4x4) most of the material's polygons made from the old surface to the new, and the share of them
-        that are where it takes them (to within ``MOTION_TOLERANCE`` of the diagonal): the places of the old layout found
-        again in the new. Where half the surface was changed and half left, the left half's motion -- none -- is it."""
-        triangles = np.nonzero(self.old_mask)[0]
-        triangles = triangles[::max(1, len(triangles) // MOTION_SAMPLES)]
-        weights = np.repeat(selection.CENTRE, len(triangles), axis=0)
-        place = self.old.point(triangles, weights)
-        new_triangle, new_weights, _offset = self.new_layout.query(self.old.uv(triangles, weights), place)
-        found = new_triangle >= 0
-        if not found.any():
-            return np.eye(4), 0.0
-        place, new_place = place[found], self.new.point(new_triangle[found], new_weights[found])
-        tolerance = MOTION_TOLERANCE * self.diagonal
-
-        def inliers(motion):
-            return np.linalg.norm(place @ motion[:3, :3].T + motion[:3, 3] - new_place, axis=1) <= tolerance
-
-        best = (float(inliers(np.eye(4)).mean()), np.eye(4))
-        seeds = np.linspace(0, len(place) - 1, min(len(place), MOTION_SEEDS)).astype(np.int64)
-        starts = [geometry.rigid_fit(place, new_place)]
-        for seed in seeds:
-            near = np.argsort(np.linalg.norm(place - place[seed], axis=1))[:MOTION_NEIGHBOURS]
-            starts.append(geometry.rigid_fit(place[near], new_place[near]))
-        for motion in starts:
-            for _round in range(4):
-                held = inliers(motion)
-                if held.sum() < 3:
-                    break
-                motion = geometry.rigid_fit(place[held], new_place[held])
-            share = float(inliers(motion).mean())
-            if share > best[0] + 1e-9:
-                best = (share, motion)
-        return best[1], best[0]
 
     @cached_property
     def old_elements(self):
@@ -146,22 +100,6 @@ class Context:
     @cached_property
     def counterpart(self):
         return geometry.Correspondence(self.old, self.new, 1e-5 * self.diagonal, same_material=not self.carrying)
-
-    def uv_counterpart(self, triangles):
-        """For each of ``triangles`` of the old surface the triangle of the new one at the same place of the UV layout, ``-1`` where
-        there is none: the triangle with the same number when it holds the same corners in the layout, and otherwise the one the
-        layout holds at the old triangle's middle -- the nearest in space to it where islands lie over one another."""
-        found = np.full(len(triangles), -1, dtype=np.int64)
-        same = triangles < len(self.new.triangles)
-        candidate = np.where(same, triangles, 0)
-        difference = np.abs(self.old.uvs[self.old.triangles[triangles]] - self.new.uvs[self.new.triangles[candidate]]).max(axis=(1, 2))
-        same &= (difference <= SAME_LAYOUT) & self.new_mask[candidate]
-        found[same] = candidate[same]
-        other = np.nonzero(~same)[0]
-        if len(other):
-            weights = np.repeat(selection.CENTRE, len(other), axis=0)
-            found[other] = self.new_layout.query(self.old.uv(triangles[other], weights), self.old.point(triangles[other], weights))[0]
-        return found
 
     @cached_property
     def counterpart_any_material(self):

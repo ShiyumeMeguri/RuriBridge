@@ -6,7 +6,8 @@ made on, and the material that replaced it reads it. So it is nothing the bridge
 Texture Set a surface has left layers in, and every surface that goes into the project carries the canvases' own surfaces with it
 (``paint_repair``), or Painter drops them as it drops every Texture Set the surface does not paint into.
 
-Which Texture Sets are canvases is a fact of the project (``project_facts``): the names of the ones the bridge made.
+Which Texture Sets are canvases is a fact of the project (``project_facts``): the ones the bridge made, each with the material it
+was made for.
 
 A canvas's surface lies where the material's surface lay, so in the viewports both would show. Painter's Python interface has no
 call that hides the surface of a Texture Set -- only the eye beside each in the Texture Set list does -- so the canvases are hidden by
@@ -44,18 +45,25 @@ _pending = [0]
 def names():
     """The canvases of the open project that are still Texture Sets of it, by name."""
     present = {one.name for one in substance_painter.textureset.all_texture_sets()}
-    return sorted(name for name in (project_facts.read(FACT) or []) if name in present)
+    return sorted(name for name in dict(project_facts.read(FACT) or {}) if name in present)
+
+
+def canvases_of(material):
+    """The canvases made for the Texture Set called ``material``: where the layers it had were moved to."""
+    return sorted(canvas for canvas, owner in dict(project_facts.read(FACT) or {}).items() if owner == material)
 
 
 def remember(made):
-    """State that the Texture Sets ``made`` are canvases, with the ones the project already has."""
-    project_facts.write(FACT, sorted(set(project_facts.read(FACT) or []) | set(made)))
+    """State that the Texture Sets ``made`` -- ``{material: canvas}`` -- are canvases, with the ones the project already has."""
+    facts = dict(project_facts.read(FACT) or {})
+    facts.update({canvas: material for material, canvas in made.items()})
+    project_facts.write(FACT, facts)
     conceal_soon()
 
 
 def held():
     """Every Texture Set of the open project that is not a canvas: the ones a modelling application's surface paints into."""
-    canvases = set(project_facts.read(FACT) or [])
+    canvases = set(dict(project_facts.read(FACT) or {}))
     return [one for one in substance_painter.textureset.all_texture_sets() if one.name not in canvases]
 
 
@@ -91,9 +99,16 @@ def _frame():
     return None
 
 
+def _row_rect(view, row):
+    """Where the row lies in the list's viewport, scrolled into view first: a list that is longer than it is high does not show every row."""
+    index = view.model().index(row, 0)
+    view.scrollTo(index)
+    return view.visualRect(index)
+
+
 def _shown(view, row):
     """Whether the Texture Set in this row of the list is shown: its eye has a pupil."""
-    rect = view.visualRect(view.model().index(row, 0))
+    rect = _row_rect(view, row)
     scale = rect.height() / ROW_HEIGHT
     size = max(1, int(round(3 * scale)))
     left, top = int(round(rect.x() + (EYE_CENTRE[0] - 1) * scale)), int(round(rect.y() + (EYE_CENTRE[1] - 1) * scale))
@@ -103,7 +118,7 @@ def _shown(view, row):
 
 def _press_eye(view, row):
     viewport = view.viewport()
-    rect = view.visualRect(view.model().index(row, 0))
+    rect = _row_rect(view, row)
     scale = rect.height() / ROW_HEIGHT
     position = QtCore.QPoint(int(round(rect.x() + EYE_CLICK[0] * scale)), int(round(rect.y() + EYE_CLICK[1] * scale)))
     for kind in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonRelease):
@@ -119,7 +134,7 @@ def conceal():
     the list has is hidden, False when the list does not show them yet.
 
     The list is looked for again after each eye: Painter may build it anew when one is pressed, and a view found through a frame
-    is only good while the frame it was found through is held."""
+    is only good while the frame it was found through is held. A row out of view is scrolled to, and the list is scrolled back."""
     wanted = set(names())
     if not wanted:
         return True
@@ -135,8 +150,13 @@ def conceal():
         rows = {model.data(model.index(row, 0), QtCore.Qt.DisplayRole): row for row in range(model.rowCount())}
         if not wanted <= set(rows):
             return False
+        bar = view.verticalScrollBar()
+        scrolled = bar.value()
         shown = [name for name in sorted(wanted) if _shown(view, rows[name])]
+        if shown:
+            _press_eye(view, rows[shown[0]])
+        if shiboken6.isValid(bar):
+            bar.setValue(scrolled)
         if not shown:
             return True
-        _press_eye(view, rows[shown[0]])
     return False

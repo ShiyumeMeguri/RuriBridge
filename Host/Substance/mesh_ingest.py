@@ -51,7 +51,7 @@ from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import canvas_state, guest_state, layout_state, paint_repair, project_facts
+from . import canvas_state, guest_state, layout_state, material_seed, paint_repair, project_facts
 
 LOG = logger("painter.mesh")
 
@@ -246,7 +246,10 @@ def apply(generation, texture_resolution, on_finished=None, interpreter="", on_s
                 if on_finished is not None:
                     on_finished("the paint is repaired, but the surface could not go in: {0}".format(error))
 
-        paint_repair.begin(generation, repair, interpreter, resume, on_finished)
+        texture_sets = set((repair or {}).get("texture_sets") or [])
+        paint_repair.begin(generation, repair, interpreter, resume, on_finished,
+                           follow=material_seed.layer_uids(texture_sets) | guest_state.folder_uids(texture_sets),
+                           followed=lambda moved: (material_seed.follow(moved), guest_state.follow(moved)))
         return "repair" if repair else "attach"
     swap(scene_path)
     return "swap"

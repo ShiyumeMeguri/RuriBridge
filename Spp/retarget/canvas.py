@@ -47,6 +47,8 @@ _ANCHOR = "DataActionAnchor"
 _REFERENCE = "DataSourceReference"
 _FILL = "DataActionFill"
 _LAYER = "DataLayerColor"
+#: The types of what a canvas takes along that other things of the document may name: layers, and the effects and masks of layers.
+LAYERS = ("DataLayer", "DataAction")
 _UV_PROJECTION = 0
 _ALL_CHANNELS = bytes([0xFF] * 16)
 _CHANNEL_BYTES = 16
@@ -203,10 +205,12 @@ def _free_name(streams, name):
 
 
 def lay(streams, name, made):
-    """Give the material called ``name`` a canvas, in the streams of an open project, and return the canvas's name.
+    """Give the material called ``name`` a canvas, in the streams of an open project: ``(canvas, mapping)``, the canvas's name and the
+    new uid of each uid the material's layers had.
 
-    Every stack of the material that holds layers moves to the canvas, and the material is left reading it. None is returned,
-    and nothing is changed, for a material with nothing in its stacks or nothing but what a canvas already holds.
+    Every stack of the material that holds layers moves to the canvas, and the material is left reading it; whatever else of the
+    document named a layer that moved -- an instance of it in another material -- names it where it is now. ``(None, {})`` is
+    returned, and nothing is changed, for a material with nothing in its stacks or nothing but what a canvas already holds.
     """
     found = [material for material in streams.materials if material.text(_NAME) == name]
     if len(found) != 1:
@@ -217,10 +221,13 @@ def lay(streams, name, made):
     owners = _owners(streams)
     stacks = [entry for entry in material["stacks"] if entry["stack"]["items"]]
     if not stacks or all(_reads_only_canvases(entry, owners, name) for entry in stacks):
-        return None
+        return None, {}
     made.conform(streams.document.root)
     canvas = _free_name(streams, name)
-    uid = materials.clone(streams, name, canvas)
+    uid, mapping = materials.clone(streams, name, canvas)
+    moving = {item.number(document_module.UID) for entry in stacks for item in stream.walk(entry["stack"])
+              if document_module.UID in item and item.type.startswith(LAYERS)}
+    mapping = {old: new for old, new in mapping.items() if old in moving}
     held = next(item for item in streams.materials if item.number(document_module.UID) == uid)
     uids = document_module.Uids(streams.document.root)
     for own, copied in zip(material["stacks"], held["stacks"]):
@@ -231,4 +238,7 @@ def lay(streams, name, made):
         codes = [channel.number("type") for channel in copied["channels"]]
         copied["stack"]["items"] = [_folder(made, layers, anchor, uids)]
         own["stack"]["items"] = [_transfer(made, codes, anchor, uids)]
-    return canvas
+    for item, field, named in document_module.references(streams.document.root):
+        if named in mapping:
+            item.set_number(field, mapping[named])
+    return canvas, mapping

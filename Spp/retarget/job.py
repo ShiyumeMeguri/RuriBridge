@@ -14,12 +14,11 @@ from .context import Context
 from .selection import CENTRE
 
 
-def run_surfaces(target, old, new, names, anchor, source=None, source_set=None, passes=None):
-    """Repair the materials called ``names`` of the open, writable project ``target``.
+def run_surfaces(target, old, new, names, source=None, source_set=None, passes=None):
+    """Repair the materials called ``names`` of the open, writable project ``target`` for a layout that changed under a mesh that stayed.
 
-    ``old`` is the ``geometry.Surface`` the paint was made on, ``new`` the one it is to be painted on, and ``anchor``
-    (``engine.UV`` or ``engine.SURFACE``) says what stayed. ``source`` is the new mesh read with the UV set
-    ``source_set`` that holds the layout the paint was made in, which paint laid through the layout needs. ``passes``
+    ``old`` is the ``geometry.Surface`` the paint was made on, ``new`` the one it is to be painted on. ``source`` is the new mesh read
+    with the UV set ``source_set`` that holds the layout the paint was made in, which paint laid through the layout needs. ``passes``
     names the passes to run (see ``engine.run``). Returns what each material's passes did.
     """
     document = stream.read(target.read(project.DOCUMENT))
@@ -28,7 +27,7 @@ def run_surfaces(target, old, new, names, anchor, source=None, source_set=None, 
     if missing:
         raise ValueError("the project has no material called {0}".format(", ".join(missing)))
     uids = document_module.Uids(document.root)
-    report = {name: engine.run(found[name], old, new, anchor, source=source, source_set=source_set, uids=uids, passes=passes)
+    report = {name: engine.run(found[name], old, new, source=source, source_set=source_set, uids=uids, passes=passes)
               for name in names}
     document_module.require_unique(document.root, "the repaired document")
     target.write(project.DOCUMENT, stream.write(document))
@@ -40,7 +39,7 @@ def split_surfaces(target, old, new, source, name):
     it has in ``new`` -- the surface the project is to have, whose polygons of ``name`` were those of ``source`` in ``old``,
     with the same UV layout. Returns what the cleaning took out."""
     streams = materials.Streams(target)
-    uid = materials.clone(streams, source, name)
+    uid, _mapping = materials.clone(streams, source, name)
     copy = next(material for material in streams.materials if material.number(document_module.UID) == uid)
     context = Context(old, new, source, uids=document_module.Uids(streams.document.root))
     triangles = np.nonzero(context.old_mask)[0]
@@ -100,26 +99,35 @@ def carry(target, old_scene, events, uv_set=0, old_document=None):
     return carry_surfaces(target, old, new, events, None if old_document is None else stream.read(old_document))
 
 
-def lay_canvases(target, names, surface, surface_out):
-    """Give each material called ``names`` of the open, writable project ``target`` a canvas (see ``canvas``), and write the file of the
-    surface the project is to have to ``surface_out``: the surface in the FBX ``surface``, and after it the surface of every canvas the
-    project has, the ones it had and the ones this made, taken from the scene the project holds now. Returns what each material
-    got: ``{"canvases": {material: canvas}, "kept": [material that needed none], "attached": [canvas the project had]}``."""
+def lay_canvases(target, names, surface, surface_out, follow=()):
+    """Give each material called ``names`` of the open, writable project ``target`` a canvas (see ``canvas``), unless its surface did not
+    change, and write the file of the surface the project is to have to ``surface_out``: the surface in the FBX ``surface``, and after it
+    the surface of every canvas the project has, the ones it had and the ones this made, taken from the scene the project holds now.
+    ``follow`` are uids of layers of the materials that something outside the document keeps. Returns what each material got:
+    ``{"canvases": {material: canvas}, "kept": [material that holds nothing but what a canvas already holds, or nothing], "unchanged":
+    [material whose surface is the very one it was painted on], "attached": [canvas the project had], "followed": {uid: the uid it
+    became}}``."""
     streams = materials.Streams(target)
     held = sorted(canvas.canvases(streams))
     made = canvas.templates() if names else None
-    laid = {name: canvas.lay(streams, name, made) for name in names}
+    parts, uv_names = fbx.read(surface)
+    found = scene.read(target.read(project.SCENE))
+    same = [name for name in names if canvas_geometry.unchanged(parts, found, name)]
+    laid, followed = {}, {}
+    for name in names:
+        if name not in same:
+            laid[name], mapping = canvas.lay(streams, name, made)
+            followed.update({str(uid): mapping[uid] for uid in follow if uid in mapping})
     if any(laid.values()):
         streams.save(target)
     placements = {name: name for name in held}
     placements.update({name: given for name, given in laid.items() if given})
-    parts, uv_names = fbx.read(surface)
-    fbx.write(surface_out, *canvas_geometry.compose(parts, uv_names, scene.read(target.read(project.SCENE)), placements))
+    fbx.write(surface_out, *canvas_geometry.compose(parts, uv_names, found, placements))
     return {"canvases": {name: given for name, given in laid.items() if given}, "kept": sorted(name for name, given in laid.items() if not given),
-            "attached": held}
+            "unchanged": sorted(same), "attached": held, "followed": followed}
 
 
-def run(target, old_scene, names, anchor, uv_set=0, source_set=None, passes=None):
+def run(target, old_scene, names, uv_set=0, source_set=None, passes=None):
     """``run_surfaces`` for the surfaces held in scene files: ``old_scene`` is the bytes of the ``scene.assbin`` the
     paint was made on and the project's own scene is the surface it is on now; ``names`` is ``None`` for every material both
     surfaces have polygons of."""
@@ -129,7 +137,7 @@ def run(target, old_scene, names, anchor, uv_set=0, source_set=None, passes=None
     source = None if source_set is None else geometry.Surface.of(current, source_set)
     if names is None:
         names = every_material(target, old, new)
-    return run_surfaces(target, old, new, names, anchor, source, source_set, passes)
+    return run_surfaces(target, old, new, names, source, source_set, passes)
 
 
 def every_material(target, old, new):
