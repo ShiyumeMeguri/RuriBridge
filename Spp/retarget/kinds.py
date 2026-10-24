@@ -28,7 +28,6 @@ MESH_BOUND = (
 
 #: The UV layout changed and the mesh stayed: paint that follows the layout and is not moved.
 LAYOUT_BOUND = (
-    ("pictures (pixel layers)", lambda item: item.type == "DataSourceBitmap"),
     ("fills laid through the UV layout", lambda item: item.type == _FILL and item.number("projection") == _UV_PROJECTION),
     ("polygon fills chosen in the UV view", lambda item: item.type in _HITS and item.number("viewType") == _VIEW_2D),
 )

@@ -3,7 +3,7 @@
 
     python -m RuriBridge.Spp.cli materials PROJECT
     python -m RuriBridge.Spp.cli clone PROJECT SOURCE NAME [--out PATH]
-    python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL... --anchor uv|surface --old SCENE [--out PATH]
+    python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL... --anchor uv|surface --old SCENE [--source-set N] [--out PATH]
 
 ``clone`` adds a material called NAME that is a copy of the material called SOURCE, with its stacks, layers,
 brushes and strokes, to the project at PATH -- or to PROJECT itself when there is no ``--out``.
@@ -11,6 +11,8 @@ brushes and strokes, to the project at PATH -- or to PROJECT itself when there i
 ``retarget`` repairs the paint of the MATERIALs of PROJECT for the surface PROJECT holds, which is not the one
 the paint was made on: SCENE is that surface, a project file or a ``scene.assbin``. ``--anchor uv`` says the UV
 layout stayed and the mesh changed, ``--anchor surface`` that the mesh stayed and the layout changed.
+``--source-set`` is the UV set of PROJECT's mesh that holds the layout the paint was made in; fills laid through
+the UV layout follow the surface to the new layout by way of it.
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ def _retarget(arguments):
     from .retarget import job
     old = _old_scene(arguments.old)
     with project.edited(arguments.project, arguments.out) as changing:
-        report = job.run(changing, old, arguments.materials, arguments.anchor, arguments.uv_set)
+        report = job.run(changing, old, arguments.materials, arguments.anchor, arguments.uv_set, arguments.source_set)
     return {"anchor": arguments.anchor, "project": arguments.out or arguments.project, "report": report}
 
 
@@ -69,6 +71,7 @@ def main(argv=None):
     retargeting.add_argument("--anchor", choices=("uv", "surface"), required=True)
     retargeting.add_argument("--old", required=True)
     retargeting.add_argument("--uv-set", type=int, default=0)
+    retargeting.add_argument("--source-set", type=int)
     retargeting.add_argument("--out")
     retargeting.set_defaults(run=_retarget)
     arguments = parser.parse_args(argv)
