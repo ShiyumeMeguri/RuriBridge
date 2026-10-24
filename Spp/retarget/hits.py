@@ -102,20 +102,23 @@ def _seeds_in_layout(hit, context):
     return seeds
 
 
-def _compact(granularity, labels, mask, wanted):
-    """``(granularity, triangles)``: one polygon of the material in each element or chunk ``wanted`` is made of, where the
-    granularity is one of those; ``None`` for the other granularities."""
-    if granularity not in (selection.ELEMENT, selection.CHUNK):
-        return None
-    own = np.nonzero(mask & wanted)[0]
-    _labels, first = np.unique(labels[own], return_index=True)
-    return granularity, own[first]
+def _compacts(granularity, layout, wanted):
+    """The ways to click ``wanted`` in fewer clicks than polygons, most compact first, as ``(granularity, triangles)``: one
+    polygon of the material in each UV chunk or element it is made of. A hit that chose by one of those can only be said by it."""
+    kinds = {selection.CHUNK: (selection.CHUNK,), selection.ELEMENT: (selection.ELEMENT,)}.get(granularity, (selection.CHUNK, selection.ELEMENT))
+    found = []
+    for kind in kinds:
+        labels = layout.chunks if kind == selection.CHUNK else layout.elements
+        own = np.nonzero(layout.mask & wanted)[0]
+        _labels, first = np.unique(labels[own], return_index=True)
+        found.append((kind, own[first]))
+    return found
 
 
-def _replacement(context, template, layout, chosen, compact):
+def _replacement(context, template, layout, chosen, compacts):
     """Clicks in ``layout`` that choose exactly the triangles ``chosen`` (a boolean per triangle of its surface): the compact
-    ones first -- ``compact`` is ``(granularity, triangles)`` or ``None`` -- then one on every polygon; ``None`` where neither does."""
-    for granularity, triangles in ([compact] if compact is not None else []) + [(0, np.nonzero(chosen)[0])]:
+    ones first (``compacts`` as ``_compacts`` gives them), then one on every polygon; ``None`` where none of them does."""
+    for granularity, triangles in list(compacts) + [(0, np.nonzero(chosen)[0])]:
         positions = selection.centroid_uv(layout.surface, triangles)
         if (layout.chosen(positions, np.full(len(triangles), granularity)) == chosen).all():
             return [_click(context, template, position, granularity) for position in positions]
@@ -177,9 +180,8 @@ def follow_uv(material, context):
             return UNTOUCHED
         granularity = hit.number("granularity")
         seeds = _seeds_through_camera(hit, context)
-        wanted = selection.widened(seeds, granularity, lambda kind: context.old_elements if kind == selection.ELEMENT else context.old_chunks)
-        labels = context.old_elements if granularity == selection.ELEMENT else context.old_chunks
-        made = _replacement(context, hit, layout, wanted & context.old_mask, _compact(granularity, labels, context.old_mask, wanted))
+        wanted = selection.widened(seeds, granularity, lambda kind: context.old_elements if kind == selection.ELEMENT else context.old_chunks) & context.old_mask
+        made = _replacement(context, hit, layout, wanted, _compacts(granularity, layout, wanted))
         return made if made is not None else _follow_camera(hit, context, wanted & context.old_mask)
 
     return dict(_replace(material, convert))
@@ -203,7 +205,6 @@ def follow_surface(material, context):
             return None
         wanted = np.zeros(len(context.new.triangles), dtype=bool)
         wanted[carried] = True
-        labels = context.new_elements if granularity == selection.ELEMENT else context.new_chunks
-        return _replacement(context, hit, layout, wanted, _compact(granularity, labels, context.new_mask, wanted))
+        return _replacement(context, hit, layout, wanted, _compacts(granularity, layout, wanted))
 
     return dict(_replace(material, convert))
