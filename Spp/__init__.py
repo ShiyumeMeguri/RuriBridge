@@ -13,9 +13,10 @@ more than a module's public functions; a module knows one thing and hands data t
 * ``document`` -- what the streams share: objects with uids that others refer to.
 * ``materials`` -- operations on whole materials across the streams that describe them.
 * ``scene`` -- the surface the project paints on, its ``scene.assbin``.
+* ``fbx`` -- the surface as the ASCII FBX the bridge hands Painter, written and read back (it uses numpy, which Blender carries).
 * ``cli`` -- the command line, for people and for an assistant.
 
-``retarget`` is the one part that uses numpy, which Blender carries and Painter does not: it moves paint onto a
-surface that changed, built from ``stream``, ``scene`` and numpy and from nothing else of the bridge. ``retarget.kinds``
-holds the names the others agree on and needs no numpy. ``layers`` reads which layers of a document hold paint.
+``retarget`` uses numpy too, which Blender carries and Painter does not: it moves paint onto a surface whose layout changed and gives
+materials whose mesh changed canvases (``retarget.canvas``), built from ``stream``, ``scene``, ``fbx`` and numpy and from nothing else of the
+bridge. ``retarget.kinds`` holds the names the others agree on and needs no numpy. ``layers`` reads which layers of a document hold paint.
 """

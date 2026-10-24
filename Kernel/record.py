@@ -214,9 +214,9 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
     ``repair`` asks for the paint of Texture Sets to be repaired for this surface before it goes in, so
     that what was painted lands where it was painted on the new surface: ``{"anchor": "uv" or "surface",
     "texture_sets": [name], "passes": [name]}`` -- ``anchor`` says what stayed (``uv``: every layout, the mesh
-    changed; ``surface``: the mesh, the layouts changed) and ``passes`` which passes of the repair to run
-    (``strokes``, ``hits``, ``fills``), all of the anchor's when absent -- or None for a surface that changes
-    nothing the paint depends on.
+    changed, so the Texture Sets are given canvases; ``surface``: the mesh, the layouts changed, so their strokes and
+    polygon fills are carried to the new layouts) and ``passes`` which passes of that repair to run (``strokes``,
+    ``hits``, ``fills``), all of them when absent -- or None for a surface that changes nothing the paint depends on.
     """
     record = _base("mesh", source)
     record.update({
