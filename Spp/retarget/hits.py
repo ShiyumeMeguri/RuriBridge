@@ -57,9 +57,8 @@ def follow_uv(material, context):
     tracks = []
     for hit in _hits(material, PUNCTUAL, VIEW_3D):
         key = hit.number("projViewInvMatrix")
-        through = "paintThrough" in hit and hit.number("paintThrough") != 0
         position = np.array([hit.number("position")], dtype=np.float64)
-        tracks.append((hit, placement.Track(key, geometry.Camera.from_inverse(key), position, through)))
+        tracks.append((hit, placement.Track(key, geometry.Camera.from_inverse(key), position)))
     placement.follow_uv([track for _hit, track in tracks], context)
     counts = Counter()
     for hit, track in tracks:

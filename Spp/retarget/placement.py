@@ -26,7 +26,7 @@ _AROUND = np.array([(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)])
 
 
 class Track:
-    """Points (n, 2) on the screen of ``camera`` (``0..1`` across and up), and whether paint goes through the model.
+    """Points (n, 2) on the screen of ``camera`` (``0..1`` across and up).
 
     ``transform`` is what the camera was moved by when the track was followed (``None`` before, and where it did not
     move): the 4x4 rigid motion of the world the camera now sees the way it saw it. ``size_ratio`` is how many times
@@ -35,11 +35,10 @@ class Track:
     by it -- or ``None``; ``mirror_after`` the matrix that keeps the duplicate where it fell, once followed.
     """
 
-    def __init__(self, key, camera, points, through, mirror=None):
+    def __init__(self, key, camera, points, mirror=None):
         self.key = key
         self.camera = camera
         self.points = points
-        self.through = through
         self.mirror = mirror
         self.seen = 0
         self.moved = 0
@@ -69,7 +68,7 @@ def follow_mirror(tracks, old_points, context):
             continue
         screen = before * 2.0 - 1.0
         index = geometry.ScreenIndex(context.old, track.camera.following(track.mirror), screen.min(axis=0) - _MARGIN, screen.max(axis=0) + _MARGIN)
-        _where, triangle, weights = _seen(track, index, context, screen)
+        _where, triangle, weights = _seen(index, context, screen)
         uv, place, new_triangle, new_weights = _across(context, triangle, weights)
         placed = new_triangle >= 0
         if placed.any():
@@ -88,21 +87,19 @@ def measure_layout(tracks, context):
         screen = np.concatenate([track.points for track in members]) * 2.0 - 1.0
         index = geometry.ScreenIndex(context.old, members[0].camera, screen.min(axis=0) - _MARGIN, screen.max(axis=0) + _MARGIN)
         for track in members:
-            where, triangle, weights = _seen(track, index, context, track.points * 2.0 - 1.0)
+            where, triangle, weights = _seen(index, context, track.points * 2.0 - 1.0)
             new_triangle, _weights = context.counterpart.carry(triangle, weights)
             found = new_triangle >= 0
             track.seen = len(where)
             track.size_ratio = geometry.length_ratio(context.old, triangle[found], context.new, new_triangle[found])
 
 
-def _seen(track, index, context, screen):
-    """The points of the track (``screen``, ``-1..1``) that the camera of ``index`` sees on the old surface, and the
-    triangle and weights it sees under each: ``(where, triangle, weights)``."""
-    triangle, weights, _depth = index.query(screen, context.old_mask if track.through else None)
-    seen = triangle >= 0
-    if not track.through:
-        seen &= context.old_mask[np.where(seen, triangle, 0)]
-    where = np.nonzero(seen)[0]
+def _seen(index, context, screen):
+    """The points (``screen``, ``-1..1``) that the camera of ``index`` sees on the old surface, and the triangle and
+    weights it sees under each: ``(where, triangle, weights)``. A material is painted by the strokes of its own stack
+    through its own surface only: a surface of another material in front does not hide it from the brush."""
+    triangle, weights, _depth = index.query(screen, context.old_mask)
+    where = np.nonzero(triangle >= 0)[0]
     return where, triangle[where], weights[where]
 
 
@@ -129,7 +126,7 @@ def _rigid(context, uv, place, new_place):
 
 
 def _move(track, index, context):
-    where, triangle, weights = _seen(track, index, context, track.points * 2.0 - 1.0)
+    where, triangle, weights = _seen(index, context, track.points * 2.0 - 1.0)
     uv, place, new_triangle, new_weights = _across(context, triangle, weights)
     placed = new_triangle >= 0
     if not placed.any():

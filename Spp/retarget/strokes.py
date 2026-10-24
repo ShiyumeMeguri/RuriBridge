@@ -28,17 +28,8 @@ HOLDERS = brushes.HOLDERS
 
 
 def _strokes(material, view):
-    """``(stroke, paints through)`` for each stroke of ``view`` kept by an action of the material."""
-    found = []
-    for action in stream.walk(material):
-        if action.type not in HOLDERS:
-            continue
-        brush = action["brush"]
-        through = brush is not None and "paintThrough" in brush and brush.number("paintThrough") != 0
-        for stroke in action["strokes"]:
-            if stroke.number("viewType") == view:
-                found.append((stroke, through))
-    return found
+    """Each stroke of ``view`` kept by an action of the material."""
+    return [stroke for action in stream.walk(material) if action.type in HOLDERS for stroke in action["strokes"] if stroke.number("viewType") == view]
 
 
 def _rows(stroke):
@@ -53,11 +44,11 @@ def _store(stroke, rows):
 def follow_uv(material, context):
     """Move the points of the strokes drawn on the model so each lands on the UV place it fell on before."""
     tracks, rows = [], []
-    for stroke, through in _strokes(material, VIEW_3D):
+    for stroke in _strokes(material, VIEW_3D):
         key = (stroke.number("viewMatrix"), stroke.number("projectionMatrix"))
         stroke_rows = _rows(stroke)
         mirror = np.array(stroke.number("duplicateMatrix")).reshape(4, 4).T if stroke.number("duplicateCount") == 1 else None
-        track = placement.Track(key, geometry.Camera(*key), stroke_rows[:, :2].copy(), through, mirror)
+        track = placement.Track(key, geometry.Camera(*key), stroke_rows[:, :2].copy(), mirror)
         tracks.append((stroke, stroke_rows, track))
     followed = [track for _stroke, _rows_, track in tracks]
     before = [track.points.copy() for track in followed]
@@ -85,7 +76,7 @@ def follow_surface(material, context):
     and give the strokes whose brush is measured in the layout the size that keeps their footprint on the surface."""
     counts = Counter()
     factors_2d = {}
-    for stroke, _through in _strokes(material, VIEW_2D):
+    for stroke in _strokes(material, VIEW_2D):
         rows = _rows(stroke)
         triangle, weights, offset = context.old_layout.query(rows[:, :2])
         found = triangle >= 0
@@ -112,9 +103,9 @@ def follow_surface(material, context):
             factors_2d[id(stroke)] = 1.0 / ratio
     brushes.resize(material, factors_2d, (brushes.VIEW, brushes.TEXTURE), context.uids)
     tracks = []
-    for stroke, through in _strokes(material, VIEW_3D):
+    for stroke in _strokes(material, VIEW_3D):
         key = (stroke.number("viewMatrix"), stroke.number("projectionMatrix"))
-        tracks.append((stroke, placement.Track(key, geometry.Camera(*key), _rows(stroke)[:, :2].copy(), through)))
+        tracks.append((stroke, placement.Track(key, geometry.Camera(*key), _rows(stroke)[:, :2].copy())))
     placement.measure_layout([track for _stroke, track in tracks], context)
     factors_3d = {id(stroke): 1.0 / track.size_ratio for stroke, track in tracks if track.size_ratio is not None}
     brushes.resize(material, factors_3d, (brushes.TEXTURE,), context.uids)
