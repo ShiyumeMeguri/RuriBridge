@@ -802,6 +802,11 @@ def _mesh_swapping():
     _mesh_deadline[0] = time.monotonic() + MESH_LOAD_DEADLINE_SECONDS
 
 
+def _mesh_repairing():
+    """The surface is in and the paint of its copies is being repaired: the load has no deadline while it is."""
+    _mesh_deadline[0] = None
+
+
 def _mesh_finished(status=None, applied=None, created=()):
     _mesh_deadline[0] = None
     _presence_due[0] = True
@@ -859,7 +864,8 @@ def _handle(topic, generation):
         _mesh_deadline[0] = time.monotonic() + MESH_LOAD_DEADLINE_SECONDS
         try:
             what = mesh_ingest.apply(generation, DEFAULT_TEXTURE_RESOLUTION, _mesh_finished,
-                                     interpreter=blender_state().get("interpreter") or "", on_swapping=_mesh_swapping)
+                                     interpreter=blender_state().get("interpreter") or "", on_swapping=_mesh_swapping,
+                                     on_repairing=_mesh_repairing)
         except Exception:
             _mesh_deadline[0] = None
             raise
