@@ -251,14 +251,14 @@ def guests(surface, painter, beside, events, resolutions, rehomes):
 # -- sending, and the record once Painter holds it --------------------------------------------------------
 
 def send(session, context, frame_of_project, painter, beside, relaid=None, carry=None, events=None,
-         resolutions=None, dropped=(), rehomes=None):
+         resolutions=None, dropped=(), rehomes=None, repair=None):
     """Send the surface in the project's frame with the masks of its guests and the pictures
     ``beside`` it (``Beside``), and keep the record it leaves until Painter holds it. ``painter`` is
     what Painter states it holds; ``events`` are the events this surface carries faces by,
     ``{(source, target): event}``, and ``rehomes`` the ones whose folder moves with their faces,
     ``{event: (holder, target)}``; ``resolutions`` the sizes of Texture Sets Painter does not have
     yet; ``dropped`` the Texture Sets Painter deletes with it, whose faces start over where they paint
-    now. Returns the generation."""
+    now; ``repair`` the paint Painter repairs for it first (see ``record.mesh``). Returns the generation."""
     objects = mesh_publish.scope(context.view_layer)
     events = dict(events or {})
     names = [name for name in project_names(painter) if name not in set(dropped)]
@@ -267,9 +267,9 @@ def send(session, context, frame_of_project, painter, beside, relaid=None, carry
         surface = gather(objects, frames=False)
         if surface.target is not None and (events or (surface.event != 0).any() or painter.get("guests")):
             payload = guests(surface, painter, beside, events, dict(resolutions or {}), dict(rehomes or {}))
-    generation =mesh_publish.publish(session.publisher(topic_module.MESH), objects, frame_of_project,
+    generation = mesh_publish.publish(session.publisher(topic_module.MESH), objects, frame_of_project,
                                       beside.files, relaid=relaid, guests=payload, carry=carry,
-                                      dropped=dropped)
+                                      dropped=dropped, repair=repair)
     meshes = face_ledger.settled(objects, slot_texture_sets, render_coordinates, events, names, fresh=not names)
     _settling[0] = face_ledger.Pending(generation.record["fingerprints"], meshes)
     return generation

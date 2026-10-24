@@ -41,6 +41,8 @@ queued behind ``execute_when_not_busy`` and reports through a callback.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import substance_painter.layerstack
 import substance_painter.project
 import substance_painter.textureset
@@ -49,7 +51,7 @@ from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import guest_state, layout_state, project_facts
+from . import guest_state, layout_state, paint_repair, project_facts
 
 LOG = logger("painter.mesh")
 
@@ -153,13 +155,17 @@ def would_lose(record):
     return sorted(lost)
 
 
-def apply(generation, texture_resolution, on_finished=None):
+def apply(generation, texture_resolution, on_finished=None, interpreter="", on_swapping=None):
     """Queue this generation's surface into Painter. Returns what it will do.
 
     ``on_finished`` hears the end of a swap, with what it changed of the layouts
     (``layout_state.Applied``) when it went in, and the Texture Sets the swap made. A new
     project says it is ready the way every project does, with ``ProjectEditionEntered`` --
     creating returns long before the project can be asked anything.
+
+    A surface that asks for the paint to be repaired for it (``record.mesh``) has that done first
+    (``paint_repair``), in the interpreter ``interpreter`` names; ``on_swapping`` hears that the surface
+    is about to be swapped in, which for such a surface is when the repair is over.
     """
     record = generation.record
     scene_path = generation.path(record["scene_file"])
@@ -207,6 +213,27 @@ def apply(generation, texture_resolution, on_finished=None):
     if dropping:
         LOG.warning("dropping %s on this swap, as asked", ", ".join(dropping))
 
+    before = {texture_set.name for texture_set in substance_painter.textureset.all_texture_sets()}
+    repair = record.get("repair")
+    if repair:
+        def resume(surface):
+            try:
+                _swap(generation, record, Path(surface), before, on_finished, on_swapping)
+            except Exception as error:
+                LOG.exception("the paint is repaired, but mesh generation %d could not go in: %s", generation.number, error)
+                if on_finished is not None:
+                    on_finished("the paint is repaired, but the surface could not go in: {0}".format(error))
+
+        paint_repair.begin(generation, repair, interpreter, resume, on_finished)
+        return "repair"
+    _swap(generation, record, scene_path, before, on_finished, on_swapping)
+    return "swap"
+
+
+def _swap(generation, record, scene_path, before, on_finished, on_swapping):
+    """Queue the surface in the file ``scene_path`` into the open project; ``before`` are the Texture Sets it had."""
+    if on_swapping is not None:
+        on_swapping()
     try:
         chosen = layout_state.plan(record, str(generation.directory))
         guests = guest_state.plan(record, str(generation.directory))
@@ -217,7 +244,6 @@ def apply(generation, texture_resolution, on_finished=None):
     if emptied:
         LOG.info("%s keep no face and go with this swap, their paint carried where the faces went",
                  ", ".join(emptied))
-    before = {texture_set.name for texture_set in substance_painter.textureset.all_texture_sets()}
 
     def finished(status):
         _allowed_drops.clear()
@@ -254,7 +280,6 @@ def apply(generation, texture_resolution, on_finished=None):
         substance_painter.project.reload_mesh(str(scene_path), settings, finished)
 
     substance_painter.project.execute_when_not_busy(reload)
-    return "swap"
 
 
 def describe_scene(generation):

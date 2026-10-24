@@ -45,6 +45,7 @@ Blender → Painter 的着色器和贴图分开推;Painter → Blender 的画和
 | Painter 画的 + 着色器参数 → Blender 的材质 | 拉取全部 / 选中材质 | Push All / Selected Materials |
 | Painter 选中的那一层 → Blender(只是图片) | Pull Selected Layer | Push Selected Layer |
 | 纹理集换到另一套 UV 布局,图层全留 | UV Layout ▸ Source UV / Target UV ▸ Retarget | — |
+| 网格改了、UV 没动,画跟着表面走 | 更新网格并修复全部 / 选中笔触 | — |
 | 面换了纹理集,画跟着面走 | Update Mesh(自动) | — |
 
 - **Update Mesh**(按钮在 Blender 面板最上面,不在折叠的推送一节里):把绘制表面发给 Painter。Painter 没开工程就用它新建一个;开着就换网格,
@@ -416,6 +417,14 @@ python -m RuriBridge.Spp.cli retarget <工程> <材质>...|--all --anchor uv|sur
 改文件):① 换网格之前留一份旧场景;② Update Mesh 把新网格换进工程、存盘 —— 工程里有了新场景,这一遍重放用的还是旧笔触;
 ③ 关掉 Painter 跑 `retarget`;④ 开工程再 Update Mesh 一次(同一个网格),Painter 按修好的数据重放。一个材质的笔触只落在它自己的表面上、只被自己的面挡住:
 实测别的材质的面挡在前面时,被挡住的 33 个地形点照样画上了,所以看得见与否只算本材质的三角形。
+
+桥里的 **更新网格并修复笔触**(Blender 面板,全部或选中的 Texture Set;UV 没动、网格变了)把这四步自动做完,Painter 端是
+`Host/Substance/paint_repair.py`:网格记录带 `repair`(锚定 `uv` 和 Texture Set 名单),Painter 存盘并另存一份(旧表面),先把新表面换进来一遍并存盘
+(工程文件里有了新场景),关掉工程,在 Blender 的解释器里(Blender 在在场记录的 `interpreter` 里说明;Painter 自带的 Python 没有 numpy)
+另起进程跑 `retarget` 改一份拷贝,拷贝顶替工程文件,开工程,然后照常换网格 —— 这一遍 Painter 按修好的数据重放。工程要先存过盘
+(存盘会把没存的改动一起存);过程中途任何一步失败都把另存的旧工程放回去再打开,工程原样。测试台上真 Painter 加桥的新版全程跑通,
+结果与离线 `retarget` 的数一致(弯曲网格,带副本的笔触 4.9% / 9.1% 缺失 / 多出,不修时 60.6% / 22.0%);解释器不对(Painter 自带那个)
+时进程失败、工程放回、重放结果与原来逐像素相同。
 
 - `--anchor uv`:UV 版面没动、网格动了。画在模型上的笔触和点选,按它们原先落在的 UV 位置:先让它的相机随脚下
   那一小片表面一起动(取新旧两片表面的最佳刚体变换),相机就像原来那样看着新的表面;弯折之类剩下的偏差再

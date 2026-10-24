@@ -145,6 +145,11 @@ def settle_due(is_locked):
     _save["due"] = None
 
 
+def settled():
+    """Whether no save of the project's own file is announced or waits to be settled."""
+    return _save["target"] is None and _save["due"] is None
+
+
 def forget():
     """The project closed or another opened: no save of it is in flight or due."""
     _save["target"] = None

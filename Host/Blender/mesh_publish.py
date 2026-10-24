@@ -441,11 +441,11 @@ def layout_fingerprints(parts):
 
 
 def publish(publisher, objects, frame_of_project, files, relaid=None, guests=None, carry=None,
-            dropped=None):
+            dropped=None, repair=None):
     """Gather, write and publish the surface in the project's frame. Returns the generation.
 
     ``files`` are the pictures the records name, ``{file name: bytes}``, written beside the
-    record. ``guests`` and ``dropped`` cross as they are (see ``record.mesh``); so does ``carry``,
+    record. ``guests``, ``dropped`` and ``repair`` cross as they are (see ``record.mesh``); so does ``carry``,
     but for the mesh
     maps of each target, ``{usage: (file name, bytes)}``, which are written beside the record.
 
@@ -510,7 +510,8 @@ def publish(publisher, objects, frame_of_project, files, relaid=None, guests=Non
             relaid=payload,
             guests=guests,
             carry=carried,
-            dropped=dropped))
+            dropped=dropped,
+            repair=repair))
 
 
 # -- shading rows ------------------------------------------------------------------

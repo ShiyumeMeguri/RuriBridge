@@ -52,8 +52,8 @@ from ...Kernel import record as record_module
 from ...Kernel import session as session_module
 from ...Kernel import topic as topic_module
 
-from . import (guest_state, held_imports, layout_state, material_seed, mesh_ingest, project_imports,
-               seeding, shader_state, texture_publish)
+from . import (guest_state, held_imports, layout_state, material_seed, mesh_ingest, paint_repair,
+               project_imports, seeding, shader_state, texture_publish)
 
 LOG = log_module.logger("painter")
 
@@ -797,6 +797,11 @@ def apply_shading(record):
     return "; ".join(parts)
 
 
+def _mesh_swapping():
+    """The surface is about to be swapped in: the load has its deadline from here."""
+    _mesh_deadline[0] = time.monotonic() + MESH_LOAD_DEADLINE_SECONDS
+
+
 def _mesh_finished(status=None, applied=None, created=()):
     _mesh_deadline[0] = None
     _presence_due[0] = True
@@ -853,12 +858,16 @@ def _handle(topic, generation):
     if topic is topic_module.MESH:
         _mesh_deadline[0] = time.monotonic() + MESH_LOAD_DEADLINE_SECONDS
         try:
-            what = mesh_ingest.apply(generation, DEFAULT_TEXTURE_RESOLUTION, _mesh_finished)
+            what = mesh_ingest.apply(generation, DEFAULT_TEXTURE_RESOLUTION, _mesh_finished,
+                                     interpreter=blender_state().get("interpreter") or "", on_swapping=_mesh_swapping)
         except Exception:
             _mesh_deadline[0] = None
             raise
+        if what == "repair":
+            _mesh_deadline[0] = None
         _panel.set_status("{0}: {1}".format(
-            "creating the project" if what == "create" else "swapping the mesh in",
+            {"create": "creating the project", "repair": "repairing the paint, then swapping the mesh in"}.get(
+                what, "swapping the mesh in"),
             mesh_ingest.describe_scene(generation)))
         return True
     if topic is topic_module.INPUTS:
@@ -928,7 +937,7 @@ def pump():
                     "channel", MESH_LOAD_DEADLINE_SECONDS)
         _mesh_deadline[0] = None
     CONNECTION.session.touch()
-    if seeding.running() or substance_painter.project.is_busy():
+    if seeding.running() or paint_repair.running() or substance_painter.project.is_busy():
         return
     for endpoint, payload in CONNECTION.session.changed_state():
         if endpoint.topic is topic_module.PRESENCE:
@@ -958,6 +967,11 @@ def _on_timer():
         if seeding.running() and not substance_painter.project.is_busy():
             _panel.set_status(seeding.advance(project_is_locked))
             _presence_due[0] = not seeding.running()
+        if paint_repair.running():
+            line = paint_repair.advance(project_is_locked)
+            if line:
+                _panel.set_status(line)
+            _presence_due[0] = not paint_repair.running()
         if _presence_due[0] and not substance_painter.project.is_busy():
             _presence_due[0] = False
             publish_presence()
@@ -1016,6 +1030,7 @@ def _rest_in_the_strip(_event=None):
 
 _EVENTS = (
     (substance_painter.event.ProjectEditionEntered, _on_project_ready),
+    (substance_painter.event.ProjectEditionEntered, paint_repair.on_project_ready),
     (substance_painter.event.ProjectClosed, _on_project_closed),
     (substance_painter.event.ProjectAboutToSave, project_imports.before_save),
     (substance_painter.event.ProjectSaved, project_imports.after_save),

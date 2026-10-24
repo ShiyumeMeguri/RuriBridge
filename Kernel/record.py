@@ -18,7 +18,7 @@ import json
 import os
 from pathlib import Path
 
-FORMAT_VERSION = 16
+FORMAT_VERSION = 17
 
 #: What a request is asking for. The only "kind" left, because it is the only
 #: one that distinguishes something WITHIN a topic -- every other distinction is
@@ -160,7 +160,7 @@ def same_frame(first, second, tolerance=1e-9):
 
 
 def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_sets,
-         fingerprints, relaid=None, guests=None, carry=None, dropped=None):
+         fingerprints, relaid=None, guests=None, carry=None, dropped=None, repair=None):
     """The surface somebody paints on, in the frame of the project it is for.
 
     ``scene`` describes what went into the file (object names, how many faces
@@ -218,6 +218,11 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
 
     ``dropped`` are Texture Sets the texturing side deletes with this surface, layers and all:
     nothing on it paints into them, and somebody chose to let them go.
+
+    ``repair`` asks for the paint of Texture Sets to be repaired for this surface before it goes in, so
+    that what was painted lands where it was painted on the new surface: ``{"anchor": "uv",
+    "texture_sets": [name]}`` -- ``anchor`` says what stayed (``uv``: every layout, the mesh changed) --
+    or None for a surface that changes nothing the paint depends on.
     """
     record = _base("mesh", source)
     record.update({
@@ -232,6 +237,7 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
         "guests": guests or {},
         "carry": carry,
         "dropped": sorted(dropped or []),
+        "repair": repair,
     })
     return record
 
@@ -416,7 +422,7 @@ def inputs(source, texture_sets):
 
 
 def presence(source, document, texture_sets=(), materials=(), textures_directory="",
-             frame_of_project=None, surface=None, guests=None):
+             frame_of_project=None, surface=None, guests=None, interpreter=""):
     """What this application has open, stated by the application itself.
 
     Everybody publishes it and everybody reads everybody else's, which is how a
@@ -433,10 +439,13 @@ def presence(source, document, texture_sets=(), materials=(), textures_directory
     textures of its document live. A material row names the generated shader the material runs
     and that shader's identity, empty for a material nobody generated.
     ``document`` is empty when nothing is open, which is an answer and not a
-    missing one.
+    missing one. ``interpreter`` is the Python interpreter the application runs, for the
+    others to run in a process of their own what needs a library theirs does not have; empty
+    for an application whose interpreter nobody else can start.
     """
     record = _base("here", source)
     record.update({
+        "interpreter": interpreter or "",
         "document": document or "",
         "texture_sets": list(texture_sets),
         "materials": list(materials),

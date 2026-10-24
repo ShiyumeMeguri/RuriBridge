@@ -4,7 +4,9 @@
 The same verbs as Painter's end, from this side, and one table:
 
 * **Update Mesh** sends the model -- the surface somebody paints on -- and Painter
-  swaps it in under every layer it already has; nothing else changes.
+  swaps it in under every layer it already has; nothing else changes. **Update Mesh And
+  Repair Paint** first has Painter repair the paint of Texture Sets for the changed mesh,
+  the UV layouts staying where they are.
 * **Push Shader** -- every Texture Set, or the one the active material paints into: the
   shader of the material that paints it, with every parameter, into Painter.
 * **Push Textures** -- the material's own textures stood up in Painter, where it runs the
@@ -40,6 +42,7 @@ This is the only place in the package allowed to import ``bpy``.
 
 import importlib
 import os
+import sys
 
 import bpy
 
@@ -240,7 +243,7 @@ def presence_record():
     out is nothing Painter is told of."""
     return record_module.presence(
         HOST.name, bpy.data.filepath, materials=[row for row in _view["materials"] if row["texture_set"]],
-        textures_directory=textures_directory())
+        textures_directory=textures_directory(), interpreter=sys.executable)
 
 
 def refresh_view(force=False):
@@ -328,13 +331,14 @@ def project_frame(context):
         record_module.CENTIMETRES_PER_METRE * context.scene.unit_settings.scale_length)
 
 
-def send_mesh(context, dropped=(), renames=None):
+def send_mesh(context, dropped=(), renames=None, repair=None):
     """Send the model. Painter keeps every layer it has: it only swaps the surface -- a Texture Set
     whose material was renamed here takes the new name, and faces that moved into another Texture Set
     take their paint along: Painter is asked first, and the surface goes with its answer
     (``guest_carry``). ``renames`` are renames asked for by hand (``bind``); the Texture Sets
     ``dropped`` go in Painter with this surface (``drop_in_painter``), and so do those of the
-    materials kept out of it. Returns one line about it."""
+    materials kept out of it; ``repair`` (``repair_request``) has Painter repair the paint of
+    Texture Sets for this surface before it goes in. Returns one line about it."""
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
     objects = mesh_publish.scope(context.view_layer)
@@ -348,14 +352,19 @@ def send_mesh(context, dropped=(), renames=None):
     if found.problems:
         raise RuntimeError("; ".join(found.problems))
     if found.carries:
+        if repair is not None:
+            raise RuntimeError("faces move into another Texture Set and take their paint along with a plain Update "
+                               "Mesh; send that first, then repair")
         if not painter_is_attached():
             raise RuntimeError("Texture Sets take new names and faces take their paint along only while Painter "
                                "is attached")
         line = guest_carry.begin(CONNECTION.session, found, dropped)
     else:
         generation = surface_crossing.send(CONNECTION.session, context, project_frame(context), painter,
-                                           surface_crossing.Beside(), dropped=dropped)
+                                           surface_crossing.Beside(), dropped=dropped, repair=repair)
         line = "sent the mesh, generation {0}".format(generation.number)
+        if repair is not None:
+            line += "; Painter repairs the paint of {0} first".format(", ".join(repair["texture_sets"]))
     if dropped:
         line += "; {0} go(es) in Painter with it".format(", ".join(sorted(dropped)))
     if found.relaid:
@@ -365,6 +374,22 @@ def send_mesh(context, dropped=(), renames=None):
         line += "; faces laid out anew in place, without Retarget Layout: {0}".format(named)
     refresh_view(force=True)
     return line
+
+
+def repair_request(texture_sets=None):
+    """What an Update Mesh asks Painter to repair the paint of for the surface it sends, the layouts
+    staying where they are and the mesh having changed: every Texture Set Painter holds that a
+    material here paints, or these. Painter runs the repair in a process of its own, with the
+    interpreter this side states in its presence."""
+    painter = painter_state()
+    if not painter_is_attached() or not painter.get("document"):
+        raise RuntimeError("Painter has no project open, so there is no paint to repair")
+    held = {entry["name"] for entry in painter.get("texture_sets") or []}
+    painted = {row["texture_set"] for row in _view["materials"] if row["texture_set"]}
+    chosen = sorted(held & painted if texture_sets is None else held & set(texture_sets))
+    if not chosen:
+        raise RuntimeError("no Texture Set both Painter's project and a material here paint into is named")
+    return {"anchor": "uv", "texture_sets": chosen}
 
 
 def selected_texture_set(context):
@@ -896,6 +921,29 @@ class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
 
 def _scope(properties):
     return "当前材质的 Texture Set" if properties.selected else "全部 Texture Set"
+
+
+class RURIBRIDGE_OT_repair_mesh(bpy.types.Operator):
+    bl_idname = "ruri_bridge.repair_mesh"
+    verb, subject = "更新网格并修复", "笔触"
+    bl_label = verb + subject
+    selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
+
+    @classmethod
+    def description(cls, _context, properties):
+        return ("更新网格,并让 Painter 先按 UV 锚定修好 {0} 的笔触、多边形填充和空间投影的框:UV 没动、网格变了,"
+                "画上去的东西要落回原来的 UV 位置。Painter 会存盘、关掉工程、在另一个进程里改文件、"
+                "重开工程再换网格,工程要先存过盘".format(_scope(properties)))
+
+    def execute(self, context):
+        try:
+            texture_sets = [selected_texture_set(context)] if self.selected else None
+            line = send_mesh(context, repair=repair_request(texture_sets))
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        say(line)
+        return {"FINISHED"}
 
 
 def _scoped(operator, context, act):
@@ -1463,6 +1511,7 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
         sending.enabled = CONNECTION.is_open
         sending.scale_y = 1.3
         sending.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
+        _draw_scoped(sending, RURIBRIDGE_OT_repair_mesh, "MOD_MESHDEFORM")
         column = layout.column(align=True)
         column.enabled = attached
         column.scale_y = 1.3
@@ -1677,8 +1726,8 @@ class RURIBRIDGE_PT_cascadeur(bpy.types.Panel):
 
 
 _CLASSES = (RuriBridgePreferences, RuriBridgeRetargetSettings,
-            RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_push_shader, RURIBRIDGE_OT_push_textures,
-            RURIBRIDGE_OT_pull_materials,
+            RURIBRIDGE_OT_send_mesh, RURIBRIDGE_OT_repair_mesh, RURIBRIDGE_OT_push_shader,
+            RURIBRIDGE_OT_push_textures, RURIBRIDGE_OT_pull_materials,
             RURIBRIDGE_OT_pull_selected_layer, RURIBRIDGE_OT_bind, RURIBRIDGE_OT_drop_in_painter,
             RURIBRIDGE_OT_exclude, RURIBRIDGE_OT_retarget_layout,
             RURIBRIDGE_OT_map_texture, RURIBRIDGE_OT_invert_lane,
