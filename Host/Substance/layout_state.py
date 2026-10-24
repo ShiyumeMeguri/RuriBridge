@@ -207,6 +207,11 @@ def _reads_canvas(source):
     return isinstance(source, source_module.SourceReference) and source.anchor is None
 
 
+def reads_canvas(node):
+    """Whether a fill reads, in some channel, an anchor point of a canvas."""
+    return any(_reads_canvas(source) for source in _sources(node) if source is not None)
+
+
 def _reads_stack(source):
     """Whether a source reads the layer stack itself, which is laid out in set 0."""
     if isinstance(source, source_module.SourceReference):

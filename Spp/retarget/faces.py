@@ -15,7 +15,9 @@ from collections import Counter
 
 import numpy as np
 
+from .. import document as document_module
 from .. import stream
+from . import fills as fills_module
 from . import geometry, hits, selection, strokes
 from .context import Context
 
@@ -47,6 +49,25 @@ def _layer(material, uid):
     if len(found) != 1:
         raise ValueError("{0} layers of {1} have the uid {2}, not one".format(len(found), material.text("sceneMaterialName"), uid))
     return found[0]
+
+
+def read_canvases(material, entries, origin, uids):
+    """Make the fill layers of ``material`` that ``entries`` -- ``{"layer", "from", "index"}`` each -- name read what the layers of
+    ``origin``, a ``DataMaterial`` they were copied from, read: the anchor points of a canvas, through the UV set ``index`` of
+    the mesh that holds where the faces' paint is laid out. Painter's interface cannot lay such a reading, so the copy was laid
+    as a plain fill and the references are copied here, from the layer it stands for."""
+    done = 0
+    for entry in entries:
+        placed, standing = _layer(material, entry["layer"]), _layer(origin, entry["from"])
+        fills = [action for layer in (placed, standing) for action in layer["actions"]["items"] if action.type == fills_module.FILL]
+        if len(fills) != 2:
+            raise ValueError("{0} and its copy do not each hold one fill".format(origin.text("sceneMaterialName")))
+        copy, original = fills
+        copy["sources"] = [document_module.renewed(source, uids)[0] for source in original["sources"]]
+        copy.set_number("projection", fills_module.UV_SET_TO_UV_SET)
+        copy.set_number("uvTransferChannel", entry["index"])
+        done += 1
+    return {"canvas readers": done}
 
 
 def run(material, roots, old, new, source, uids):

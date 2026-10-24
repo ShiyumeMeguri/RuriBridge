@@ -59,11 +59,13 @@ def split(target, old_scene, new_scene, source, name, uv_set=0):
     return split_surfaces(target, geometry.Surface.of(scene.read(old_scene), uv_set), geometry.Surface.of(scene.read(new_scene), uv_set), source, name)
 
 
-def carry_surfaces(target, old, new, events):
+def carry_surfaces(target, old, new, events, before=None):
     """Repair the paint of layers copied into materials of the open, writable project ``target``, for faces carried into those
     from other materials: ``old`` is the surface the paint was made on and ``new`` the one the project holds, and each of
-    ``events`` -- ``{"source", "target", "roots"}`` -- names the material the faces came from, the one the copies are in and the
-    uids of the copies' root layers. Returns what the passes did, by material the copies are in."""
+    ``events`` -- ``{"source", "target", "roots", "canvases"}`` -- names the material the faces came from, the one the copies are in,
+    the uids of the copies' root layers and the copies that read a canvas (see ``faces.read_canvases``), which are read from
+    ``before``, the document of the project as it stood before the faces moved. Returns what the passes did, by material the
+    copies are in."""
     document = stream.read(target.read(project.DOCUMENT))
     found = {material.text("sceneMaterialName"): material for material in document.root["materials"]}
     missing = [event["target"] for event in events if event["target"] not in found]
@@ -72,7 +74,13 @@ def carry_surfaces(target, old, new, events):
     uids = document_module.Uids(document.root)
     report = {}
     for event in events:
-        done = faces.run(found[event["target"]], event["roots"], old, new, event["source"], uids)
+        if event.get("canvases"):
+            if before is None:
+                raise ValueError("copies that read a canvas need the document of the project as it stood before the faces moved")
+            origins = {material.text("sceneMaterialName"): material for material in before.root["materials"]}
+            merged = report.setdefault(event["target"], {})
+            merged["faces.read_canvases"] = faces.read_canvases(found[event["target"]], event["canvases"], origins[event["source"]], uids)
+        done = faces.run(found[event["target"]], event["roots"], old, new, event["source"], uids) if event["roots"] else {}
         merged = report.setdefault(event["target"], {})
         for name, counts in done.items():
             total = Counter(merged.get(name, {}))
@@ -83,12 +91,13 @@ def carry_surfaces(target, old, new, events):
     return report
 
 
-def carry(target, old_scene, events, uv_set=0):
+def carry(target, old_scene, events, uv_set=0, old_document=None):
     """``carry_surfaces`` for the surfaces held in scene files: ``old_scene`` is the bytes of the ``scene.assbin`` the paint was made on
-    and the project's own scene is the surface it is on now."""
+    and the project's own scene is the surface it is on now; ``old_document`` the bytes of the project's document as it stood
+    before the faces moved, for the copies that read a canvas."""
     old = geometry.Surface.of(scene.read(old_scene), uv_set)
     new = geometry.Surface.of(scene.read(target.read(project.SCENE)), uv_set)
-    return carry_surfaces(target, old, new, events)
+    return carry_surfaces(target, old, new, events, None if old_document is None else stream.read(old_document))
 
 
 def lay_canvases(target, names, surface, surface_out):

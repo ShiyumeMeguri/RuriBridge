@@ -87,6 +87,13 @@ def _layers_under(node):
     return found
 
 
+def _reads_canvas(node):
+    """Whether a layer is a fill that reads a canvas (``canvas_state``): what the paint of the Texture Set it lies in is kept in, which a
+    layer of another Texture Set cannot read through Painter's interface -- an instance of it shows nothing -- so it is carried like
+    paint is, as a copy, and its reading is written into the project's document once it is in."""
+    return isinstance(node, layerstack.FillLayerNode) and layout_state.reads_canvas(node)
+
+
 def _kind(node):
     """``group`` for a folder, ``plain`` for a fill with no effect and no mask, ``other`` else:
     what a copy can be made of."""
@@ -117,7 +124,7 @@ def _layer(node, texture_set, painted, seed, emptied, staging, measured):
     Texture Set only when ``measured`` and it would be copied."""
     shows = shown_by(node)
     home = shows.get_texture_set().name
-    paint = any(layer.uid() in painted for layer in _layers_under(shows))
+    paint = any(layer.uid() in painted or _reads_canvas(layer) for layer in _layers_under(shows))
     own_seed = seed is not None and node.uid() == int(seed)
     copied = measured and home == texture_set.name and not own_seed and (paint or emptied)
     return {"uid": node.uid(), "name": node.get_name(), "shows": shows.uid(), "home": home,
@@ -412,6 +419,9 @@ def plan(record, directory):
                 elif root["carry"] == "copy" and _kind(shows) == "other":
                     problems.append("{0}: {1} would have to be copied, and only folders and plain fills can be; "
                                     "put it in a folder in Painter".format(carried["source"], node.get_name()))
+                elif root["carry"] == "copy" and any(_reads_canvas(layer) for layer in _layers_under(shows)[1:]):
+                    problems.append("{0}: {1} holds a layer that reads a canvas, which a folder cannot be copied with; "
+                                    "take that layer out of the folder in Painter".format(carried["source"], node.get_name()))
                 if root["carry"] == "skip":
                     continue
                 for layer in [node] + (_layers_under(shows) if root["carry"] == "copy" else []):
@@ -465,8 +475,10 @@ def _shape(node):
 
 
 def _plain(node):
-    """Everything a plain fill lays, to lay it again."""
+    """Everything a plain fill lays, to lay it again. What a fill reads from a canvas is laid as black here, and written into the
+    document as what it reads once the copy is in (``canvas``)."""
     channels = {}
+    reading = False
     for channel in node.active_channels:
         source = node.get_source(channel)
         if isinstance(source, source_module.SourceBitmap):
@@ -474,12 +486,15 @@ def _plain(node):
                     "space": source.get_color_space()}
         elif isinstance(source, source_module.SourceUniformColor):
             laid = {"colour": source.get_color()}
+        elif layout_state.reads_canvas(node):
+            laid = {"colour": colormanagement.Color(0.0, 0.0, 0.0)}
+            reading = True
         else:
             raise GuestError("{0} lays {1} from a {2}, which a plain copy cannot lay again".format(
                 node.get_name(), channel.name, type(source).__name__))
         channels[channel] = dict(laid, blending=node.get_blending_mode(channel), opacity=node.get_opacity(channel))
     return {"name": node.get_name(), "visible": node.is_visible(), "projection": node.get_projection_mode(),
-            "parameters": node.get_projection_parameters(), "channels": channels}
+            "parameters": node.get_projection_parameters(), "channels": channels, "canvas": reading}
 
 
 def _blending(node, channels):
@@ -761,6 +776,7 @@ def _build(texture_set, index, event, carried, mask, chosen):
     following = {uid for uid in _following(texture_set)}
     bound = set()
     repaired = []
+    reading = []
     turned = set()
     for how, made, copy, reads, paint in laid:
         if how == "copy":
@@ -773,7 +789,9 @@ def _build(texture_set, index, event, carried, mask, chosen):
                 if int(uid) in found:
                     _lay_normal(layerstack.get_node_by_uid(found[int(uid)]), path)
                     turned.add(int(uid))
-            if paint:
+            if copy["kind"] != "group" and copy["plain"]["canvas"]:
+                reading.append({"layer": made.uid(), "from": int(copy["shape"]["uid"]), "index": index})
+            elif paint:
                 repaired.append(made.uid())
         if reads == "painted":
             _carried_fills(made, index, following, bound)
@@ -781,7 +799,8 @@ def _build(texture_set, index, event, carried, mask, chosen):
         chosen.notes.append("{0}: a fill laying normals ({1}) lies under an instance in a copy, and keeps the "
                             "directions the old islands gave them".format(carried["source"], uid))
     return ({"source": carried["source"], "group": group.uid(), "mask": mask_fill.uid(), "file": os.path.basename(mask)},
-            len(laid), {"source": _home(carried), "target": texture_set.name, "roots": repaired} if repaired else None)
+            len(laid), {"source": _home(carried), "target": texture_set.name, "roots": repaired, "canvases": reading}
+            if repaired or reading else None)
 
 
 def _following(texture_set):

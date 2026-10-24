@@ -20,8 +20,10 @@ the UV layout follow the surface to the new layout by way of it. ``--passes`` na
 ``hits``, ``fills``) when something else takes care of the rest; every pass of the anchor otherwise.
 
 ``carry`` repairs the paint of layers copied into a material for the faces carried into it from another one. FILE is JSON,
-``[{"source": material the faces came from, "target": material the copies are in, "roots": [uid of each copied layer]}]``; SCENE
-is the surface the paint was made on, a project file or a ``scene.assbin``, and the surface the faces lie on now is PROJECT's own.
+``[{"source": material the faces came from, "target": material the copies are in, "roots": [uid of each copied layer], "canvases":
+[{"layer": uid of a plain fill laid for a layer that reads a canvas, "from": uid of that layer, "index": the UV set that holds where
+the faces' paint is laid out}]}]``; SCENE is the surface the paint was made on, a project file or a ``scene.assbin`` -- a project file
+when there are ``canvases``, whose layers are read from its document -- and the surface the faces lie on now is PROJECT's own.
 
 ``canvas`` gives each MATERIAL of PROJECT a canvas (see ``retarget.canvas``) for a mesh that changed under a UV layout that stayed:
 the material is copied with all its paint, and left reading the copy. FBX is the surface the project is to have, written by ``Spp.fbx``;
@@ -63,6 +65,14 @@ def _scene_bytes(path):
             return opened.read(project.SCENE)
     with open(path, "rb") as handle:
         return handle.read()
+
+
+def _document_bytes(path):
+    """The document of the project at ``path``, or None for a scene file."""
+    if not path.lower().endswith(".spp"):
+        return None
+    with project.Project(path) as opened:
+        return opened.read(project.DOCUMENT)
 
 
 def _retarget(arguments):
@@ -110,7 +120,7 @@ def _carry(arguments):
         events = json.load(handle)
     old = _scene_bytes(arguments.old)
     with project.edited(arguments.project, arguments.out) as changing:
-        report = job.carry(changing, old, events, arguments.uv_set)
+        report = job.carry(changing, old, events, arguments.uv_set, _document_bytes(arguments.old))
     return {"events": events, "project": arguments.out or arguments.project, "report": report}
 
 
