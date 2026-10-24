@@ -37,6 +37,24 @@ class Uids:
         return value
 
 
+def repeated(root):
+    """The uids more than one object under ``root`` uses: a stream whose objects cannot be told apart by their uids is one Painter
+    cannot open, so nothing that changes a stream is written while this is not empty."""
+    seen, found = set(), set()
+    for item in stream.walk(root):
+        if _has_uid(item):
+            uid = item.number(UID)
+            (found if uid in seen else seen).add(uid)
+    return sorted(found)
+
+
+def require_unique(root, what):
+    """Raise ``DocumentError`` naming ``what`` if two objects under ``root`` share a uid."""
+    twice = repeated(root)
+    if twice:
+        raise DocumentError("{0} would use {1} uid(s) twice, among them {2}".format(what, len(twice), ", ".join(str(uid) for uid in twice[:5])))
+
+
 def renewed(source, uids):
     """A copy of ``source`` whose every uid is new, and the new uid of each old one: ``(copy, {old: new})``."""
     copy = source.copy()

@@ -38,6 +38,8 @@ class Streams:
         return self.viewer.root["materialSettings"]["shaders"]
 
     def save(self, target):
+        for name, found in (("the document", self.document), ("the viewer settings", self.viewer), ("the baking settings", self.baking)):
+            document.require_unique(found.root, name)
         target.write(project.DOCUMENT, stream.write(self.document))
         target.write(project.VIEWER_SETTINGS, stream.write(self.viewer))
         target.write(project.BAKING_SETTINGS, stream.write(self.baking))
@@ -75,13 +77,18 @@ def clone(streams, source, name):
     """Add a material called ``name`` that is a copy of the one called ``source``; the uid of the new one.
 
     Everything under the copy takes new uids, so it shares nothing with the original but the pictures its
-    layers and shader name by URL, which a project holds once however many materials use them.
+    layers and shader name by URL, which a project holds once however many materials use them. What inside the
+    copy names something else inside it -- an anchor a fill reads, a layer an instance shows -- names the
+    copy's own; what names something outside stays as it was.
     """
     original = _material(streams, source)
     if any(material.text(_NAME) == name for material in streams.materials):
         raise document.DocumentError("there is already a material called {0}".format(name))
     shader = _clone_shader(streams, original.number(_SHADER), name)
-    copy, _mapping = document.renewed(original, document.Uids(streams.document.root))
+    copy, mapping = document.renewed(original, document.Uids(streams.document.root))
+    for item, field, uid in document.references(copy):
+        if uid in mapping:
+            item.set_number(field, mapping[uid])
     copy.set_text(_NAME, name)
     copy.set_number(_SCENE_UID, _scene_uid(name, streams))
     copy.set_number(_SHADER, shader)
