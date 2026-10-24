@@ -23,16 +23,6 @@ TEXTURE = 2
 STEP = 1.01
 
 
-def _lists(material):
-    """Every list of the material that holds actions with a brush."""
-    found = []
-    for item in stream.walk(material):
-        for _field, _code, value in item.items():
-            if isinstance(value, list) and any(isinstance(entry, stream.Object) and entry.type in HOLDERS for entry in value):
-                found.append(value)
-    return found
-
-
 def _pieces(action, factors, uids):
     """``action`` as the actions that give each of its strokes the size ``factors`` (by ``id`` of the stroke) asks for."""
     strokes = list(action["strokes"])
@@ -59,7 +49,7 @@ def _pieces(action, factors, uids):
 def resize(material, factors, spaces, uids):
     """Scale the brushes of the material's actions whose size is measured in one of ``spaces``: each stroke by its
     factor in ``factors`` (``id`` of the stroke -> factor). New actions take their uids from ``uids``."""
-    for items in _lists(material):
+    for items in stream.holders(material, HOLDERS):
         rebuilt = []
         for entry in items:
             brush = entry["brush"] if entry.type in HOLDERS else None

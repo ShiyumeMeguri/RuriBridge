@@ -365,6 +365,21 @@ class UvIndex:
                         weights[begin:end], offset[begin:end])
         return found, weights, offset
 
+    def holding(self, points):
+        """How many triangles of the index hold each of ``points`` (n, 2) in the UV layout: more than one where islands
+        lie over one another."""
+        counts = np.zeros(len(points), dtype=np.int64)
+        cells = np.floor((points - self.origin) / self.size).astype(np.int64)
+        inside = ((cells >= 0) & (cells < self.resolution)).all(axis=1)
+        cells = np.clip(cells, 0, self.resolution - 1)
+        cells = cells[:, 1] * self.resolution + cells[:, 0]
+        query, triangle = _candidates(self.starts, self.entries, cells)
+        keep = inside[query]
+        query, triangle = query[keep], triangle[keep]
+        _weights, held = _barycentric(self.surface.uvs[self.surface.triangles[triangle]], points[query])
+        np.add.at(counts, query[held], 1)
+        return counts
+
     def _query(self, points, near, found, weights, offset):
         cells = np.floor((points - self.origin) / self.size).astype(np.int64)
         inside = ((cells >= 0) & (cells < self.resolution)).all(axis=1)
@@ -405,15 +420,17 @@ class UvIndex:
 class Correspondence:
     """The triangles of one surface found again in another surface that lies in the same places.
 
-    A triangle of ``old`` counterparts the triangle of ``new`` with the same corners in space and the same
-    material, however the corners are numbered. That is exact where the nearest triangle to a point on a UV
-    seam is not: across the seam the surface continues in a triangle that is elsewhere in the layout.
+    A triangle of ``old`` counterparts the triangle of ``new`` with the same corners in space and, with
+    ``same_material``, the same material, however the corners are numbered. That is exact where the nearest
+    triangle to a point on a UV seam is not: across the seam the surface continues in a triangle that is
+    elsewhere in the layout. Without ``same_material`` a triangle is found again when it was given another material.
     """
 
-    def __init__(self, old, new, tolerance):
+    def __init__(self, old, new, tolerance, same_material=True):
         self.old = old
         self.new = new
         self.tolerance = tolerance
+        self.same_material = same_material
         self._material = np.array([new.names.index(name) if name in new.names else -1 for name in old.names], dtype=np.int64)
         self._lookup = {tuple(key): index for index, key in enumerate(self._keys(new))}
 
@@ -422,7 +439,7 @@ class Correspondence:
         quantized = np.round(surface.positions / self.tolerance).astype(np.int64)
         vertex = (quantized[:, 0] * 73856093) ^ (quantized[:, 1] * 19349663) ^ (quantized[:, 2] * 83492791)
         corners = np.sort(vertex[surface.triangles], axis=1)
-        return np.concatenate([corners, names[surface.materials][:, None]], axis=1)
+        return np.concatenate([corners, names[surface.materials][:, None]], axis=1) if self.same_material else corners
 
     def carry(self, triangles, weights):
         """For each of ``triangles`` of the old surface with its ``weights``, the counterpart triangle of the new one
@@ -440,7 +457,8 @@ class Correspondence:
             candidate = np.where(same, triangles, 0)
             new_corners = self.new.positions[self.new.triangles[candidate]]
             matches = (np.abs(old_corners - new_corners).max(axis=(1, 2)) <= self.tolerance) & same
-            matches &= self._material[self.old.materials[triangles]] == self.new.materials[candidate]
+            if self.same_material:
+                matches &= self._material[self.old.materials[triangles]] == self.new.materials[candidate]
             found[matches] = candidate[matches]
         keys = self._keys(self.old)[triangles]
         for index in np.nonzero(found < 0)[0]:

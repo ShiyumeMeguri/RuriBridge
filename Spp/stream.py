@@ -162,6 +162,16 @@ def walk(value):
             pending.extend(reversed([child for child in found if child is not None]))
 
 
+def holders(value, types):
+    """Every list under ``value`` (an object, or an array of them) that holds an object whose type is one of ``types``."""
+    found = []
+    for item in walk(value):
+        for _field, _code, member in item.items():
+            if isinstance(member, list) and any(isinstance(entry, Object) and entry.type in types for entry in member):
+                found.append(member)
+    return found
+
+
 class _Reader:
     def __init__(self, data):
         self.data = memoryview(data)

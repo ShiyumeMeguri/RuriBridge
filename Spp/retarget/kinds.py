@@ -9,8 +9,9 @@ SURFACE = "surface"
 
 _FILL = "DataActionFill"
 _UV_PROJECTION = 0
+#: Planar, triplanar, spherical, cylindrical and warp: laid on the surface through a frame in space.
+_SPACE_PROJECTIONS = (1, 2, 3, 4, 7)
 _VIEW_2D = 0
-_VIEW_3D = 1
 
 
 def _holds_3d_keys(item):
@@ -19,9 +20,7 @@ def _holds_3d_keys(item):
 
 #: The mesh changed and the UV layout stayed: paint that follows the mesh and is not moved.
 MESH_BOUND = (
-    ("polygon fills chosen by a rectangle through a camera",
-     lambda item: item.type == "DataDecalHitRect" and item.number("viewType") == _VIEW_3D),
-    ("fills projected in space", lambda item: item.type == _FILL and item.number("projection") != _UV_PROJECTION),
+    ("fills projected in space", lambda item: item.type == _FILL and item.number("projection") in _SPACE_PROJECTIONS),
     ("strokes kept as keys in space", _holds_3d_keys),
     ("strokes with several symmetry duplicates", lambda item: item.type == "DataStroke" and item.number("duplicateCount") > 1),
 )
@@ -29,7 +28,8 @@ MESH_BOUND = (
 #: The UV layout changed and the mesh stayed: paint that follows the layout and is not moved.
 LAYOUT_BOUND = (
     ("fills laid through the UV layout", lambda item: item.type == _FILL and item.number("projection") == _UV_PROJECTION),
-    ("polygon fills chosen by a rectangle in the UV view", lambda item: item.type == "DataDecalHitRect" and item.number("viewType") == _VIEW_2D),
+    ("polygon fills in the UV view with a symmetry duplicate",
+     lambda item: item.type in ("DataDecalHitPunctual", "DataDecalHitRect") and item.number("viewType") == _VIEW_2D and item.number("duplicateCount") != 0),
 )
 
 BY_ANCHOR = {UV: MESH_BOUND, SURFACE: LAYOUT_BOUND}

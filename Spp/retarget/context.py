@@ -7,7 +7,7 @@ from functools import cached_property
 
 import numpy as np
 
-from . import geometry
+from . import geometry, selection
 
 
 #: How far apart, in the UV layout, the old layout and the new mesh's copy of it may lie.
@@ -54,6 +54,18 @@ class Context:
         return self._source_set
 
     @cached_property
+    def old_elements(self):
+        return selection.elements(self.old)
+
+    @cached_property
+    def old_chunks(self):
+        return selection.chunks(self.old)
+
+    @cached_property
+    def new_chunks(self):
+        return selection.chunks(self.new)
+
+    @cached_property
     def diagonal(self):
         return float(np.linalg.norm(self.new.positions.max(axis=0) - self.new.positions.min(axis=0)))
 
@@ -77,3 +89,8 @@ class Context:
     @cached_property
     def counterpart(self):
         return geometry.Correspondence(self.old, self.new, 1e-5 * self.diagonal)
+
+    @cached_property
+    def counterpart_any_material(self):
+        """The same, finding a triangle again when it was given another material (a material split in two)."""
+        return geometry.Correspondence(self.old, self.new, 1e-5 * self.diagonal, same_material=False)
