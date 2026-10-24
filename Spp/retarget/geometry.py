@@ -83,6 +83,12 @@ class Camera:
         camera.matrix = np.linalg.inv(np.array(inverse, dtype=np.float64).reshape(4, 4).T)
         return camera
 
+    def following(self, transform):
+        """The camera that sees the world moved by ``transform`` (4x4) the way this one sees the world."""
+        camera = Camera.__new__(Camera)
+        camera.matrix = self.matrix @ np.linalg.inv(transform)
+        return camera
+
     def clip(self, points):
         """The homogeneous clip-space position of each of ``points``."""
         homogeneous = np.concatenate([points, np.ones((len(points), 1))], axis=1)
@@ -92,6 +98,36 @@ class Camera:
         """Where ``points`` fall on the screen, as Painter's strokes hold it: ``0..1`` across and up."""
         clip = self.clip(points)
         return (clip[:, :2] / clip[:, 3:4]) * 0.5 + 0.5
+
+
+def rigid_fit(old, new):
+    """The 4x4 rigid motion taking the points ``old`` (n, 3) as near as it can to ``new``, least squares (Kabsch);
+    the identity where the points do not pin one down (fewer than three, or all on a line)."""
+    if len(old) < 3:
+        return np.eye(4)
+    old_centre, new_centre = old.mean(axis=0), new.mean(axis=0)
+    covariance = (old - old_centre).T @ (new - new_centre)
+    left, spread, right = np.linalg.svd(covariance)
+    if spread[1] <= 1e-12 * max(spread[0], 1e-300):
+        return np.eye(4)
+    sign = np.sign(np.linalg.det(right.T @ left.T))
+    rotation = right.T @ np.diag([1.0, 1.0, sign if sign != 0 else 1.0]) @ left.T
+    motion = np.eye(4)
+    motion[:3, :3] = rotation
+    motion[:3, 3] = new_centre - rotation @ old_centre
+    return motion
+
+
+def moved_view(view, transform):
+    """The sixteen floats of the view that sees the world moved by ``transform`` the way ``view`` sees the world."""
+    matrix = np.array(view, dtype=np.float64).reshape(4, 4).T @ np.linalg.inv(transform)
+    return tuple(float(value) for value in matrix.T.reshape(-1))
+
+
+def moved_inverse(inverse, transform):
+    """The sixteen floats of the inverse of projection and view together after the camera follows ``transform``."""
+    matrix = transform @ np.array(inverse, dtype=np.float64).reshape(4, 4).T
+    return tuple(float(value) for value in matrix.T.reshape(-1))
 
 
 def _cells(low, high, origin, size, resolution):

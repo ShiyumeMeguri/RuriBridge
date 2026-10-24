@@ -6,8 +6,9 @@ across and up), or, for a stroke drawn in the UV view, a place in the UV layout.
 whatever surface it has: a stroke through a camera lands on what the camera sees under each point, a stroke in
 the UV view lands where it says.
 
-* ``follow_uv`` -- the mesh moved, the UV layout stayed: the points of a stroke through a camera are moved on the
-  screen to where the camera now sees the UV place each one used to fall on.
+* ``follow_uv`` -- the mesh moved, the UV layout stayed: the camera of a stroke is moved as the patch of surface under
+  it moved, and the points of the stroke are moved on the screen to where that camera now sees the UV place each
+  one used to fall on.
 * ``follow_surface`` -- the UV layout moved, the mesh stayed: a stroke through a camera is right as it is, and
   the points of a stroke in the UV view are carried to where the layout now puts the surface they were on.
 """
@@ -62,6 +63,8 @@ def follow_uv(material, context):
     for stroke, stroke_rows, track in tracks:
         stroke_rows[:, :2] = track.points
         _store(stroke, stroke_rows)
+        if track.transform is not None:
+            stroke.set_number("viewMatrix", geometry.moved_view(track.key[0], track.transform))
         counts["strokes"] += 1
         counts["points"] += len(stroke_rows)
         counts["seen"] += track.seen

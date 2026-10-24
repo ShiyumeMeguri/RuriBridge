@@ -6,9 +6,10 @@ under it, or the mesh element or UV chunk the polygon belongs to, is what it cho
 (``DataDecalHitRect``) chose what its two corners enclose. Both are replayed on whatever surface the project
 holds, through the camera the hit keeps as the inverse of its projection and view together.
 
-* ``follow_uv`` -- the mesh moved, the UV layout stayed: the click of a hit through a camera is moved on the screen
-  to where the camera now sees the UV place it fell on, as a stroke's point is. A rectangle chooses by what lies
-  under an area of the screen, which no move of its corners keeps; it is reported, not carried.
+* ``follow_uv`` -- the mesh moved, the UV layout stayed: the camera of a click is moved as the patch of surface under
+  it moved and the click is moved on the screen to where that camera now sees the UV place it fell on, as a
+  stroke's point is. A rectangle chooses by what lies under an area of the screen, which no move of its corners
+  keeps; it is reported, not carried.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ def follow_uv(material, context):
     counts = Counter()
     for hit, track in tracks:
         hit.set_number("position", tuple(float(value) for value in track.points[0]))
+        if track.transform is not None:
+            hit.set_number("projViewInvMatrix", geometry.moved_inverse(track.key, track.transform))
         counts["clicks"] += 1
         counts["seen"] += track.seen
         counts["moved"] += track.moved
