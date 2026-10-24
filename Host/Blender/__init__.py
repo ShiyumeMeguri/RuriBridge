@@ -56,8 +56,9 @@ from ...Kernel import record as record_module
 from ...Kernel import session as session_module
 from ...Kernel import summon as summon_module
 from ...Kernel import topic as topic_module
+from ...Spp import fbx
 
-from . import (chart_resample, face_ledger, fbx_surface, glb_ingest, guest_carry, layout_retarget,
+from . import (chart_resample, face_ledger, glb_ingest, guest_carry, layout_retarget,
                layout_triangles, layouts, material_inputs, material_relayout, mesh_publish, pixels,
                shader_ingest, slot_compose, surface_crossing, texture_ingest)
 
@@ -65,7 +66,7 @@ from . import (chart_resample, face_ledger, fbx_surface, glb_ingest, guest_carry
 # would clear the binding while everything that already imported it kept the old
 # module object -- "no application is bound", from the next call on.
 for _module in (arena_module, record_module, topic_module, session_module, layout_module,
-                glb_ingest, fbx_surface, layouts, face_ledger, mesh_publish, pixels, slot_compose,
+                glb_ingest, fbx, layouts, face_ledger, mesh_publish, pixels, slot_compose,
                 texture_ingest, material_inputs, shader_ingest, chart_resample, layout_triangles,
                 material_relayout, surface_crossing, layout_retarget, guest_carry):
     importlib.reload(_module)

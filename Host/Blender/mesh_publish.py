@@ -16,7 +16,7 @@ written into it: a project the bridge starts measures in centimetres, and one th
 began as somebody else's file keeps whatever frame that file had. A surface sent
 in any other frame is, to Painter, a different object.
 
-**It is an FBX of the polygons as they are** (see ``fbx_surface``). Painter
+**It is an FBX of the polygons as they are** (see ``Spp.fbx``). Painter
 triangulates on import, and the triangulation it chose is part of what a stroke or
 a selection is recorded against; handing it Blender's own triangles would be
 handing it a second opinion. UV set 0 is the one Blender renders with -- the layout
@@ -50,8 +50,9 @@ from ...Kernel import arena as arena_module
 from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
+from ...Spp import fbx
 
-from . import face_ledger, fbx_surface, layouts
+from . import face_ledger, layouts
 
 LOG = logger("blender.mesh")
 
@@ -467,7 +468,7 @@ def publish(publisher, objects, frame_of_project, files, relaid=None, guests=Non
                            "into a Texture Set")
     with publisher.staging() as staging:
         path = staging.path(record_module.SURFACE_FILE_NAME)
-        fbx_surface.write(path, parts, ["UVSet{0}".format(index) for index in range(uv_set_count)])
+        fbx.write(path, parts, ["UVSet{0}".format(index) for index in range(uv_set_count)])
         arena_module.keep_in_memory(path)
         for file_name, data in sorted(files.items()):
             with open(staging.path(file_name), "wb") as handle:
