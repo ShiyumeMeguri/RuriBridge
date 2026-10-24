@@ -25,11 +25,19 @@ from . import brushes, geometry, placement
 VIEW_2D = 0
 VIEW_3D = 1
 HOLDERS = brushes.HOLDERS
+#: How far on the screen (``0..1``) a symmetry duplicate may lie from where it belongs, on the path it shares with its stroke,
+#: before it is given a path of its own.
+SHARED_PATH_TOLERANCE = 1e-3
 
 
 def _strokes(material, view):
     """Each stroke of ``view`` kept by an action of the material."""
-    return [stroke for action in stream.walk(material) if action.type in HOLDERS for stroke in action["strokes"] if stroke.number("viewType") == view]
+    return [stroke for _action, stroke in _kept(material, view)]
+
+
+def _kept(material, view):
+    """``(action, stroke)`` for each stroke of ``view`` kept by an action of the material."""
+    return [(action, stroke) for action in stream.walk(material) if action.type in HOLDERS for stroke in action["strokes"] if stroke.number("viewType") == view]
 
 
 def _rows(stroke):
@@ -41,32 +49,73 @@ def _store(stroke, rows):
     stroke["points"] = stream.Packed.of(definition, [(float(x), float(y), float(time), int(kind)) for x, y, time, kind in rows])
 
 
-def follow_uv(material, context):
-    """Move the points of the strokes drawn on the model so each lands on the UV place it fell on before."""
-    tracks, rows = [], []
-    for stroke in _strokes(material, VIEW_3D):
+def _mirror_of(stroke):
+    return np.array(stroke.number("duplicateMatrix")).reshape(4, 4).T if stroke.number("duplicateCount") == 1 else None
+
+
+class _Followed:
+    """A stroke through a camera that is being followed: its action, the rows of its points as they were, and its track."""
+
+    def __init__(self, action, stroke, rows=None, mirror=None):
+        self.action = action
+        self.stroke = stroke
+        self.rows = _rows(stroke) if rows is None else rows
         key = (stroke.number("viewMatrix"), stroke.number("projectionMatrix"))
-        stroke_rows = _rows(stroke)
-        mirror = np.array(stroke.number("duplicateMatrix")).reshape(4, 4).T if stroke.number("duplicateCount") == 1 else None
-        track = placement.Track(key, geometry.Camera(*key), stroke_rows[:, :2].copy(), mirror)
-        tracks.append((stroke, stroke_rows, track))
-    followed = [track for _stroke, _rows_, track in tracks]
-    before = [track.points.copy() for track in followed]
-    placement.follow_uv(followed, context)
-    placement.follow_mirror(followed, before, context)
+        self.track = placement.Track(key, geometry.Camera(*key), self.rows[:, :2].copy(), mirror)
+
+    def of_its_own(self, uids):
+        """The symmetry duplicate of this stroke as a stroke of its own: the same path through the camera mirrored by the
+        duplicate matrix, the same random seed. This stroke no longer has the duplicate."""
+        if uids is None:
+            raise ValueError("a duplicate that is given a stroke of its own needs uids to name it")
+        mirror = self.track.mirror
+        own = self.stroke.copy()
+        own.set_number("uid", uids.take())
+        own.set_number("viewMatrix", geometry.moved_view(self.stroke.number("viewMatrix"), mirror))
+        for each in (self.stroke, own):
+            each.set_number("duplicateCount", 0)
+            each.set_number("duplicateMatrix", (0.0,) * 16)
+        self.track.mirror = None
+        self.track.mirror_after = None
+        return _Followed(self.action, own, self.rows.copy())
+
+    def write(self):
+        """Put the followed points, camera and duplicate matrix into the stroke."""
+        self.rows[:, :2] = self.track.points
+        _store(self.stroke, self.rows)
+        if self.track.transform is not None:
+            self.stroke.set_number("viewMatrix", geometry.moved_view(self.track.key[0], self.track.transform))
+        if self.track.mirror_after is not None:
+            self.stroke.set_number("duplicateMatrix", geometry.storage(self.track.mirror_after))
+
+
+def _with_own(strokes, owned):
+    """``strokes`` with the stroke each duplicate was given (``owned``, by ``id`` of the stroke it came from) right after that stroke."""
+    return [kept for stroke in strokes for kept in ((stroke, owned[id(stroke)].stroke) if id(stroke) in owned else (stroke,))]
+
+
+def follow_uv(material, context):
+    """Move the points of the strokes drawn on the model so each lands on the UV place it fell on before. A symmetry duplicate
+    shares the path of its stroke, so it can only follow what moved the way the stroke's own patch did; one that left the
+    path further than ``SHARED_PATH_TOLERANCE`` is made a stroke of its own, with a path of its own."""
+    followed = [_Followed(action, stroke, mirror=_mirror_of(stroke)) for action, stroke in _kept(material, VIEW_3D)]
+    placement.follow_uv([each.track for each in followed], context)
+    placement.follow_mirror([each.track for each in followed], [each.rows[:, :2] for each in followed], context)
+    apart = [each for each in followed if each.track.mirror_error is not None and each.track.mirror_error > SHARED_PATH_TOLERANCE]
+    owned = {id(each.stroke): each.of_its_own(context.uids) for each in apart}
+    placement.follow_uv([each.track for each in owned.values()], context)
+    for action in {id(each.action): each.action for each in apart}.values():
+        action["strokes"] = _with_own(action["strokes"], owned)
+    followed.extend(owned.values())
     counts = Counter()
-    for stroke, stroke_rows, track in tracks:
-        stroke_rows[:, :2] = track.points
-        _store(stroke, stroke_rows)
-        if track.transform is not None:
-            stroke.set_number("viewMatrix", geometry.moved_view(track.key[0], track.transform))
-        if track.mirror_after is not None:
-            stroke.set_number("duplicateMatrix", geometry.storage(track.mirror_after))
+    counts["duplicates given a path of their own"] = len(owned)
+    for each in followed:
+        each.write()
         counts["strokes"] += 1
-        counts["points"] += len(stroke_rows)
-        counts["seen"] += track.seen
-        counts["moved"] += track.moved
-    factors = {id(stroke): track.size_ratio for stroke, _rows_, track in tracks if track.size_ratio is not None}
+        counts["points"] += len(each.rows)
+        counts["seen"] += each.track.seen
+        counts["moved"] += each.track.moved
+    factors = {id(each.stroke): each.track.size_ratio for each in followed if each.track.size_ratio is not None}
     brushes.resize(material, factors, (brushes.VIEW, brushes.OBJECT), context.uids)
     return dict(counts)
 
@@ -92,7 +141,9 @@ def follow_surface(material, context):
         where = where[placed]
         carried = context.new.uv(new_triangle[placed], new_weights[placed])
         carried += _carry_offset(context, triangle[where], new_triangle[placed], offset[where])
+        before = rows[:, :2].copy()
         rows[where, :2] = carried
+        placement.carry_along(rows[:, :2], before, where)
         counts["strokes"] += 1
         counts["points"] += len(rows)
         counts["seen"] += int(found.sum())

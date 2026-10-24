@@ -34,7 +34,9 @@ class Track:
     move): the 4x4 rigid motion of the world the camera now sees the way it saw it. ``size_ratio`` is how many times
     longer a step of the UV layout is across the surface under the track now than it was (``None`` where unknown).
     ``mirror`` is the 4x4 matrix of the symmetry duplicate of the paint -- the same path seen through the camera mirrored
-    by it -- or ``None``; ``mirror_after`` the matrix that keeps the duplicate where it fell, once followed.
+    by it -- or ``None``; ``mirror_after`` the matrix that keeps the duplicate where it fell, once followed, and
+    ``mirror_error`` how far on the screen (``0..1``) the duplicate then lies from where it fell, the path being the one
+    it shares with the paint (``None`` where the duplicate saw nothing).
     """
 
     def __init__(self, key, camera, points, mirror=None):
@@ -47,6 +49,7 @@ class Track:
         self.transform = None
         self.size_ratio = None
         self.mirror_after = None
+        self.mirror_error = None
 
 
 def follow_uv(tracks, context):
@@ -63,20 +66,24 @@ def follow_uv(tracks, context):
 
 def follow_mirror(tracks, old_points, context):
     """For the tracks that have a symmetry duplicate and were followed (``old_points`` their points before): set each
-    ``mirror_after`` to the matrix that keeps the duplicate on the UV places it fell on. The duplicate camera follows the
-    rigid motion of the patch it sees, so the matrix is that motion, then the old matrix, then the track's own motion undone."""
+    ``mirror_after`` to the matrix that keeps the duplicate on the UV places it fell on, and ``mirror_error`` to how far the
+    shared path leaves it from them. The duplicate camera follows the rigid motion of the patch it sees, so the matrix is that
+    motion, then the old matrix, then the track's own motion undone."""
     for track, before in zip(tracks, old_points):
         if track.mirror is None:
             continue
         screen = before * 2.0 - 1.0
         index = geometry.ScreenIndex(context.old, track.camera.following(track.mirror), screen.min(axis=0) - _MARGIN, screen.max(axis=0) + _MARGIN)
-        _where, triangle, weights = _seen(index, context, screen)
+        where, triangle, weights = _seen(index, context, screen)
         uv, place, new_triangle, new_weights = across(context, triangle, weights)
         placed = new_triangle >= 0
         if placed.any():
-            patch = rigid(context, uv[placed], place[placed], context.new.point(new_triangle[placed], new_weights[placed]))
+            new_place = context.new.point(new_triangle[placed], new_weights[placed])
+            patch = rigid(context, uv[placed], place[placed], new_place)
             own = track.transform if track.transform is not None else np.eye(4)
             track.mirror_after = patch @ track.mirror @ np.linalg.inv(own)
+            duplicate = track.camera.following(own).following(track.mirror_after)
+            track.mirror_error = float(np.abs(duplicate.screen(new_place) - track.points[where[placed]]).max())
 
 
 def measure_layout(tracks, context):
@@ -137,6 +144,21 @@ def _move(track, index, context):
         return len(where), 0
     new_place = context.new.point(new_triangle[placed], new_weights[placed])
     track.transform = rigid(context, uv[placed], place[placed], new_place)
-    track.points[where[placed]] = track.camera.following(track.transform).screen(new_place)
+    before = track.points.copy()
+    chosen = where[placed]
+    track.points[chosen] = track.camera.following(track.transform).screen(new_place)
+    carry_along(track.points, before, chosen)
     track.size_ratio = geometry.length_ratio(context.old, triangle[placed], context.new, new_triangle[placed])
     return len(where), int(placed.sum())
+
+
+def carry_along(points, before, moved):
+    """Move the points of a path that were not placed -- the camera saw no surface of the material there, or the new surface has
+    none -- by the step of their neighbours along the path (``moved`` the indices of the points that were placed, ``before`` where
+    all of them were), so that what the path did beside the surface it still does: a point just off the silhouette stays just off it."""
+    rest = np.setdiff1d(np.arange(len(points)), moved)
+    if not len(rest) or not len(moved):
+        return
+    step = points[moved] - before[moved]
+    for axis in range(2):
+        points[rest, axis] = before[rest, axis] + np.interp(rest, moved, step[:, axis])
