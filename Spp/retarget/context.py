@@ -14,6 +14,9 @@ from . import geometry, selection
 SOURCE_TOLERANCE = 1e-5
 #: How many triangles of the material are looked at to check that copy.
 SOURCE_SAMPLES = 4000
+#: How far apart, in the UV layout, the corners of a triangle of the old surface and of the new one with the same number may lie
+#: for them to be the same polygon.
+SAME_LAYOUT = 1e-9
 #: How many triangles of the material are looked at to find the rigid motion between the surfaces.
 MOTION_SAMPLES = 4000
 #: How far, as a share of the model's diagonal, a polygon may lie from where a rigid motion takes it and still be on it.
@@ -141,6 +144,22 @@ class Context:
     @cached_property
     def counterpart(self):
         return geometry.Correspondence(self.old, self.new, 1e-5 * self.diagonal)
+
+    def uv_counterpart(self, triangles):
+        """For each of ``triangles`` of the old surface the triangle of the new one at the same place of the UV layout, ``-1`` where
+        there is none: the triangle with the same number when it holds the same corners in the layout, and otherwise the one the
+        layout holds at the old triangle's middle -- the nearest in space to it where islands lie over one another."""
+        found = np.full(len(triangles), -1, dtype=np.int64)
+        same = triangles < len(self.new.triangles)
+        candidate = np.where(same, triangles, 0)
+        difference = np.abs(self.old.uvs[self.old.triangles[triangles]] - self.new.uvs[self.new.triangles[candidate]]).max(axis=(1, 2))
+        same &= (difference <= SAME_LAYOUT) & self.new_mask[candidate]
+        found[same] = candidate[same]
+        other = np.nonzero(~same)[0]
+        if len(other):
+            weights = np.repeat(selection.CENTRE, len(other), axis=0)
+            found[other] = self.new_layout.query(self.old.uv(triangles[other], weights), self.old.point(triangles[other], weights))[0]
+        return found
 
     @cached_property
     def counterpart_any_material(self):

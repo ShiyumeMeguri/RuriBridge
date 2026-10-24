@@ -12,7 +12,10 @@ layout the project has now. They choose the same polygons whatever the mesh look
 
 A replacement is only made when the rules, run on the clicks, choose exactly the polygons the hit chose: a UV chunk is
 clicked as one only where the layout still holds it as one chunk, and a polygon that lies over another in the layout (a
-mirrored island) is only clicked where the one under it is chosen too. Otherwise the hit is left as it is and counted.
+mirrored island) is only clicked where the one under it is chosen too. A hit that clicks in the layout cannot say is said by
+clicks through cameras put just off single polygons of the surface -- a click chooses the polygon the camera sees first at its
+middle, so nothing in front of the polygon and nothing under it in the layout can come between the click and the polygon.
+Where no such camera exists the hit is left as it is, its camera following the polygons it chose, and counted.
 """
 
 from __future__ import annotations
@@ -33,6 +36,11 @@ FIELDS = (("color", 0x03), ("duplicateCount", 0x0B), ("duplicateMatrix", 0x0E), 
           ("position", 0x02), ("projViewInvMatrix", 0x0E), ("uid", 0x0C), ("viewType", 0x09))
 DEFINITION = stream.Definition(PUNCTUAL, FIELDS)
 _WINDOW = 0.02
+#: How far off a polygon the camera that clicks it is put, as shares of the surface's diagonal, tried in turn: so close that
+#: nothing but the polygon can lie between the camera and it.
+HUG_DISTANCES = (1e-3, 2e-4)
+HUG_FOCAL = 1.0
+SCREEN_CENTRE = (0.5, 0.5)
 #: What ``convert`` gives for a hit the pass is not about: it stays and is not counted.
 UNTOUCHED = object()
 
@@ -58,12 +66,95 @@ class _Layout:
         return out & self.mask
 
 
+def _hit(context, template, granularity, view_type, position, inverse):
+    """A click like ``template`` (its colour) of ``granularity``: in the UV view at ``position``, or through the camera whose
+    projection and view together are the inverse of ``inverse``."""
+    values = {"color": template.number("color"), "duplicateCount": 0, "duplicateMatrix": (0.0,) * 16, "granularity": granularity,
+              "paintThrough": 0, "position": tuple(float(value) for value in position), "projViewInvMatrix": inverse,
+              "uid": context.uids.take(), "viewType": view_type}
+    return stream.Object(DEFINITION, [stream.encode(code, values[name]) for name, code in FIELDS])
+
+
 def _click(context, template, position, granularity):
     """A click in the UV view like ``template`` (its colour), at ``position``, of ``granularity``."""
-    values = {"color": template.number("color"), "duplicateCount": 0, "duplicateMatrix": (0.0,) * 16, "granularity": granularity,
-              "paintThrough": 0, "position": tuple(float(value) for value in position), "projViewInvMatrix": (0.0,) * 16,
-              "uid": context.uids.take(), "viewType": VIEW_2D}
-    return stream.Object(DEFINITION, [stream.encode(code, values[name]) for name, code in FIELDS])
+    return _hit(context, template, granularity, VIEW_2D, position, (0.0,) * 16)
+
+
+class _Hugging:
+    """Clicks through cameras put just off single polygons of the new surface: they choose any polygon of the material, whatever
+    lies over it in the UV layout or in front of it, so they say what clicks in the layout cannot."""
+
+    def __init__(self, context):
+        self.context = context
+        self.diagonal = float(np.linalg.norm(context.new.positions.max(axis=0) - context.new.positions.min(axis=0)))
+        self._space = None
+
+    @property
+    def space(self):
+        if self._space is None:
+            self._space = geometry.SpaceIndex(self.context.new, self.context.new_mask, max(HUG_DISTANCES) * self.diagonal)
+        return self._space
+
+    def clicks(self, template, wanted):
+        """Hits like ``template`` that choose exactly the triangles ``wanted`` (a boolean per triangle of the new surface): one click
+        on a polygon of each element or UV chunk ``wanted`` holds whole, then one on each polygon left. ``None`` where a polygon
+        has no camera to click it."""
+        seeds, granularities = self._seeds(wanted & self.context.new_mask)
+        inverses = self._cameras(seeds)
+        if inverses is None:
+            return None
+        return [_hit(self.context, template, granularity, VIEW_3D, SCREEN_CENTRE, inverse) for granularity, inverse in zip(granularities, inverses)]
+
+    def _seeds(self, wanted):
+        """The polygons to click and the granularity of each click."""
+        context = self.context
+        own = np.nonzero(context.new_mask)[0]
+        left = wanted.copy()
+        seeds, granularities = [], []
+        for kind, labels in ((selection.ELEMENT, context.new_elements), (selection.CHUNK, context.new_chunks)):
+            labels_of_own, group = np.unique(labels[own], return_inverse=True)
+            total = np.bincount(group, minlength=len(labels_of_own))
+            held = np.bincount(group, weights=wanted[own].astype(np.float64), minlength=len(labels_of_own))
+            whole = (held == total)[group]
+            needed = whole & left[own]
+            if needed.any():
+                _labels, first = np.unique(group[needed], return_index=True)
+                seeds.extend(own[needed][first].tolist())
+                granularities.extend([kind] * len(first))
+            left[own[whole]] = False
+        rest = np.nonzero(left)[0]
+        seeds.extend(rest.tolist())
+        granularities.extend([0] * len(rest))
+        return np.array(seeds, dtype=np.int64), granularities
+
+    def _cameras(self, seeds):
+        """``projViewInvMatrix`` of a camera for each of ``seeds``: put just off the polygon, looking at its middle, with nothing
+        else of the material between; ``None`` where one has none."""
+        surface = self.context.new
+        corners = surface.positions[surface.triangles[seeds]]
+        centre = corners.mean(axis=1)
+        edge = corners[:, 1] - corners[:, 0]
+        normal = np.cross(edge, corners[:, 2] - corners[:, 0])
+        length = np.linalg.norm(normal, axis=1)
+        pending = np.nonzero(length > 1e-30)[0]
+        normal = normal / np.where(length > 1e-30, length, 1.0)[:, None]
+        found = {}
+        for share in HUG_DISTANCES:
+            distance = share * self.diagonal
+            for side in (1.0, -1.0):
+                eye = centre[pending] + side * distance * normal[pending]
+                free = ~self.space.crossed(eye, centre[pending], seeds[pending])
+                found.update({int(position): (place, distance) for position, place in zip(pending[free], eye[free])})
+                pending = pending[~free]
+        if len(found) < len(seeds):
+            return None
+        inverses = []
+        for position in range(len(seeds)):
+            place, distance = found[position]
+            view = geometry.look_at(place, centre[position], edge[position])
+            projection = geometry.perspective(HUG_FOCAL, 0.25 * distance, 4.0 * distance)
+            inverses.append(geometry.storage(np.linalg.inv(projection @ view)))
+        return inverses
 
 
 def _mirror(hit):
@@ -144,6 +235,7 @@ def _replace(material, convert):
                 rebuilt.append(hit)
             else:
                 counts["clicks"] += len(made)
+                counts["clicks through a camera"] += sum(1 for click in made if click.number("viewType") == VIEW_3D)
                 rebuilt.extend(made)
         action["hits"] = rebuilt
         if not rebuilt:
@@ -170,10 +262,20 @@ def _follow_camera(hit, context, wanted):
     return None
 
 
+def _carried(context, wanted):
+    """The triangles of the new surface that ``wanted`` (a boolean per triangle of the old one) are found again as."""
+    found = context.uv_counterpart(np.nonzero(wanted)[0])
+    carried = np.zeros(len(context.new.triangles), dtype=bool)
+    carried[found[found >= 0]] = True
+    return carried
+
+
 def follow_uv(material, context):
-    """Replace the hits made through a camera by clicks in the UV layout on the polygons they chose; those that clicks cannot say
-    (polygons that lie over others in the layout) keep their camera, moved with the patch of polygons they chose."""
+    """Replace the hits made through a camera by clicks in the UV layout on the polygons they chose; those that clicks in the layout
+    cannot say (polygons that lie over others in the layout) by clicks through cameras put just off the polygons; and the rare
+    one that neither can say keeps its camera, moved with the patch of polygons it chose."""
     layout = _Layout(context.old, context.old_mask, context.old_elements, context.old_chunks)
+    hugging = _Hugging(context)
 
     def convert(hit):
         if hit.number("viewType") != VIEW_3D:
@@ -182,14 +284,18 @@ def follow_uv(material, context):
         seeds = _seeds_through_camera(hit, context)
         wanted = selection.widened(seeds, granularity, lambda kind: context.old_elements if kind == selection.ELEMENT else context.old_chunks) & context.old_mask
         made = _replacement(context, hit, layout, wanted, _compacts(granularity, layout, wanted))
+        if made is None:
+            made = hugging.clicks(hit, _carried(context, wanted))
         return made if made is not None else _follow_camera(hit, context, wanted & context.old_mask)
 
     return dict(_replace(material, convert))
 
 
 def follow_surface(material, context):
-    """Replace the hits made in the UV view by clicks in the new layout on the polygons they chose."""
+    """Replace the hits made in the UV view by clicks in the new layout on the polygons they chose, or where the layout cannot say
+    them by clicks through cameras put just off the polygons."""
     layout = _Layout(context.new, context.new_mask, context.new_elements, context.new_chunks)
+    hugging = _Hugging(context)
 
     def convert(hit):
         if hit.number("viewType") != VIEW_2D:
@@ -205,6 +311,7 @@ def follow_surface(material, context):
             return None
         wanted = np.zeros(len(context.new.triangles), dtype=bool)
         wanted[carried] = True
-        return _replacement(context, hit, layout, wanted, _compacts(granularity, layout, wanted))
+        made = _replacement(context, hit, layout, wanted, _compacts(granularity, layout, wanted))
+        return made if made is not None else hugging.clicks(hit, wanted)
 
     return dict(_replace(material, convert))

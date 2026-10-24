@@ -138,6 +138,29 @@ def storage(matrix):
     return tuple(float(value) for value in matrix.T.reshape(-1))
 
 
+def look_at(eye, target, up):
+    """The 4x4 view of a camera at ``eye`` looking at ``target`` with ``up`` above it: it looks down its own -z."""
+    eye, target, up = (np.asarray(value, dtype=np.float64) for value in (eye, target, up))
+    forward = target - eye
+    forward = forward / np.linalg.norm(forward)
+    right = np.cross(forward, up)
+    right = right / np.linalg.norm(right)
+    view = np.eye(4)
+    view[0, :3], view[1, :3], view[2, :3] = right, np.cross(right, forward), -forward
+    view[:3, 3] = -view[:3, :3] @ eye
+    return view
+
+
+def perspective(focal, near, far):
+    """The 4x4 projection of a camera with ``focal`` (1 / tan of half its field of view) seeing between ``near`` and ``far``."""
+    matrix = np.zeros((4, 4))
+    matrix[0, 0] = matrix[1, 1] = focal
+    matrix[2, 2] = (near + far) / (near - far)
+    matrix[2, 3] = 2.0 * near * far / (near - far)
+    matrix[3, 2] = -1.0
+    return matrix
+
+
 def moved_view(view, transform):
     """The sixteen floats of the view that sees the world moved by ``transform`` the way ``view`` sees the world."""
     return storage(np.array(view, dtype=np.float64).reshape(4, 4).T @ np.linalg.inv(transform))
@@ -250,6 +273,22 @@ def closest(points, corners):
 
 def _dot(left, right):
     return np.einsum("nk,nk->n", left, right)
+
+
+def _segment_hits(starts, ends, corners):
+    """Whether each segment from ``starts`` to ``ends`` (n, 3) passes through its triangle ``corners`` (n, 3, 3)."""
+    first, second = corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]
+    direction = ends - starts
+    across = np.cross(direction, second)
+    determinant = _dot(first, across)
+    usable = np.abs(determinant) > 1e-30
+    safe = np.where(usable, determinant, 1.0)
+    offset = starts - corners[:, 0]
+    beside = np.cross(offset, first)
+    u = _dot(offset, across) / safe
+    v = _dot(direction, beside) / safe
+    along = _dot(second, beside) / safe
+    return usable & (u >= -_TOLERANCE) & (v >= -_TOLERANCE) & (u + v <= 1.0 + _TOLERANCE) & (along >= -_TOLERANCE) & (along <= 1.0 + _TOLERANCE)
 
 
 def _first_by_query(query, score, count):
@@ -498,6 +537,29 @@ class SpaceIndex:
             end = begin + _BATCH
             self._query(points[begin:end], found[begin:end], weights[begin:end])
         return found, weights
+
+    def crossed(self, starts, ends, others):
+        """Whether the segment from each of ``starts`` to its place in ``ends`` (n, 3) passes through a triangle of the index other
+        than ``others`` (n), the one it is meant to end on: a boolean per segment. The index's reach has to be at least half of
+        the longest segment."""
+        blocked = np.zeros(len(starts), dtype=bool)
+        for begin in range(0, len(starts), _BATCH):
+            end = begin + _BATCH
+            blocked[begin:end] = self._crossed(starts[begin:end], ends[begin:end], others[begin:end])
+        return blocked
+
+    def _crossed(self, starts, ends, others):
+        cells = np.floor((0.5 * (starts + ends) - self.origin) / self.size).astype(np.int64)
+        inside = ((cells >= 0) & (cells < self.resolution)).all(axis=1)
+        cells = np.clip(cells, 0, self.resolution - 1)
+        cells = (cells[:, 2] * self.resolution + cells[:, 1]) * self.resolution + cells[:, 0]
+        query, triangle = _candidates(self.starts, self.entries, cells)
+        keep = inside[query] & (triangle != others[query])
+        query, triangle = query[keep], triangle[keep]
+        through = _segment_hits(starts[query], ends[query], self.surface.positions[self.surface.triangles[triangle]])
+        blocked = np.zeros(len(starts), dtype=bool)
+        blocked[query[through]] = True
+        return blocked
 
     def _query(self, points, found, weights):
         cells = np.floor((points - self.origin) / self.size).astype(np.int64)
