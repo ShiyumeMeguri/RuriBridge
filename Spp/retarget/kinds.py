@@ -6,9 +6,9 @@ from __future__ import annotations
 
 UV = "uv"
 SURFACE = "surface"
+#: The key of a material's report under which the engine counts the paint no pass moves.
+NOT_CARRIED = "not carried"
 
-_FILL = "DataActionFill"
-_UV_PROJECTION = 0
 _VIEW_2D = 0
 
 
@@ -26,7 +26,6 @@ MESH_BOUND = (
 
 #: The UV layout changed and the mesh stayed: paint that follows the layout and is not moved.
 LAYOUT_BOUND = (
-    ("fills laid through the UV layout", lambda item: item.type == _FILL and item.number("projection") == _UV_PROJECTION),
     ("polygon fills in the UV view with a symmetry duplicate",
      lambda item: item.type in ("DataDecalHitPunctual", "DataDecalHitRect") and item.number("viewType") == _VIEW_2D and item.number("duplicateCount") != 0),
 )

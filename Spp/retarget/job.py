@@ -12,13 +12,13 @@ from .context import Context
 from .selection import CENTRE
 
 
-def run_surfaces(target, old, new, names, anchor, source=None, source_set=None):
+def run_surfaces(target, old, new, names, anchor, source=None, source_set=None, passes=None):
     """Repair the materials called ``names`` of the open, writable project ``target``.
 
     ``old`` is the ``geometry.Surface`` the paint was made on, ``new`` the one it is to be painted on, and ``anchor``
     (``engine.UV`` or ``engine.SURFACE``) says what stayed. ``source`` is the new mesh read with the UV set
-    ``source_set`` that holds the layout the paint was made in, which paint laid through the layout needs. Returns
-    what each material's passes did.
+    ``source_set`` that holds the layout the paint was made in, which paint laid through the layout needs. ``passes``
+    names the passes to run (see ``engine.run``). Returns what each material's passes did.
     """
     document = stream.read(target.read(project.DOCUMENT))
     found = {material.text("sceneMaterialName"): material for material in document.root["materials"]}
@@ -26,7 +26,8 @@ def run_surfaces(target, old, new, names, anchor, source=None, source_set=None):
     if missing:
         raise ValueError("the project has no material called {0}".format(", ".join(missing)))
     uids = document_module.Uids(document.root)
-    report = {name: engine.run(found[name], old, new, anchor, source=source, source_set=source_set, uids=uids) for name in names}
+    report = {name: engine.run(found[name], old, new, anchor, source=source, source_set=source_set, uids=uids, passes=passes)
+              for name in names}
     target.write(project.DOCUMENT, stream.write(document))
     return report
 
@@ -55,7 +56,7 @@ def split(target, old_scene, new_scene, source, name, uv_set=0):
     return split_surfaces(target, geometry.Surface.of(scene.read(old_scene), uv_set), geometry.Surface.of(scene.read(new_scene), uv_set), source, name)
 
 
-def run(target, old_scene, names, anchor, uv_set=0, source_set=None):
+def run(target, old_scene, names, anchor, uv_set=0, source_set=None, passes=None):
     """``run_surfaces`` for the surfaces held in scene files: ``old_scene`` is the bytes of the ``scene.assbin`` the
     paint was made on and the project's own scene is the surface it is on now; ``names`` is ``None`` for every material both
     surfaces have polygons of."""
@@ -65,7 +66,7 @@ def run(target, old_scene, names, anchor, uv_set=0, source_set=None):
     source = None if source_set is None else geometry.Surface.of(current, source_set)
     if names is None:
         names = every_material(target, old, new)
-    return run_surfaces(target, old, new, names, anchor, source, source_set)
+    return run_surfaces(target, old, new, names, anchor, source, source_set, passes)
 
 
 def every_material(target, old, new):

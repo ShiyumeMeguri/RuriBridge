@@ -231,11 +231,7 @@ def answer(publisher, renamed, moves, rehomes, emptied, request_number, refused=
         refused = "{0} laid out in UV tiles, which faces cannot be carried between".format(", ".join(tiled))
     fills = []
     if not refused:
-        fills, unplaceable, _unprojected = layout_state.readers()
-        projected = sorted(name for name, members in unplaceable.values() if members & leaving_from)
-        if projected:
-            refused = ("fills projected per UV tile ({0}) cannot read where their faces went; set their "
-                       "projection to UV first".format(", ".join(projected)))
+        fills, _unprojected = layout_state.readers()
     readers = [{"uid": fill.uid, "index": fill.index, "members": sorted(fill.members),
                 "following": sorted(fill.following)} for fill in fills if fill.members & leaving_from]
     roots, frozen, normals, described, convention, leaving = {}, {}, {}, {}, {}, {}
@@ -810,7 +806,7 @@ def _following(texture_set):
     whose picture is a mesh map of the Texture Set it lives in shows, in every Texture Set showing it,
     that Texture Set's own map -- and the target's map holds the source's on the faces carried in --
     and one showing the target's own map follows it."""
-    fills, _unplaceable, _unprojected = layout_state.readers()
+    fills, _unprojected = layout_state.readers()
     maps = {one.name: layout_state.mesh_map_pictures(one) for one in textureset.all_texture_sets()}
     return {fill.uid for fill in fills
             if texture_set.name in fill.following

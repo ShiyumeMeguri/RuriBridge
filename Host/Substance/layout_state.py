@@ -56,10 +56,8 @@ map inputs bound to the old layout's maps (``CARRIED_KEY``). Moving back to that
 makes it a generator again. Any other generator computes in the layout of set 0.
 
 Paint laid out in UV space -- strokes or polygon fills that take where they land from the UVs
-every time Painter casts them again -- cannot follow its islands at all (``paint_pixels``). Blender
-makes it pixels from Painter's own record of it, and a fill of them stands in for it, reading
-the old layout like every other picture; moving back to the layout it was made in gives the
-paint back.
+every time Painter casts them again -- is not the layer stack's: the project's document holds it, and
+``paint_repair`` has it carried to the new layout, live, before the surface goes in.
 
 Each Texture Set's chart table (``Kernel.layout``) comes from Blender with every
 surface; the tables applied last live in the project, beside the layers they
@@ -92,7 +90,7 @@ from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import held_imports, paint_pixels, project_facts, project_imports, substance_package
+from . import held_imports, project_facts, project_imports, substance_package
 
 LOG = logger("painter.layout")
 
@@ -177,8 +175,15 @@ def _turn(transformation):
     return ((transformation.rotation or 0.0) + 180.0) % 360.0 - 180.0
 
 
+def _transformation(node):
+    """The UV transformation a fill lays its source through; none for one that fits its source to each UV tile and so
+    lays it as it is."""
+    parameters = node.get_projection_parameters()
+    return None if parameters is None else parameters.uv_transformation
+
+
 def _identity(transformation):
-    return (transformation.scale_mode == layerstack.ScaleMode.Factors
+    return transformation is None or (transformation.scale_mode == layerstack.ScaleMode.Factors
             and all(abs(value - 1.0) <= _TOLERANCE for value in transformation.scale)
             and abs(_turn(transformation)) <= _TOLERANCE
             and all(abs(value) <= _TOLERANCE for value in transformation.offset))
@@ -222,7 +227,7 @@ def chart_index(node):
     mode = node.get_projection_mode()
     if mode == layerstack.ProjectionMode.UVSetToUVSet:
         index = int(node.get_projection_parameters().source_uv_set or 0)
-    elif mode == layerstack.ProjectionMode.UV:
+    elif mode in (layerstack.ProjectionMode.UV, layerstack.ProjectionMode.Fill):
         index = 0
     else:
         return None
@@ -339,7 +344,7 @@ def _pictures_only(node):
                for source in _sources(node) if source is not None)
 
 
-def _visit(nodes, member, found, unplaceable, unprojected, in_mask=False):
+def _visit(nodes, member, found, unprojected, in_mask=False):
     for node in nodes:
         if not isinstance(node, layerstack.LayerNode):
             uid = node.uid()
@@ -350,24 +355,17 @@ def _visit(nodes, member, found, unplaceable, unprojected, in_mask=False):
         if isinstance(node, (layerstack.FillLayerNode, layerstack.FillEffectNode)):
             uid = node.uid()
             if uid not in found:
-                mode = node.get_projection_mode()
-                if mode == layerstack.ProjectionMode.Fill:
-                    unplaceable.setdefault(uid, (node.get_name(), set()))
-                    found[uid] = None
-                else:
-                    index = chart_index(node)
-                    normal = None if index is None else _laid_normal(node, in_mask)
-                    transformation = None if index is None else node.get_projection_parameters().uv_transformation
-                    plain = index is not None and _identity(transformation)
-                    found[uid] = None if index is None else Addressed(
-                        uid, node.get_name(), index, isinstance(node, layerstack.FillLayerNode), normal,
-                        normal is not None and normal[0] == "bitmap" and index == 0 and plain and _pictures_only(node),
-                        set().union(*(_pictures(source) for source in _sources(node) if source is not None)),
-                        False, not plain, 0.0 if plain else _turn(transformation))
+                index = chart_index(node)
+                normal = None if index is None else _laid_normal(node, in_mask)
+                transformation = None if index is None else _transformation(node)
+                plain = index is not None and _identity(transformation)
+                found[uid] = None if index is None else Addressed(
+                    uid, node.get_name(), index, isinstance(node, layerstack.FillLayerNode), normal,
+                    normal is not None and normal[0] == "bitmap" and index == 0 and plain and _pictures_only(node),
+                    set().union(*(_pictures(source) for source in _sources(node) if source is not None)),
+                    False, not plain, 0.0 if plain else _turn(transformation))
             if found[uid] is not None:
                 found[uid].members.add(member)
-            elif uid in unplaceable:
-                unplaceable[uid][1].add(member)
         if in_mask and isinstance(node, layerstack.GeneratorEffectNode):
             uid = node.uid()
             if uid not in found:
@@ -376,12 +374,12 @@ def _visit(nodes, member, found, unplaceable, unprojected, in_mask=False):
             if found[uid] is not None:
                 found[uid].members.add(member)
         if isinstance(node, layerstack.LayerNode):
-            _visit(node.content_effects(), member, found, unplaceable, unprojected, in_mask)
-            _visit(node.mask_effects(), member, found, unplaceable, unprojected, True)
+            _visit(node.content_effects(), member, found, unprojected, in_mask)
+            _visit(node.mask_effects(), member, found, unprojected, True)
             if isinstance(node, layerstack.GroupLayerNode):
-                _visit(node.sub_layers(), member, found, unplaceable, unprojected, in_mask)
+                _visit(node.sub_layers(), member, found, unprojected, in_mask)
             if isinstance(node, layerstack.InstanceLayerNode):
-                _visit([node.instance_source()], member, found, unplaceable, unprojected, in_mask)
+                _visit([node.instance_source()], member, found, unprojected, in_mask)
 
 
 def mesh_map_pictures(texture_set):
@@ -397,27 +395,24 @@ def readers():
     """Every chart-addressed fill in the project, with the Texture Sets that show it and
     those whose own mesh map it reads -- Painter shows such a picture, in that Texture
     Set, as whatever its mesh map is, and swaps it along with the map -- and every
-    generator the bridge can carry as such a fill; the fills projected per UV tile, which
-    no chart can carry, with theirs; and every picture an effect it does not carry reads
-    with no projection of its own. A generator other Texture Sets show too stays a
+    generator the bridge can carry as such a fill; and every picture an effect it does not
+    carry reads with no projection of its own. A generator other Texture Sets show too stays a
     generator, its mesh map inputs being each Texture Set's own; so does a turned tile
     laying normals they show."""
     found = {}
-    unplaceable = {}
     unprojected = {}
     mesh_maps = {}
     for texture_set in textureset.all_texture_sets():
         mesh_maps[texture_set.name] = mesh_map_pictures(texture_set)
         for stack in texture_set.all_stacks():
-            _visit(layerstack.get_root_layer_nodes(stack), texture_set.name, found, unplaceable, unprojected)
+            _visit(layerstack.get_root_layer_nodes(stack), texture_set.name, found, unprojected)
     fills = [entry for entry in found.values() if entry is not None and not (
         len(entry.members) > 1 and (entry.generator or (entry.turn and entry.normal is not None)))]
     for fill in fills:
         fill.following = (set() if fill.generator else
                           {member for member in fill.members if fill.pictures & mesh_maps.get(member, set())})
     carried = {fill.uid for fill in fills if fill.generator}
-    return fills, unplaceable, [entry for uid, entries in unprojected.items() if uid not in carried
-                                for entry in entries]
+    return fills, [entry for uid, entries in unprojected.items() if uid not in carried for entry in entries]
 
 
 # -- what the project applied last ------------------------------------------------------
@@ -446,15 +441,13 @@ def _current_mesh_maps(texture_set):
 # -- planning a surface ------------------------------------------------------------------
 
 class Plan:
-    """What one surface changes, worked out before anything moves: among it the paint Blender
-    made pixels (``frozen``, by uid, each with the UV set its fill reads) and the fills standing
-    in for paint that come away again (``thawed``)."""
+    """What one surface changes, worked out before anything moves."""
 
     __slots__ = ("moves", "desired", "states", "relayouts", "nodes", "fingerprints", "fills", "pictures",
-                 "unprojected", "restored", "generators", "frozen", "thawed")
+                 "unprojected", "restored", "generators")
 
     def __init__(self, moves, desired, states, relayouts, nodes, fingerprints, fills, pictures, unprojected,
-                 restored, generators, frozen, thawed):
+                 restored, generators):
         self.moves = moves
         self.desired = desired
         self.states = states
@@ -466,8 +459,6 @@ class Plan:
         self.unprojected = unprojected
         self.restored = restored
         self.generators = generators
-        self.frozen = frozen
-        self.thawed = thawed
 
     @property
     def changes_anything(self):
@@ -485,14 +476,10 @@ def plan(record, directory):
     before = tables_of(states)
     changed = sorted(name for name in desired
                      if desired[name] != layout_module.charts(before.get(name)))
-    fills, unplaceable, unprojected = readers()
+    fills, unprojected = readers()
     moves = layout_module.rebind([(fill.uid, fill.index, fill.members, fill.following) for fill in fills],
                                  before, desired, int(record.get("uv_sets") or 1))
     problems = []
-    for uid, (name, members) in sorted(unplaceable.items()):
-        if members & set(changed):
-            problems.append("layer {0} is projected per UV tile and {1} changes layout; set "
-                            "its projection to UV first".format(name, ", ".join(sorted(members))))
     relayouts = {}
     for name in changed:
         old = (before.get(name) or layout_module.empty())["layout"]
@@ -547,40 +534,25 @@ def plan(record, directory):
                                 "reads no picture there any more".format(name, key))
                 continue
             pictures[key] = {"path": held_imports.delivered(directory, replacement)}
-    frozen = {}
-    thawed = []
-    remembered = paint_pixels.remembered()
-    for name, entry in dict(record.get("relaid") or {}).items():
-        layout = (before.get(name) or layout_module.empty())["layout"]
-        for uid, target in dict(entry.get("frozen") or {}).items():
-            problem = paint_pixels.problem(int(uid), target)
-            if problem:
-                problems.append("{0}: {1}".format(name, problem))
-                continue
-            frozen[int(uid)] = dict(paint_pixels.held(target, directory), texture_set=name, layout=layout)
-        for uid in entry.get("thawed") or []:
-            if str(uid) not in remembered:
-                problems.append("{0}: the fill standing in for paint ({1}) is gone".format(name, uid))
-                continue
-            thawed.append(int(uid))
     if problems:
         raise layout_module.LayoutError("; ".join(problems))
-    staying = layout_module.rebind([(uid, 0, {target["texture_set"]}, set()) for uid, target in sorted(frozen.items())
-                                    if not target["moved"]], before, desired, int(record.get("uv_sets") or 1))
-    for uid, target in frozen.items():
-        target["index"] = 0 if target["moved"] else staying.get(uid, 0)
-    moves = {uid: index for uid, index in moves.items() if uid not in thawed}
     nodes = {fill.uid: fill.name for fill in fills}
     generators = {fill.uid: next(iter(fill.members)) for fill in fills if fill.generator}
     return Plan(moves, desired, states, relayouts, nodes, dict(record.get("fingerprints") or {}),
-                replaced, pictures, held, restored, generators, frozen, thawed)
+                replaced, pictures, held, restored, generators)
 
 
 # -- applying it -----------------------------------------------------------------------------
 
 def bind(uid, index):
+    """Make a fill read its source through UV set ``index``; one that fits its source to each UV tile has no
+    parameters to keep and reads set 0 as it is."""
     node = layerstack.get_node_by_uid(uid)
     old = node.get_projection_parameters()
+    if old is None:
+        if index != 0:
+            node.set_projection_parameters(layerstack.UVSetToUVSetProjectionParams(source_uv_set=index))
+        return
     if index == 0:
         node.set_projection_parameters(layerstack.UVProjectionParams(
             filtering_mode=old.filtering_mode, uv_wrapping_mode=old.uv_wrapping_mode,
@@ -755,18 +727,12 @@ def _read_picture(entry, resource_id):
 
 
 def after_surface(chosen):
-    """Moves to the other UV sets, the paint made pixels and given back, the mesh maps of every
-    Texture Set that changed layout, the normals and the effects' pictures laid out anew, the
-    generators carried to the layout they computed in or back, and the tables now applied."""
+    """Moves to the other UV sets, the mesh maps of every Texture Set that changed layout, the
+    normals and the effects' pictures laid out anew, the generators carried to the layout they
+    computed in or back, and the tables now applied."""
     for uid, index in sorted(chosen.moves.items()):
         if index != 0 and uid not in chosen.generators:
             bind(uid, index)
-    standing = paint_pixels.remembered()
-    for uid in chosen.thawed:
-        paint_pixels.thaw(uid, standing)
-    for uid, target in sorted(chosen.frozen.items()):
-        bind(paint_pixels.freeze(uid, target, standing).uid(), target["index"])
-    project_facts.write(paint_pixels.FROZEN_KEY, standing)
     records = {key: value for key, value in dict(project_facts.read(NORMALS_KEY) or {}).items()
                if int(key) in chosen.nodes}
     for uid in chosen.restored:
@@ -808,13 +774,11 @@ def after_surface(chosen):
     relaid = sorted(name for name in chosen.relayouts if name in names)
     if moved or relaid:
         LOG.info("%d fill(s) now read another UV set, %d took their pictures of normals turned "
-                 "into the new frames and %d their own back, %d effect(s) a picture laid out anew, "
-                 "%d piece(s) of paint laid out in UV space stand as pixels and %d came back; "
+                 "into the new frames and %d their own back, %d effect(s) a picture laid out anew; "
                  "%d Texture Set(s) took the mesh maps of their new layout", moved, len(chosen.fills),
-                 len(chosen.restored), len(chosen.pictures), len(chosen.frozen), len(chosen.thawed), len(relaid))
-    return Applied("{0} fill(s) rebound, {1} with normals turned, {2} piece(s) of paint as pixels, {3} given "
-                   "back, {4} Texture Set(s) relaid".format(moved, len(chosen.fills), len(chosen.frozen),
-                                                            len(chosen.thawed), len(relaid)), relaid, replaced)
+                 len(chosen.restored), len(chosen.pictures), len(relaid))
+    return Applied("{0} fill(s) rebound, {1} with normals turned, {2} Texture Set(s) relaid".format(
+        moved, len(chosen.fills), len(relaid)), relaid, replaced)
 
 
 def _settle(states, desired, names):
@@ -1105,8 +1069,7 @@ def readings(texture_set, normal_fills, fills, staging):
 
 def answer(publisher, texture_set_name, request_number):
     """Say how a Texture Set reads its charts and hand over its mesh maps, laid out in its
-    current layout, with Painter's own record of its paint laid out in UV space. Returns one
-    line about it."""
+    current layout. Returns one line about it."""
     names = {one.name: one for one in textureset.all_texture_sets()}
     texture_set = names.get(texture_set_name)
     refused = ""
@@ -1114,28 +1077,16 @@ def answer(publisher, texture_set_name, request_number):
         refused = "this project has no Texture Set {0}".format(texture_set_name)
     elif texture_set.has_uv_tiles():
         refused = "{0} is laid out in UV tiles, which a layout change cannot carry".format(texture_set_name)
-    fills, unplaceable, unprojected = readers()
-    tiled = sorted(name for name, members in unplaceable.values() if texture_set_name in members)
-    if tiled and not refused:
-        refused = "{0} has fills projected per UV tile ({1}); set their projection to UV first".format(
-            texture_set_name, ", ".join(tiled))
+    fills, unprojected = readers()
     pictures = []
     if texture_set is not None and not refused:
         problems = []
         pictures = _unprojected_pictures(unprojected, texture_set, problems)
         if problems:
             refused = "; ".join(problems)
-    found = []
-    if texture_set is not None and not refused:
-        problems = []
-        found = paint_pixels.find(texture_set, problems)
-        if problems:
-            refused = "; ".join(problems)
     readers_here = [{"uid": fill.uid, "index": fill.index, "members": sorted(fill.members),
                      "following": sorted(fill.following)}
                     for fill in fills if texture_set_name in fill.members]
-    readers_here += [{"uid": one.bound.uid, "index": 0, "members": [texture_set_name], "following": []}
-                     for one in found]
     states = applied()
     tables = tables_of(states)
     kept = sorted(dict((states.get(texture_set_name) or {}).get("mesh_maps") or {}))
@@ -1143,9 +1094,7 @@ def answer(publisher, texture_set_name, request_number):
         mesh_maps = {}
         convention = {}
         laying = []
-        frozen = []
         if texture_set is not None and not refused:
-            frozen = paint_pixels.capture(found, staging)
             for usage, (identifier, kind) in MESH_MAPS.items():
                 if texture_set.get_mesh_map_resource(usage) is None:
                     continue
@@ -1154,17 +1103,14 @@ def answer(publisher, texture_set_name, request_number):
                 mesh_maps[usage.name] = {"file": file_name, "kind": kind}
             laying = normal_fills(fills, texture_set, staging, dict(project_facts.read(NORMALS_KEY) or {}))
             pictured = [entry for entry in laying if not entry["untouched"]]
-            normal_paint = any(channel["space"] == "normal" for entry in frozen for channel in entry["channels"])
-            if laying or normal_paint or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
+            if laying or any(entry["kind"] == "tangent" for entry in mesh_maps.values()):
                 convention = convention_maps(texture_set, staging.directory)
             if pictured:
                 convention["fresh"] = readings(texture_set, pictured, fills, staging)
         fingerprint = dict(project_facts.read(SURFACE_KEY) or {}).get(texture_set_name, "")
         staging.publish(record_module.layout_answer(
             "Substance", texture_set_name, request_number, fingerprint, readers_here, tables,
-            kept, mesh_maps, laying, pictures, convention, frozen,
-            paint_pixels.thawing(texture_set_name), refused))
+            kept, mesh_maps, laying, pictures, convention, refused))
     if refused:
         return "cannot change the layout of {0}: {1}".format(texture_set_name, refused)
-    return ("handed {0}'s {1} mesh map(s) and {2} piece(s) of paint laid out in UV space to Blender for its "
-            "new layout".format(texture_set_name, len(mesh_maps), len(frozen)))
+    return "handed {0}'s {1} mesh map(s) to Blender for its new layout".format(texture_set_name, len(mesh_maps))

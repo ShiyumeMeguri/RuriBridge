@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Paint laid out in UV space, made pixels for a layout change and given back after it.
+"""Paint laid out in UV space, made pixels for the faces carried into another Texture Set.
 
 Paint that takes where it lands from the UVs every time Painter casts it again
-(``project_document.bound``) cannot follow its islands into another layout: no layout but the
-one it was made in puts it back. Painter's own record of it -- per channel the colour and the
-coverage it lays, exported -- goes to Blender with the layout answer (``capture``); Blender writes
-pictures of it, and with the new surface a fill of them stands in for the paint (``freeze``): at
-the bottom of its stack, Replace, for a layer's or a mask's own strokes, which it covers; right
-above an effect, blending as the effect does, the effect hidden. The fill is an ordinary picture
-fill, reading the layout the paint was made in like every other. Moving back to that layout
-takes the fill away again (``thaw``): the paint, cast where it was made, is what it was. Paint a
-fill stands in for is not taken again in between: cast in a layout it was not made in, it is not
-what it was.
+(``project_document.bound``) cannot follow its faces into another Texture Set. Painter's own
+record of it -- per channel the colour and the coverage it lays, exported -- goes to Blender with
+the answer (``capture``); Blender writes pictures of it, and in the copy of the layers a fill of
+them stands in for the paint (``stand_in``): at the bottom of its stack, Replace, for a layer's or
+a mask's own strokes, which it covers; right above an effect, blending as the effect does, the
+effect hidden.
 
 A layer's own strokes, and an effect isolated over a transparent Replace fill and laid
 normally, are exported with their alpha: the colour and the coverage exactly as Painter stores
@@ -45,12 +41,6 @@ from ...Kernel import arena as arena_module
 from . import held_imports, project_document, project_facts, project_imports
 
 
-#: Per fill the bridge laid in place of paint laid out in UV space, by uid: the Texture Set it
-#: shows in, the layout the paint was made in, the layer and whether its mask holds the paint,
-#: and the paint effect it stands in for with whether that was shown, ``{"texture_set", "layout",
-#: "layer", "mask", "effect", "visible"}`` -- ``effect`` is None for a stack's own strokes,
-#: which the fill covers.
-FROZEN_KEY = "frozen"
 #: Per fill standing for good in a copy carried into another Texture Set, by uid: the layer, whether
 #: its mask holds the paint, and the paint effect it stands in for, ``{"layer", "mask", "effect"}``.
 CARRIED_PAINT_KEY = "carried_paint"
@@ -135,21 +125,9 @@ def _exportable(channel, stack, identifiers):
 def _standing():
     """What the fills standing in for paint stand in for: the effects, and per layer the stacks
     whose own strokes they cover."""
-    records = list(remembered().values()) + [
-        record for key, record in dict(project_facts.read(CARRIED_PAINT_KEY) or {}).items() if exists(key)]
+    records = [record for key, record in dict(project_facts.read(CARRIED_PAINT_KEY) or {}).items() if exists(key)]
     return ({int(record["effect"]) for record in records if record["effect"] is not None},
             {(int(record["layer"]), bool(record["mask"])) for record in records if record["effect"] is None})
-
-
-def find(texture_set, problems):
-    """Every piece of the Texture Set's paint laid out in UV space that no fill stands in for yet,
-    ``[Frozen]``; what stands in the way of making one pixels goes into ``problems``."""
-    try:
-        bound = project_document.bound(document(), texture_set.name)
-    except project_document.DocumentError as error:
-        problems.append("the project file holds its strokes in a form the bridge does not read: {0}".format(error))
-        return []
-    return _standing_free(texture_set, bound, problems, True)
 
 
 def root_of(node):
@@ -454,56 +432,12 @@ def exists(uid):
     return True
 
 
-def remembered():
-    """The fills standing in for paint whose fill, and effect when there is one, are still there."""
-    return {key: record for key, record in dict(project_facts.read(FROZEN_KEY) or {}).items()
-            if exists(key) and (record["effect"] is None or exists(record["effect"]))}
-
-
-def thawing(texture_set):
-    """The fills standing in for paint of the Texture Set, each with the layout the paint was
-    made in, ``[{"uid", "layout"}]``: moving there takes them away again."""
-    return [{"uid": int(key), "layout": record["layout"]} for key, record in sorted(remembered().items())
-            if record["texture_set"] == texture_set]
-
-
-def problem(uid, target):
-    """What stands in the way of laying a fill in place of paint Blender made pixels, or empty."""
-    try:
-        layer = layerstack.get_node_by_uid(int(target["layer"]))
-    except ValueError:
-        return "the layer holding {0} is gone".format(target["name"])
-    if target["own"]:
-        if target["mask"] and not layer.has_mask():
-            return "{0} has no mask any more".format(target["name"])
-        if not target["mask"] and not isinstance(layer, layerstack.PaintLayerNode):
-            return "{0} is no paint layer any more".format(target["name"])
-        return ""
-    effects = layer.mask_effects() if target["mask"] else layer.content_effects()
-    if uid not in {one.uid() for one in effects}:
-        return "{0} is gone".format(target["name"])
-    return ""
-
-
 def held(target, directory):
     """A piece of paint Blender made pixels, its pictures -- delivered beside the record in
     ``directory``, ``{"file", "hash", "space"}`` -- where Painter imports them from, ``{"path",
     "space"}``."""
     return dict(target, pictures={name: {"path": held_imports.delivered(directory, picture), "space": picture["space"]}
                                   for name, picture in target["pictures"].items()})
-
-
-def freeze(uid, target, records):
-    """Lay the pictures Blender made of a piece of paint in a fill standing in for it
-    (``stand_in``) and remember it (``records``). Returns the fill, still reading set 0."""
-    layer = layerstack.get_node_by_uid(int(target["layer"]))
-    effect = None if target["own"] else layerstack.get_node_by_uid(uid)
-    shown = True if effect is None else effect.is_visible()
-    fill = stand_in(layer, effect, target)
-    records[str(fill.uid())] = {"texture_set": target["texture_set"], "layout": target["layout"],
-                                "layer": int(target["layer"]), "mask": bool(target["mask"]),
-                                "effect": None if effect is None else uid, "visible": shown}
-    return fill
 
 
 def stand_in(layer, effect, target):
@@ -545,19 +479,3 @@ def stand_in(layer, effect, target):
         effect.set_visible(False)
     return fill
 
-
-def rename(renames):
-    """Texture Sets renamed, old name to new: the fills standing in for paint follow the name."""
-    records = dict(project_facts.read(FROZEN_KEY) or {})
-    if any(record["texture_set"] in renames for record in records.values()):
-        project_facts.write(FROZEN_KEY, {uid: dict(record, texture_set=renames.get(record["texture_set"],
-                                                                                   record["texture_set"]))
-                                         for uid, record in records.items()})
-
-
-def thaw(uid, records):
-    """Take away a fill standing in for paint, showing the effect it stood in for as it was."""
-    record = records.pop(str(uid))
-    if record["effect"] is not None:
-        layerstack.get_node_by_uid(int(record["effect"])).set_visible(bool(record["visible"]))
-    layerstack.delete_node(layerstack.get_node_by_uid(int(uid)))

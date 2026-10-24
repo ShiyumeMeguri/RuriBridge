@@ -445,7 +445,6 @@ def rename(renames):
     layout_state.rename(wanted)
     guest_state.rename(wanted)
     material_seed.rename(wanted)
-    paint_pixels.rename(wanted)
     if wanted:
         LOG.info("renamed %s", ", ".join("{0} -> {1}".format(old, new)
                                          for old, new in sorted(wanted.items())))

@@ -2,10 +2,10 @@
 """Repairing the paint of a project for a surface that is about to go in, before it does.
 
 Painter replays every stroke and every polygon fill of the project against the surface it
-holds, so a surface whose mesh changed under layouts that stayed is painted on differently
-unless the document says where each of them fell on the new one. ``Spp.retarget`` says it: it
-rewrites the document in the project file for the surface the project holds, given the one the
-paint was made on. Painter's interpreter has no numpy, so that runs in a process of its own,
+holds, so a surface whose mesh changed under layouts that stayed, or whose layouts changed under a
+mesh that stayed, is painted on differently unless the document says where each of them fell on
+the new one. ``Spp.retarget`` says it: it rewrites the document in the project file for the surface
+the project holds, given the one the paint was made on. Painter's interpreter has no numpy, so that runs in a process of its own,
 with the interpreter the modelling application states in its presence, on a project Painter has
 closed.
 
@@ -37,6 +37,7 @@ import substance_painter.textureset
 
 from ...Kernel import arena as arena_module
 from ...Kernel.log import logger
+from ...Spp.retarget import kinds
 
 from . import project_imports
 
@@ -64,7 +65,7 @@ class RepairError(RuntimeError):
 class _Repair:
     """One repair under way: where its files are, which stage it is at and what that stage has done."""
 
-    __slots__ = ("record", "texture_sets", "anchor", "interpreter", "project", "directory", "old", "surface",
+    __slots__ = ("record", "texture_sets", "anchor", "passes", "interpreter", "project", "directory", "old", "surface",
                  "edited", "resume", "fail", "stages", "index", "entered", "called", "ticks", "scouted", "swapped",
                  "opened", "process", "started", "streams", "report", "line", "said", "inside", "reason")
 
@@ -72,6 +73,7 @@ class _Repair:
         self.record = record
         self.texture_sets = list(record["texture_sets"])
         self.anchor = record["anchor"]
+        self.passes = list(record["passes"]) if record.get("passes") else []
         self.interpreter = interpreter
         self.project = project_path
         self.directory = directory
@@ -122,9 +124,9 @@ def begin(generation, record, interpreter, resume, fail):
     and the project is as it was. Returns one line about it. Nothing is touched when it raises."""
     if running():
         raise RepairError("a repair is still running")
-    if record.get("anchor") != "uv":
-        raise RepairError("the paint can only be repaired for a mesh that changed under layouts that stayed, not for {0!r}".format(
-            record.get("anchor")))
+    if record.get("anchor") not in kinds.BY_ANCHOR:
+        raise RepairError("the paint can be repaired for a surface whose mesh changed under layouts that stayed ({0!r}) or whose layouts "
+                          "changed under a mesh that stayed ({1!r}), not for {2!r}".format(kinds.UV, kinds.SURFACE, record.get("anchor")))
     project_path = substance_painter.project.file_path()
     if not project_path:
         raise RepairError("the project has no file yet, and the repair works on the file: save it once first")
@@ -241,13 +243,22 @@ def _summary(report):
     """What a repair did, in a line: the numbers the process reported for the Texture Sets it repaired."""
     if not report:
         return "nothing reported"
-    strokes = hits = split = 0
+    strokes = hits = split = left = 0
     for passes in dict(report.get("report") or {}).values():
-        strokes += int(passes.get("strokes.follow_uv", {}).get("strokes", 0))
-        split += int(passes.get("strokes.follow_uv", {}).get("duplicates given a path of their own", 0))
-        hits += int(passes.get("hits.follow_uv", {}).get("clicks", 0))
-    return "{0} stroke(s), {1} of them symmetry duplicates given a path of their own, {2} polygon fill click(s)".format(
+        for name, counts in passes.items():
+            module = name.split(".", 1)[0]
+            if name == kinds.NOT_CARRIED:
+                left += sum(int(count) for count in counts.values())
+            elif module == "strokes":
+                strokes += int(counts.get("strokes", 0))
+                split += int(counts.get("duplicates given a path of their own", 0))
+            elif module == "hits":
+                hits += int(counts.get("clicks", 0))
+    line = "{0} stroke(s), {1} of them symmetry duplicates given a path of their own, {2} polygon fill click(s)".format(
         strokes, split, hits)
+    if left:
+        line += ", {0} piece(s) of paint it does not carry".format(left)
+    return line
 
 
 def _settled():
@@ -319,6 +330,8 @@ def _edit(repair):
     if repair.process is None:
         arguments = [repair.interpreter, "-m", "RuriBridge.Spp.cli", "retarget", repair.project, *repair.texture_sets,
                      "--anchor", repair.anchor, "--old", str(repair.old), "--out", str(repair.edited)]
+        if repair.passes:
+            arguments += ["--passes", *repair.passes]
         environment = dict(os.environ)
         environment["PYTHONPATH"] = os.pathsep.join(
             [os.path.dirname(_package_root())] + ([environment["PYTHONPATH"]] if environment.get("PYTHONPATH") else []))

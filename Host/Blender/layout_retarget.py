@@ -23,11 +23,9 @@ read through the old layout, and the line this returns names the fills whose nor
 keep the old islands' directions where islands turn.
 
 Paint Painter holds laid out in UV space -- strokes or polygon fills that take where they land
-from the UVs -- comes with the answer as Painter's own record of it, per channel its colour and
-coverage. It becomes pictures, in the layout it was made in, for fills that stand in for it and
-read that layout like every other picture; where it lays normals the turning islands bend, its
-pictures are laid out in the new layout instead, the normals carried into the new frames. The
-fills come away again when the layout the paint was made in comes back.
+from the UVs -- is carried to the new layout in the project's document, live: the surface goes with
+a request that Painter repair the Texture Set's strokes and polygon fills for it first
+(``REPAIR_PASSES``; the fills are the layout change's own, above).
 
 Pictures the material itself samples through the swapped maps are laid out again
 beside it (``material_relayout``), so the material looks here as it looked before.
@@ -63,6 +61,9 @@ _REPLACING = "DataBlendingMode_Replace"
 _FLAT = 2.0 / 255.0
 #: How far past 0..1 a value stored in a picture may lie and still be a float's rounding.
 _STORED = 1e-6
+#: The passes of the paint repair a layout change asks Painter for: the fills that read a layout are the layout
+#: change's own, which goes on reading the old one through the UV set that now holds it.
+REPAIR_PASSES = ("strokes", "hits")
 
 
 class Pending:
@@ -515,17 +516,15 @@ def complete(context, session, generation, frame_of_project, directory, painter)
         record["tables"], texture_set)
     render_names = {object_reference.data.as_pointer(): pending.source for object_reference, _polygons in wearers}
     tangent_maps = any(entry["kind"] == "tangent" for entry in record["mesh_maps"].values())
-    relaid, fills, pictures, kept, apart, frozen, made_pixels = {}, {}, {}, [], 0.0, {}, []
+    relaid, fills, pictures, kept, apart = {}, {}, {}, [], 0.0
     beside = surface_crossing.Beside()
-    thawed = sorted(int(entry["uid"]) for entry in record["thawing"] if entry["layout"] == retargeted["layout"])
-    restored = [uid for uid in _restored_fills(record, retargeted["layout"]) if uid not in thawed]
-    if record["mesh_maps"] or record["fills"] or record["pictures"] or record["frozen"]:
+    restored = _restored_fills(record, retargeted["layout"])
+    if record["mesh_maps"] or record["fills"] or record["pictures"]:
         extra_layers = sorted({table["extra"][str(fill["index"])]["layer"] for fill in record["fills"]
                                if str(fill["index"]) in table["extra"]})
-        normal_paint = any(channel["space"] == "normal" for entry in record["frozen"] for channel in entry["channels"])
         triangles = layout_triangles.gather(
             _visible_wearers(context.view_layer, wearers), materials, render_names, target_layer,
-            frames=tangent_maps or bool(record["fills"]) or normal_paint, extra_layers=extra_layers)
+            frames=tangent_maps or bool(record["fills"]), extra_layers=extra_layers)
         if triangles is None:
             raise RuntimeError("no visible mesh shows a face of {0}, so there is no surface to lay "
                                "its mesh maps out on".format(texture_set))
@@ -544,10 +543,7 @@ def complete(context, session, generation, frame_of_project, directory, painter)
                                        green() if turning and tangent_maps else 1.0)
         if record["fills"]:
             fills, kept, apart = _relaid_fills(record, generation, triangles, frames, green, table,
-                                               texture_set, beside, set(restored) | set(thawed))
-        if record["frozen"]:
-            frozen, made_pixels = frozen_pictures(record, generation, triangles, frames, green, texture_set,
-                                                   beside)
+                                               texture_set, beside, set(restored))
         if record["pictures"]:
             pictures = _relaid_pictures(record, triangles, texture_set, beside)
     made = material_relayout.relay(materials, wearers, render_names, target_layer, directory)
@@ -557,14 +553,16 @@ def complete(context, session, generation, frame_of_project, directory, painter)
     sent = surface_crossing.send(
         session, context, frame_of_project, painter, beside,
         relaid={texture_set: {"chart": retargeted["layout"], "mesh_maps": relaid, "fills": fills,
-                              "pictures": pictures, "restored": restored, "frozen": frozen, "thawed": thawed}})
+                              "pictures": pictures, "restored": restored}},
+        repair={"anchor": "surface", "texture_sets": [texture_set], "passes": list(REPAIR_PASSES)})
     LOG.info("%s now lays out in what %s held, in %s; the old layout lives in %s at UV set(s) %s",
              texture_set, target_layer, pending.source, target_layer,
              ", ".join(sorted(index for index, entry in retargeted["extra"].items()
                               if entry["layer"] == target_layer)))
     line = ("{0} moved from {1!r} to {2!r}: {3} mesh map(s), {4} effect picture(s) and {5} material "
             "picture(s) laid out again, {6} picture(s) of normals turned into the new frames, {7} fill(s) "
-            "took their own normals back, surface generation {8} sent".format(
+            "took their own normals back, surface generation {8} sent; Painter repairs the strokes and polygon "
+            "fills of {0} for it first".format(
                 texture_set, pending.source, target_layer, len(relaid), len(pictures), installed, len(fills),
                 len(restored), sent.number))
     if kept:
@@ -578,9 +576,4 @@ def complete(context, session, generation, frame_of_project, directory, painter)
                  texture_set, apart)
         line += "; texels two islands of the old layout share part by up to {0:.3g} degrees once turned".format(
             apart)
-    if made_pixels:
-        LOG.info("%s: paint laid out in UV space stands as pixels: %s", texture_set, "; ".join(made_pixels))
-        line += "; paint laid out in UV space stands as pixels: {0}".format("; ".join(made_pixels))
-    if thawed:
-        line += "; {0} piece(s) of paint made pixels before are cast as they were made again".format(len(thawed))
     return line

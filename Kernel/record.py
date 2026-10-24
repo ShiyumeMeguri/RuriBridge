@@ -178,15 +178,9 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
     Texture Set whose layout is a chart the texturing side has no mesh maps for
     yet, those maps laid out in it: ``{Texture Set: {"chart": chart, "mesh_maps":
     {usage: file}, "fills": {uid: {"pictures": {channel: file}, "pixels"}}, "pictures": {key:
-    file}, "restored": [uid], "frozen": {uid: {"layer", "mask", "own", "name", "moved",
-    "pictures": {channel: file and "space"}}}, "thawed": [uid]}}``; ``fills`` are the pictures
+    file}, "restored": [uid]}}``; ``fills`` are the pictures
     of fills laying normals, carried into the new layout's frames; ``pictures`` those of
     effects reading a picture with no projection of their own, laid out in the new layout.
-    ``frozen`` is the paint laid out in UV space made pictures, for a fill to stand in for it:
-    laid out in the layout the paint was made in, or in the new one (``moved``) where its
-    normals had to turn with the islands; ``space`` is how a picture's values are read back.
-    ``thawed`` are the fills standing in for paint that come away again, the layout the paint
-    was made in being back.
 
     ``fingerprints`` is, per Texture Set, a digest of its polygons and their layout
     coordinates as they cross: what its mesh maps are laid out on. The texturing side
@@ -220,9 +214,11 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
     nothing on it paints into them, and somebody chose to let them go.
 
     ``repair`` asks for the paint of Texture Sets to be repaired for this surface before it goes in, so
-    that what was painted lands where it was painted on the new surface: ``{"anchor": "uv",
-    "texture_sets": [name]}`` -- ``anchor`` says what stayed (``uv``: every layout, the mesh changed) --
-    or None for a surface that changes nothing the paint depends on.
+    that what was painted lands where it was painted on the new surface: ``{"anchor": "uv" or "surface",
+    "texture_sets": [name], "passes": [name]}`` -- ``anchor`` says what stayed (``uv``: every layout, the mesh
+    changed; ``surface``: the mesh, the layouts changed) and ``passes`` which passes of the repair to run
+    (``strokes``, ``hits``, ``fills``), all of the anchor's when absent -- or None for a surface that changes
+    nothing the paint depends on.
     """
     record = _base("mesh", source)
     record.update({
@@ -292,7 +288,7 @@ def textures(source, document, directory, texture_sets):
 
 
 def layout_answer(source, texture_set, request, fingerprint, readers, tables, kept,
-                  mesh_maps, fills, pictures, convention, frozen, thawing, refused):
+                  mesh_maps, fills, pictures, convention, refused):
     """A Texture Set about to change layout, as the texturing side holds it.
 
     ``request`` is the generation of the ask it answers. ``fingerprint`` is the
@@ -323,16 +319,8 @@ def layout_answer(source, texture_set, request, fingerprint, readers, tables, ke
     ``{"key", "name", "label", "members", "file"}``. ``convention`` names the exports
     that tell which way the stored tangent maps point their green, how the normal channel
     combines with the mesh map, and -- with ``fresh`` -- a picture Painter had never seen
-    and its render, when there are any. ``frozen`` is the paint laid out in UV space, which
-    no layout but its own puts back: ``{"uid", "layer", "mask", "own", "name", "reasons",
-    "channels"}`` -- the action group holding it, its layer, whether the mask holds it and
-    whether it is the stack's own strokes rather than an effect -- each channel ``{"channel",
-    "space", "file"}``, an export holding its colour and, as alpha, its coverage, or for an
-    effect in a mask ``{"channel", "space", "zero", "one"}``, the mask with it laid over 0 and
-    over 1; ``space`` is how the values are stored back (``raw``, ``signed`` or ``normal``).
-    Each is a reader of UV set 0 as well. ``thawing`` are the fills standing in for paint, each
-    with the layout the paint was made in, ``{"uid", "layout"}``. ``refused`` says why the
-    layout cannot change, when it cannot.
+    and its render, when there are any. ``refused`` says why the layout cannot change, when it
+    cannot.
     """
     record = _base(LAYOUT_ANSWER, source)
     record.update({
@@ -346,8 +334,6 @@ def layout_answer(source, texture_set, request, fingerprint, readers, tables, ke
         "fills": list(fills),
         "pictures": list(pictures),
         "convention": convention,
-        "frozen": list(frozen),
-        "thawing": list(thawing),
         "refused": refused,
     })
     return record

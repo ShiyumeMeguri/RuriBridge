@@ -19,21 +19,38 @@ PASSES = {
     SURFACE: (strokes.follow_surface, hits.follow_surface, fills.follow_layout),
 }
 
-NOT_CARRIED = "not carried"
+NOT_CARRIED = kinds.NOT_CARRIED
 
 
-def run(material, old, new, anchor, uv_reach=0.05, source=None, source_set=None, uids=None):
+def _module(step):
+    return step.__module__.rsplit(".", 1)[-1]
+
+
+def _chosen(anchor, passes):
+    """The passes of ``anchor`` called by the name of the module each lives in (``strokes``, ``hits``, ``fills``), in their
+    order; all of them when none are named."""
+    if passes is None:
+        return PASSES[anchor]
+    available = [_module(step) for step in PASSES[anchor]]
+    unknown = [name for name in passes if name not in available]
+    if unknown:
+        raise ValueError("anchor {0} has no pass called {1}; it has {2}".format(anchor, ", ".join(unknown), ", ".join(available)))
+    return tuple(step for step in PASSES[anchor] if _module(step) in passes)
+
+
+def run(material, old, new, anchor, uv_reach=0.05, source=None, source_set=None, uids=None, passes=None):
     """Repair ``material`` -- a ``DataMaterial`` -- in place for the surface having changed from ``old`` to ``new``.
 
     ``anchor`` says what stayed: ``UV`` the layout, ``SURFACE`` the mesh. ``source`` is the new mesh read with the
     UV set ``source_set`` that holds the layout the paint was made in; paint laid through the layout needs it. The
     report names what each pass did and counts, under ``not carried``, the paint bound to what changed that no pass
-    moves. ``uids`` hands out the uids of what the passes add to the document.
+    moves. ``uids`` hands out the uids of what the passes add to the document. ``passes`` names the passes to run, by
+    module, when the caller leaves the rest to something else; all of the anchor's otherwise.
     """
     if anchor not in PASSES:
         raise ValueError("anchor must be one of {0}, not {1!r}".format(sorted(PASSES), anchor))
     context = Context(old, new, material.text("sceneMaterialName"), uv_reach, source, source_set, uids)
-    report = {"{0}.{1}".format(step.__module__.rsplit(".", 1)[-1], step.__name__): step(material, context) for step in PASSES[anchor]}
+    report = {"{0}.{1}".format(_module(step), step.__name__): step(material, context) for step in _chosen(anchor, passes)}
     left = Counter()
     for item in stream.walk(material):
         for description, applies in kinds.BY_ANCHOR[anchor]:
