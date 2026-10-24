@@ -21,7 +21,8 @@ The same verbs as Painter's end, from this side, and one table:
   renamed here renames its Texture Set with the next Update Mesh, every layer kept; one
   that shared another's takes its faces' paint into its own. A Texture Set nothing paints
   is bound to a material by hand -- from here or from Painter -- and takes its name. A
-  material kept out is nowhere Painter looks: not sent, not listed, not offered.
+  material kept out is not sent and Painter holds no Texture Set of it: the one it had goes
+  with the next Update Mesh. It waits in the table's Hidden list until it is let back in.
 * **Retarget Layout** moves the active material's Texture Set from the layout its
   Source UV holds to the one its Target UV holds (``layout_retarget``): the two maps
   swap on its faces, and Painter keeps every layer, reading what was laid out in the old
@@ -269,22 +270,31 @@ def painter_state():
 def pending(context):
     """What the next Update Mesh changes in a project Painter already paints in, one line each, for
     the person sending to read first: Texture Sets taking a material's new name, paint going along
-    with faces, and Texture Sets new to it with nothing painted on them -- a material just made, or
-    one whose faces' paint is nowhere Painter has."""
+    with faces, Texture Sets of hidden materials going, and Texture Sets new to it with nothing
+    painted on them -- a material just made, or one whose faces' paint is nowhere Painter has.
+
+    Returns ``(lines, asks)``: ``asks`` is whether any of it destroys something in Painter -- Texture
+    Sets of hidden materials going, layers and all, with no undo. New Texture Sets, renames and paint
+    going along with faces lose nothing there, so they are sent without asking."""
     painter = painter_state()
     existing = painter.get("texture_sets") or []
     if not painter.get("document") or not any(entry["layers"] for entry in existing):
-        return []
-    found = guest_carry.survey(mesh_publish.scope(context.view_layer), painter)
+        return [], False
+    going = hidden_texture_sets(context)
+    found = guest_carry.survey(mesh_publish.scope(context.view_layer), painter, going)
     known = {entry["name"] for entry in existing}
     receiving = (set(found.renames.values()) | {target for _source, target in found.moves}
                  | {target for _holder, target in found.rehomes.values()})
     fresh = sorted({row["texture_set"] for row in _view["materials"]
                     if row["texture_set"] and row["texture_set"] not in known | receiving})
+    layers = painter_texture_sets()
     lines = guest_carry.describe(found)
+    lines += ["{0} (hidden) goes in Painter, {1} layer(s) with it, no undo".format(name, layers.get(name, 0))
+              for name in going]
+    asks = bool(going)
     if fresh:
         lines.append("{0} new Texture Set(s) with nothing painted on them: {1}".format(len(fresh), ", ".join(fresh)))
-    return lines
+    return lines, asks
 
 
 def painter_is_attached():
@@ -323,7 +333,8 @@ def send_mesh(context, dropped=(), renames=None):
     whose material was renamed here takes the new name, and faces that moved into another Texture Set
     take their paint along: Painter is asked first, and the surface goes with its answer
     (``guest_carry``). ``renames`` are renames asked for by hand (``bind``); the Texture Sets
-    ``dropped`` go in Painter with this surface (``drop_in_painter``). Returns one line about it."""
+    ``dropped`` go in Painter with this surface (``drop_in_painter``), and so do those of the
+    materials kept out of it. Returns one line about it."""
     if not CONNECTION.is_open:
         raise RuntimeError("not attached to a bridge session")
     objects = mesh_publish.scope(context.view_layer)
@@ -331,6 +342,7 @@ def send_mesh(context, dropped=(), renames=None):
         raise RuntimeError("no visible mesh object to send")
     if guest_carry.waiting():
         raise RuntimeError("the paint of faces moving between Texture Sets waits for Painter's answer")
+    dropped = tuple(sorted(set(dropped) | set(hidden_texture_sets(context))))
     painter = painter_state()
     found = guest_carry.survey(objects, painter, dropped, renames)
     if found.problems:
@@ -447,6 +459,21 @@ def unpainted_texture_sets(context):
     """The Texture Sets Painter has that no material worn here paints into."""
     painted = {row["texture_set"] for row in material_rows(mesh_publish.scope(context.view_layer))}
     return sorted(name for name in painter_texture_sets() if name not in painted)
+
+
+def kept_out_materials():
+    """This document's materials kept out of Painter, by name. Each waits in the table's Hidden list
+    until it is let back in, worn or not."""
+    return sorted(material.name for material in bpy.data.materials
+                  if material.library is None and mesh_publish.is_kept_out(material))
+
+
+def hidden_texture_sets(context):
+    """The Texture Sets Painter has that are named for a material kept out of it and that nothing
+    else paints into: a hidden material has no Texture Set there, so these go in Painter with the
+    next Update Mesh, layers and all."""
+    hidden = set(kept_out_materials())
+    return [name for name in unpainted_texture_sets(context) if name in hidden]
 
 
 def drop_in_painter(context, texture_sets):
@@ -839,17 +866,19 @@ class RuriBridgePreferences(bpy.types.AddonPreferences):
 class RURIBRIDGE_OT_send_mesh(bpy.types.Operator):
     bl_idname = "ruri_bridge.send_mesh"
     bl_label = "更新网格"
-    bl_description = ("把所有可见网格换进 Painter,保留 Painter 已有的图层。材质改名的 Texture Set 会跟着改名,"
-                      "换了 Texture Set 的面会带着颜料一起走。有图层但这边没有任何材质在画的 Texture Set 会让替换中止")
+    bl_description = ("把所有可见网格换进 Painter,保留 Painter 已有的图层。多出来的材质直接在 Painter 里新建 Texture Set,"
+                      "材质改名的 Texture Set 会跟着改名,换了 Texture Set 的面会带着颜料一起走,"
+                      "隐藏的材质在 Painter 里的 Texture Set 会连图层一起删掉。"
+                      "有图层但这边没有任何材质在画的别的 Texture Set 会让替换中止")
 
     def invoke(self, context, event):
         refresh_view()
         try:
-            lines = pending(context)
+            lines, asks = pending(context)
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        if not lines:
+        if not asks:
             return self.execute(context)
         return context.window_manager.invoke_confirm(
             self, event, title="更新网格", message="; ".join(lines), confirm_text="更新")
@@ -1039,12 +1068,11 @@ class RURIBRIDGE_OT_exclude(bpy.types.Operator):
     @classmethod
     def description(cls, context, properties):
         if properties.excluded:
-            return ("Keep {0}'s faces out of Painter: Update Mesh stops sending them. A "
-                    "Texture Set that still has layers and nothing left painting into it "
-                    "stops the swap until it is deleted in Painter or this is let back "
-                    "in".format(properties.material))
-        return "Let {0}'s faces back into Painter with the next Update Mesh".format(
-            properties.material)
+            return ("Hide {0}: Update Mesh stops sending its faces and deletes its Texture Set in "
+                    "Painter, layers and all. It waits in the Hidden list below, where it can be "
+                    "let back in".format(properties.material))
+        return ("Let {0} back into Painter: the next Update Mesh sends its faces and makes it a "
+                "new Texture Set there".format(properties.material))
 
     def execute(self, context):
         try:
@@ -1352,6 +1380,7 @@ def _draw_table(layout):
     for row in rows:
         if row["texture_set"]:
             by_set.setdefault(row["texture_set"], []).append(row["name"])
+    hidden = set(kept_out_materials())
     if sets:
         box = layout.box()
         box.label(text="Texture Sets in Painter")
@@ -1359,6 +1388,10 @@ def _draw_table(layout):
             name = entry["name"]
             painters = by_set.get(name, [])
             line = box.row(align=True)
+            if not painters and name in hidden:
+                line.label(text=name, icon="HIDE_ON")
+                line.label(text="hidden: goes with the next Update Mesh")
+                continue
             orphan = entry.get("layers", 0) and not painters
             line.label(text=name, icon="ERROR" if orphan else "TEXTURE")
             if not painters:
@@ -1373,7 +1406,8 @@ def _draw_table(layout):
                 operator = line.operator(RURIBRIDGE_OT_exclude.bl_idname, text="",
                                          icon="HIDE_OFF")
                 operator.material, operator.excluded = painter, True
-    orphans = [entry for entry in sets if entry.get("layers", 0) and not by_set.get(entry["name"])]
+    orphans = [entry for entry in sets
+               if entry.get("layers", 0) and not by_set.get(entry["name"]) and entry["name"] not in hidden]
     if len(orphans) > 1:
         operator = box.operator(RURIBRIDGE_OT_drop_in_painter.bl_idname,
                                 text="Delete {0} Unpainted In Painter".format(len(orphans)), icon="TRASH")
@@ -1389,6 +1423,15 @@ def _draw_table(layout):
             operator = line.operator(RURIBRIDGE_OT_exclude.bl_idname, text="",
                                      icon="HIDE_OFF")
             operator.material, operator.excluded = row["name"], True
+    standby = kept_out_materials()
+    if standby:
+        box = layout.box()
+        box.label(text="Hidden: not in Painter ({0})".format(len(standby)))
+        for name in standby:
+            line = box.row(align=True)
+            line.label(text=name, icon="MATERIAL")
+            operator = line.operator(RURIBRIDGE_OT_exclude.bl_idname, text="", icon="HIDE_ON")
+            operator.material, operator.excluded = name, False
     if _view["bare"]:
         box = layout.box()
         box.label(text="No material, not sent")
@@ -1416,6 +1459,10 @@ class RURIBRIDGE_PT_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         attached = _draw_status(layout)
+        sending = layout.column(align=True)
+        sending.enabled = CONNECTION.is_open
+        sending.scale_y = 1.3
+        sending.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
         column = layout.column(align=True)
         column.enabled = attached
         column.scale_y = 1.3
@@ -1440,7 +1487,6 @@ class RURIBRIDGE_PT_push(bpy.types.Panel):
         column = self.layout.column(align=True)
         column.enabled = CONNECTION.is_open
         column.scale_y = 1.3
-        column.operator(RURIBRIDGE_OT_send_mesh.bl_idname, icon="EXPORT")
         _draw_scoped(column, RURIBRIDGE_OT_push_shader, "MATERIAL")
         _draw_scoped(column, RURIBRIDGE_OT_push_textures, "TEXTURE")
 
