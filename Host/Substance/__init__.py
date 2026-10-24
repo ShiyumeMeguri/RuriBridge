@@ -52,7 +52,7 @@ from ...Kernel import record as record_module
 from ...Kernel import session as session_module
 from ...Kernel import topic as topic_module
 
-from . import (guest_state, held_imports, layout_state, material_seed, mesh_ingest, paint_repair,
+from . import (canvas_state, guest_state, held_imports, layout_state, material_seed, mesh_ingest, paint_repair,
                project_imports, seeding, shader_state, texture_publish)
 
 LOG = log_module.logger("painter")
@@ -225,7 +225,7 @@ def selected_texture_set():
 def _texture_sets(names):
     """These Texture Sets by name, or every one this project has when none are named."""
     if names is None:
-        return sorted(one.name for one in substance_painter.textureset.all_texture_sets())
+        return sorted(one.name for one in canvas_state.held())
     return list(names)
 
 
@@ -810,6 +810,7 @@ def _mesh_repairing():
 def _mesh_finished(status=None, applied=None, created=()):
     _mesh_deadline[0] = None
     _presence_due[0] = True
+    canvas_state.conceal_soon()
     if applied is None and status is not None and status != str(substance_painter.project.ReloadMeshStatus.SUCCESS):
         _panel.set_status(status)
     if applied is not None and applied.relaid:
@@ -869,10 +870,11 @@ def _handle(topic, generation):
         except Exception:
             _mesh_deadline[0] = None
             raise
-        if what == "repair":
+        if what in ("repair", "attach"):
             _mesh_deadline[0] = None
         _panel.set_status("{0}: {1}".format(
-            {"create": "creating the project", "repair": "repairing the paint, then swapping the mesh in"}.get(
+            {"create": "creating the project", "repair": "repairing the paint, then swapping the mesh in",
+             "attach": "putting the canvases' surfaces beside the mesh, then swapping it in"}.get(
                 what, "swapping the mesh in"),
             mesh_ingest.describe_scene(generation)))
         return True
@@ -978,6 +980,8 @@ def _on_timer():
             if line:
                 _panel.set_status(line)
             _presence_due[0] = not paint_repair.running()
+        if canvas_state.concealing() and not substance_painter.project.is_busy() and not paint_repair.running():
+            canvas_state.settle_concealment()
         if _presence_due[0] and not substance_painter.project.is_busy():
             _presence_due[0] = False
             publish_presence()
@@ -995,8 +999,9 @@ def _on_timer():
 def _on_project_ready(_event):
     _IMPORTED.clear()
     project_imports.forget()
+    canvas_state.conceal_soon()
     made = mesh_ingest.settle_new_project()
-    _mesh_finished(created=sorted(one.name for one in substance_painter.textureset.all_texture_sets()) if made else ())
+    _mesh_finished(created=sorted(one.name for one in canvas_state.held()) if made else ())
 
 
 def _on_project_changed(_event):

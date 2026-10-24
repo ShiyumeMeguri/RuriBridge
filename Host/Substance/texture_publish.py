@@ -30,7 +30,7 @@ import substance_painter.textureset
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import guest_state, layout_state, material_seed, mesh_ingest, project_facts, shader_state, slot_recipe
+from . import canvas_state, guest_state, layout_state, material_seed, mesh_ingest, project_facts, shader_state, slot_recipe
 
 LOG = logger("painter.textures")
 
@@ -359,7 +359,7 @@ def publish(publisher, directory, preset_name=DEFAULT_PRESET_NAME, layer=False, 
         suffix = _safe("_".join(node.get_name() for node in chosen))
         isolation = _only_these_visible(stack, chosen)
     else:
-        texture_sets = list(substance_painter.textureset.all_texture_sets()
+        texture_sets = list(canvas_state.held()
                             if texture_sets is None else texture_sets)
         suffix = ""
         isolation = contextlib.nullcontext()
@@ -423,7 +423,7 @@ def rename(renames):
     anything moves.
     """
     by_name = {texture_set.name: texture_set
-               for texture_set in substance_painter.textureset.all_texture_sets()}
+               for texture_set in canvas_state.held()}
     wanted = {old: new for old, new in renames.items() if old in by_name and old != new}
     missing = sorted(set(renames) - set(by_name))
     if missing:
@@ -481,7 +481,7 @@ def current_project_state():
     if not substance_painter.project.is_open():
         return record_module.presence("Substance", "")
     texture_sets = [_texture_set_state(texture_set)
-                    for texture_set in substance_painter.textureset.all_texture_sets()]
+                    for texture_set in canvas_state.held()]
     return record_module.presence(
         "Substance", substance_painter.project.file_path() or "(unsaved project)",
         texture_sets=sorted(texture_sets, key=lambda entry: entry["name"]),

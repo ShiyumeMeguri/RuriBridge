@@ -90,7 +90,7 @@ from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import held_imports, project_facts, project_imports, substance_package
+from . import canvas_state, held_imports, project_facts, project_imports, substance_package
 
 LOG = logger("painter.layout")
 
@@ -402,7 +402,7 @@ def readers():
     found = {}
     unprojected = {}
     mesh_maps = {}
-    for texture_set in textureset.all_texture_sets():
+    for texture_set in canvas_state.held():
         mesh_maps[texture_set.name] = mesh_map_pictures(texture_set)
         for stack in texture_set.all_stacks():
             _visit(layerstack.get_root_layer_nodes(stack), texture_set.name, found, unprojected)
@@ -487,7 +487,7 @@ def plan(record, directory):
         if old == new:
             continue
         texture_set = textureset.TextureSet.from_name(name) if name in {
-            one.name for one in textureset.all_texture_sets()} else None
+            one.name for one in canvas_state.held()} else None
         if texture_set is not None and texture_set.has_uv_tiles():
             problems.append("{0} is laid out in UV tiles, which a layout change cannot carry".format(name))
             continue
@@ -741,7 +741,7 @@ def after_surface(chosen):
         _turned(uid, replacement, records)
     project_facts.write(NORMALS_KEY, records)
     states = dict(chosen.states)
-    names = {one.name: one for one in textureset.all_texture_sets()}
+    names = {one.name: one for one in canvas_state.held()}
     replaced = {}
     for name, (how, old, new, maps) in sorted(chosen.relayouts.items()):
         texture_set = names.get(name)
@@ -800,7 +800,7 @@ def hold_surface(fingerprints):
     """Remember the fingerprints of the surface the project holds now, per Texture Set it has: the
     last thing a surface does once everything it brought is in place, so the side that sent it
     learns it went in only then."""
-    names = {one.name for one in textureset.all_texture_sets()}
+    names = {one.name for one in canvas_state.held()}
     project_facts.write(SURFACE_KEY, {name: str(fingerprint) for name, fingerprint
                                       in dict(fingerprints).items() if name in names})
 
@@ -813,7 +813,7 @@ def hold_mesh_maps(texture_set, maps):
     states = applied()
     state = states.setdefault(texture_set.name, {"layout": "", "extra": {}, "mesh_maps": {}})
     state.setdefault("mesh_maps", {})[state["layout"]] = dict(maps)
-    _settle(states, tables_of(states), {one.name for one in textureset.all_texture_sets()})
+    _settle(states, tables_of(states), {one.name for one in canvas_state.held()})
 
 
 def rename(renames):
@@ -833,7 +833,7 @@ def rename(renames):
 def adopt(layouts, fingerprints):
     """A project just created from a surface starts out applying the tables it came with."""
     desired = {name: layout_module.charts(table) for name, table in dict(layouts).items()}
-    names = {one.name for one in textureset.all_texture_sets()}
+    names = {one.name for one in canvas_state.held()}
     _settle({}, desired, names)
     hold_surface(fingerprints)
 
@@ -1070,7 +1070,7 @@ def readings(texture_set, normal_fills, fills, staging):
 def answer(publisher, texture_set_name, request_number):
     """Say how a Texture Set reads its charts and hand over its mesh maps, laid out in its
     current layout. Returns one line about it."""
-    names = {one.name: one for one in textureset.all_texture_sets()}
+    names = {one.name: one for one in canvas_state.held()}
     texture_set = names.get(texture_set_name)
     refused = ""
     if texture_set is None:

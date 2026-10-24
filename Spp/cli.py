@@ -6,6 +6,8 @@
     python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL...|--all --anchor uv|surface --old SCENE [--source-set N] [--passes NAME...] [--out PATH]
     python -m RuriBridge.Spp.cli split PROJECT SOURCE NAME --new SCENE [--out PATH]
     python -m RuriBridge.Spp.cli carry PROJECT --old SCENE --events FILE [--uv-set N] [--out PATH]
+    python -m RuriBridge.Spp.cli canvas PROJECT MATERIAL... --surface FBX --surface-out FBX [--out PATH]
+    python -m RuriBridge.Spp.cli templates PROJECT --out FILE
 
 ``clone`` adds a material called NAME that is a copy of the material called SOURCE, with its stacks, layers,
 brushes and strokes, to the project at PATH -- or to PROJECT itself when there is no ``--out``.
@@ -21,6 +23,13 @@ the UV layout follow the surface to the new layout by way of it. ``--passes`` na
 ``[{"source": material the faces came from, "target": material the copies are in, "roots": [uid of each copied layer]}]``; SCENE
 is the surface the paint was made on, a project file or a ``scene.assbin``, and the surface the faces lie on now is PROJECT's own.
 
+``canvas`` gives each MATERIAL of PROJECT a canvas (see ``retarget.canvas``) for a mesh that changed under a UV layout that stayed:
+the material is copied with all its paint, and left reading the copy. FBX is the surface the project is to have, written by ``Spp.fbx``;
+the file at ``--surface-out`` holds it and, after it, the surface of every canvas the project has, from PROJECT's own scene: the surface
+the paint was made on. With no MATERIAL it only puts the canvases the project has beside a surface, which every surface a project with
+canvases is sent needs. ``templates`` makes the file the canvases are made from (``retarget/canvas_templates.bin``) from a project
+Painter saved that holds a folder with an anchor in its effects, a fill that reads references, and a fill layer.
+
 ``split`` adds a material called NAME that is a copy of SOURCE and takes out of it the strokes, polygon fills and layers that
 cannot touch the polygons NAME has in SCENE -- the scene (a project file or a ``scene.assbin``) of the mesh the material was
 split on, whose UV layout is PROJECT's own.
@@ -32,7 +41,7 @@ import argparse
 import json
 import sys
 
-from . import materials, project
+from . import materials, project, stream
 
 
 def _materials(arguments):
@@ -65,6 +74,26 @@ def _retarget(arguments):
         report = job.run(changing, old, None if arguments.all else arguments.materials, arguments.anchor, arguments.uv_set, arguments.source_set,
                          arguments.passes)
     return {"anchor": arguments.anchor, "project": arguments.out or arguments.project, "report": report}
+
+
+def _canvas(arguments):
+    from .retarget import job
+    if arguments.materials:
+        with project.edited(arguments.project, arguments.out) as changing:
+            report = job.lay_canvases(changing, arguments.materials, arguments.surface, arguments.surface_out)
+    else:
+        with project.Project(arguments.project) as opened:
+            report = job.lay_canvases(opened, [], arguments.surface, arguments.surface_out)
+    return dict(report, surface=arguments.surface_out, project=arguments.out or arguments.project)
+
+
+def _templates(arguments):
+    from .retarget import canvas
+    with project.Project(arguments.project) as opened:
+        data = canvas.make_templates(stream.read(opened.read(project.DOCUMENT)))
+    with open(arguments.out, "wb") as handle:
+        handle.write(data)
+    return {"templates": arguments.out, "bytes": len(data)}
 
 
 def _split(arguments):
@@ -123,6 +152,17 @@ def main(argv=None):
     carrying.add_argument("--uv-set", type=int, default=0)
     carrying.add_argument("--out")
     carrying.set_defaults(run=_carry)
+    laying = commands.add_parser("canvas", help="give materials canvases for a mesh that changed under a layout that stayed")
+    laying.add_argument("project")
+    laying.add_argument("materials", nargs="*")
+    laying.add_argument("--surface", required=True)
+    laying.add_argument("--surface-out", required=True)
+    laying.add_argument("--out")
+    laying.set_defaults(run=_canvas)
+    making = commands.add_parser("templates", help="make the file canvases are made from")
+    making.add_argument("project")
+    making.add_argument("--out", required=True)
+    making.set_defaults(run=_templates)
     arguments = parser.parse_args(argv)
     json.dump(arguments.run(arguments), sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")

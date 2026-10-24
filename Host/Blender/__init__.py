@@ -5,8 +5,9 @@ The same verbs as Painter's end, from this side, and one table:
 
 * **Update Mesh** sends the model -- the surface somebody paints on -- and Painter
   swaps it in under every layer it already has; nothing else changes. **Update Mesh And
-  Repair Paint** first has Painter repair the paint of Texture Sets for the changed mesh,
-  the UV layouts staying where they are.
+  Keep Paint** first has Painter give the Texture Sets canvases (``Spp.retarget.canvas``) for
+  the changed mesh, the UV layouts staying where they are: the paint stays where it was painted,
+  on the surface it was painted on, and what the model paints into reads it from there.
 * **Push Shader** -- every Texture Set, or the one the active material paints into: the
   shader of the material that paints it, with every parameter, into Painter.
 * **Push Textures** -- the material's own textures stood up in Painter, where it runs the
@@ -926,14 +927,15 @@ def _scope(properties):
 
 class RURIBRIDGE_OT_repair_mesh(bpy.types.Operator):
     bl_idname = "ruri_bridge.repair_mesh"
-    verb, subject = "更新网格并修复", "笔触"
+    verb, subject = "更新网格并保住", "绘画"
     bl_label = verb + subject
     selected: bpy.props.BoolProperty(options={"SKIP_SAVE"})
 
     @classmethod
     def description(cls, _context, properties):
-        return ("更新网格,并让 Painter 先按 UV 锚定修好 {0} 的笔触、多边形填充和空间投影的框:UV 没动、网格变了,"
-                "画上去的东西要落回原来的 UV 位置。Painter 会存盘、关掉工程、在另一个进程里改文件、"
+        return ("更新网格,并让 Painter 保住 {0} 已经画上去的一切:UV 没动、网格变了,所有图层(笔触、填充、点选、"
+                "生成器、实例……)原封不动留在一个隐藏的画布纹理集里,照旧在原来的网格上重放;新网格上的纹理集按同一个 "
+                "UV 位置读它,画上去的东西落回原来的 UV 位置。Painter 会存盘、关掉工程、在另一个进程里改文件、"
                 "重开工程再换网格,工程要先存过盘".format(_scope(properties)))
 
     def execute(self, context):

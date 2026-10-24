@@ -8,8 +8,8 @@ from collections import Counter
 import numpy as np
 
 from .. import document as document_module
-from .. import materials, project, scene, stream
-from . import engine, faces, geometry, prune
+from .. import fbx, materials, project, scene, stream
+from . import canvas, canvas_geometry, engine, faces, geometry, prune
 from .context import Context
 from .selection import CENTRE
 
@@ -30,6 +30,7 @@ def run_surfaces(target, old, new, names, anchor, source=None, source_set=None, 
     uids = document_module.Uids(document.root)
     report = {name: engine.run(found[name], old, new, anchor, source=source, source_set=source_set, uids=uids, passes=passes)
               for name in names}
+    document_module.require_unique(document.root, "the repaired document")
     target.write(project.DOCUMENT, stream.write(document))
     return report
 
@@ -77,6 +78,7 @@ def carry_surfaces(target, old, new, events):
             total = Counter(merged.get(name, {}))
             total.update(counts)
             merged[name] = dict(total)
+    document_module.require_unique(document.root, "the repaired document")
     target.write(project.DOCUMENT, stream.write(document))
     return report
 
@@ -87,6 +89,25 @@ def carry(target, old_scene, events, uv_set=0):
     old = geometry.Surface.of(scene.read(old_scene), uv_set)
     new = geometry.Surface.of(scene.read(target.read(project.SCENE)), uv_set)
     return carry_surfaces(target, old, new, events)
+
+
+def lay_canvases(target, names, surface, surface_out):
+    """Give each material called ``names`` of the open, writable project ``target`` a canvas (see ``canvas``), and write the file of the
+    surface the project is to have to ``surface_out``: the surface in the FBX ``surface``, and after it the surface of every canvas the
+    project has, the ones it had and the ones this made, taken from the scene the project holds now. Returns what each material
+    got: ``{"canvases": {material: canvas}, "kept": [material that needed none], "attached": [canvas the project had]}``."""
+    streams = materials.Streams(target)
+    held = sorted(canvas.canvases(streams))
+    made = canvas.templates() if names else None
+    laid = {name: canvas.lay(streams, name, made) for name in names}
+    if any(laid.values()):
+        streams.save(target)
+    placements = {name: name for name in held}
+    placements.update({name: given for name, given in laid.items() if given})
+    parts, uv_names = fbx.read(surface)
+    fbx.write(surface_out, *canvas_geometry.compose(parts, uv_names, scene.read(target.read(project.SCENE)), placements))
+    return {"canvases": {name: given for name, given in laid.items() if given}, "kept": sorted(name for name, given in laid.items() if not given),
+            "attached": held}
 
 
 def run(target, old_scene, names, anchor, uv_set=0, source_set=None, passes=None):

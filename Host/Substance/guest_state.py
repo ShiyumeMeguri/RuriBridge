@@ -55,7 +55,7 @@ import substance_painter.textureset as textureset
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import (held_imports, layer_export, layout_state, material_seed, paint_repair, project_facts, project_imports,
+from . import (canvas_state, held_imports, layer_export, layout_state, material_seed, paint_repair, project_facts, project_imports,
                project_paint)
 
 LOG = logger("painter.guests")
@@ -198,7 +198,7 @@ def answer(publisher, renamed, moves, rehomes, emptied, request_number, refused=
     root layers with pictures of where the ones that would be copied cover them, the folders leaving
     with their faces (``rehomes``, ``{event: {"holder", "target"}}``) with what lies over them and in
     them (``_leaving``), and the fills laying normals through a chart. Returns one line about it."""
-    names = {one.name: one for one in textureset.all_texture_sets()}
+    names = {one.name: one for one in canvas_state.held()}
     events = known()
     targets = sorted(set(moves) | {entry["target"] for entry in rehomes.values()})
     sources = sorted({source for listed in moves.values() for source in listed})
@@ -381,7 +381,7 @@ def plan(record, directory):
     carry = record.get("carry") or {}
     targets = dict(carry.get("targets") or {})
     held = known()
-    names = {one.name for one in textureset.all_texture_sets()}
+    names = {one.name for one in canvas_state.held()}
     problems = []
     for target, entry in sorted(guests.items()):
         for event, guest in sorted(entry["events"].items()):
@@ -525,7 +525,7 @@ def before_surface(chosen):
     its tree as it stands -- each root with how it blends in its source. A root the target's own
     layer stands in for that blends otherwise there is noted."""
     folder = held_imports.folder()
-    names = {one.name for one in textureset.all_texture_sets()}
+    names = {one.name for one in canvas_state.held()}
     events = known()
     for target, entry in sorted(dict((chosen.carry or {}).get("targets") or {}).items()):
         target_channels = (set(textureset.TextureSet.from_name(target).get_stack().all_channels())
@@ -790,7 +790,7 @@ def _following(texture_set):
     that Texture Set's own map -- and the target's map holds the source's on the faces carried in --
     and one showing the target's own map follows it."""
     fills, _unprojected = layout_state.readers()
-    maps = {one.name: layout_state.mesh_map_pictures(one) for one in textureset.all_texture_sets()}
+    maps = {one.name: layout_state.mesh_map_pictures(one) for one in canvas_state.held()}
     return {fill.uid for fill in fills
             if texture_set.name in fill.following
             or fill.pictures & maps.get(layerstack.get_node_by_uid(fill.uid).get_texture_set().name, set())}
@@ -811,7 +811,7 @@ def after_surface(chosen):
     and the resolution of a Texture Set the surface made -- take away the folders that left with
     their faces, and give every other event's mask where its faces lie now. Returns one line about
     it."""
-    names = {one.name: one for one in textureset.all_texture_sets()}
+    names = {one.name: one for one in canvas_state.held()}
     events = known()
     built, layers, added, remasked, left = 0, 0, [], 0, []
     targets = dict((chosen.carry or {}).get("targets") or {})

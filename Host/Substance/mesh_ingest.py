@@ -51,7 +51,7 @@ from ...Kernel import layout as layout_module
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import guest_state, layout_state, paint_repair, project_facts
+from . import canvas_state, guest_state, layout_state, paint_repair, project_facts
 
 LOG = logger("painter.mesh")
 
@@ -146,7 +146,7 @@ def would_lose(record):
     incoming = incoming_texture_sets(record)
     allowed = _allowed_drops | emptied_texture_sets(record) | dropped_texture_sets(record)
     lost = []
-    for texture_set in substance_painter.textureset.all_texture_sets():
+    for texture_set in canvas_state.held():
         if texture_set.name in incoming or texture_set.name in allowed:
             continue
         layers = layer_count(texture_set)
@@ -164,7 +164,8 @@ def apply(generation, texture_resolution, on_finished=None, interpreter="", on_s
     creating returns long before the project can be asked anything.
 
     A surface that asks for the paint to be repaired for it (``record.mesh``) has that done first
-    (``paint_repair``), in the interpreter ``interpreter`` names; ``on_swapping`` hears that the surface
+    (``paint_repair``), in the interpreter ``interpreter`` names; so has one that goes into a project with
+    canvases (``canvas_state``), whose surfaces go in with it. ``on_swapping`` hears that the surface
     is about to be swapped in, which for such a surface is when the repair is over. The copies faces were
     given have their paint repaired after the swap: ``on_repairing`` hears that the swap is over and
     the repair begins.
@@ -202,6 +203,11 @@ def apply(generation, texture_resolution, on_finished=None, interpreter="", on_s
             "send it again now that Blender can see this project. The mesh was not "
             "swapped".format(frame_of_surface, frame_of_project))
 
+    clashing = sorted(set(canvas_state.names()) & incoming_texture_sets(record))
+    if clashing:
+        raise MeshIngestError(
+            "these materials are called like canvases this project keeps the paint of others in: {0}. Rename them in Blender "
+            "and send again; the mesh was not swapped".format(", ".join(clashing)))
     lost = would_lose(record)
     if lost:
         raise MeshIngestError(
@@ -225,13 +231,13 @@ def apply(generation, texture_resolution, on_finished=None, interpreter="", on_s
             paint_repair.check(interpreter)
         except paint_repair.RepairError as error:
             raise MeshIngestError("{0}. The mesh was not swapped".format(error)) from error
-    before = {texture_set.name for texture_set in substance_painter.textureset.all_texture_sets()}
+    before = {texture_set.name for texture_set in canvas_state.held()}
 
     def swap(scene):
         _swap(generation, record, chosen, guests, before, scene, interpreter, on_finished, on_swapping, on_repairing)
 
     repair = record.get("repair")
-    if repair:
+    if paint_repair.needed(repair):
         def resume(surface):
             try:
                 swap(Path(surface))
@@ -241,7 +247,7 @@ def apply(generation, texture_resolution, on_finished=None, interpreter="", on_s
                     on_finished("the paint is repaired, but the surface could not go in: {0}".format(error))
 
         paint_repair.begin(generation, repair, interpreter, resume, on_finished)
-        return "repair"
+        return "repair" if repair else "attach"
     swap(scene_path)
     return "swap"
 
@@ -291,7 +297,8 @@ def _swap(generation, record, chosen, guests, before, scene_path, interpreter, o
         created = []
         outcome = str(status)
         if status == substance_painter.project.ReloadMeshStatus.SUCCESS:
-            created = sorted({texture_set.name for texture_set in substance_painter.textureset.all_texture_sets()}
+            paint_repair.commit()
+            created = sorted({texture_set.name for texture_set in canvas_state.held()}
                              - before)
             LOG.info("mesh generation %d swapped in", generation.number)
             try:
@@ -313,6 +320,8 @@ def _swap(generation, record, chosen, guests, before, scene_path, interpreter, o
         else:
             LOG.error("Painter refused mesh generation %d (%s); its log says why",
                       generation.number, status)
+            if paint_repair.rollback("Painter refused the surface ({0})".format(status), lambda line: settle(line, None, [])):
+                return
         settle(outcome, applied, created)
 
     def reload():
