@@ -20,6 +20,7 @@ Cascadeur 收一份生成的入口脚本。一份代码,不复制、不分叉。
 <Blender scripts>/addons/RuriBridge/
   __init__.py        宿主检测 + 分派
   Kernel/            宿主中立,纯标准库:花名册、主题、会话、竞技场、通道、记录、命令行
+  Spp/               不经 Painter 读写改写 .spp 工程文件:纯标准库,谁都能 import
   Host/
     Blender/         唯一允许 import bpy 的地方
     Substance/       唯一允许 import substance_painter / PySide 的地方
@@ -383,6 +384,26 @@ N 面板的 Cascadeur 一节:把选中的绑定和它当前的动作一起发过
 桥召唤它跑一条命令,它做完就退出。
 
 两个方向都只用 glTF(Cascadeur 自带 `csc.glb` 两个方向的门),一份模型不存两种编码。
+
+## 工程文件(.spp)
+
+`Spp/` 不开 Painter 直接读写 `.spp`。它是 HDF5:几千个一维字节数据集,每个带 `m3_x64_128` 属性
+(MurmurHash3 x64 128,种子 `0xF13A0239`,两个大端 u64),改了数据集就同步重算,Painter 才认。
+文档(`paint/document.bin`)、查看器设置(`editor/viewersettings2.ini`)、烘焙设置(`baking/baking.ini`)
+是三份 Painter 自描述数据流,读成树、改、写回,没动过的流逐字节一致;笔迹点、时间轴键这类定长
+记录数组整块保存,所以 109 MB 的文档 1.6 秒读完。
+
+改动永远先拷贝再替换:块里成功才落到目标,失败不碰原文件。
+
+```bash
+python -m RuriBridge.Spp.cli materials <工程>
+python -m RuriBridge.Spp.cli clone <工程> <源材质> <新名字> [--out <路径>]
+```
+
+`clone` 把一个材质整份复制成另一个名字:文档里的 `DataMaterial`(栈、图层、笔触原样)、查看器设置里它的
+`ShaderData`、烘焙设置里它的 `BakingMaterial` 与只有它自己引用的 tweak 列表。副本里每个对象取新 uid,
+引用重新接好,图片按地址与原材质共用。之后更新网格,Painter 按材质名把这个名字绑到副本上,图层与笔触
+都在。工程得是关着的:Painter 开着时改文件,存盘会被它盖掉。
 
 ## 装进三个宿主
 
