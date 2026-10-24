@@ -133,16 +133,19 @@ def rigid_fit(old, new):
     return motion
 
 
+def storage(matrix):
+    """The sixteen floats Painter keeps for the 4x4 ``matrix``: column by column."""
+    return tuple(float(value) for value in matrix.T.reshape(-1))
+
+
 def moved_view(view, transform):
     """The sixteen floats of the view that sees the world moved by ``transform`` the way ``view`` sees the world."""
-    matrix = np.array(view, dtype=np.float64).reshape(4, 4).T @ np.linalg.inv(transform)
-    return tuple(float(value) for value in matrix.T.reshape(-1))
+    return storage(np.array(view, dtype=np.float64).reshape(4, 4).T @ np.linalg.inv(transform))
 
 
 def moved_inverse(inverse, transform):
     """The sixteen floats of the inverse of projection and view together after the camera follows ``transform``."""
-    matrix = transform @ np.array(inverse, dtype=np.float64).reshape(4, 4).T
-    return tuple(float(value) for value in matrix.T.reshape(-1))
+    return storage(transform @ np.array(inverse, dtype=np.float64).reshape(4, 4).T)
 
 
 def _cells(low, high, origin, size, resolution):

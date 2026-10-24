@@ -56,15 +56,21 @@ def follow_uv(material, context):
     for stroke, through in _strokes(material, VIEW_3D):
         key = (stroke.number("viewMatrix"), stroke.number("projectionMatrix"))
         stroke_rows = _rows(stroke)
-        track = placement.Track(key, geometry.Camera(*key), stroke_rows[:, :2].copy(), through)
+        mirror = np.array(stroke.number("duplicateMatrix")).reshape(4, 4).T if stroke.number("duplicateCount") == 1 else None
+        track = placement.Track(key, geometry.Camera(*key), stroke_rows[:, :2].copy(), through, mirror)
         tracks.append((stroke, stroke_rows, track))
-    placement.follow_uv([track for _stroke, _rows_, track in tracks], context)
+    followed = [track for _stroke, _rows_, track in tracks]
+    before = [track.points.copy() for track in followed]
+    placement.follow_uv(followed, context)
+    placement.follow_mirror(followed, before, context)
     counts = Counter()
     for stroke, stroke_rows, track in tracks:
         stroke_rows[:, :2] = track.points
         _store(stroke, stroke_rows)
         if track.transform is not None:
             stroke.set_number("viewMatrix", geometry.moved_view(track.key[0], track.transform))
+        if track.mirror_after is not None:
+            stroke.set_number("duplicateMatrix", geometry.storage(track.mirror_after))
         counts["strokes"] += 1
         counts["points"] += len(stroke_rows)
         counts["seen"] += track.seen

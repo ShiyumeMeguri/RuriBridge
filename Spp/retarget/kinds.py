@@ -23,6 +23,7 @@ MESH_BOUND = (
      lambda item: item.type == "DataDecalHitRect" and item.number("viewType") == _VIEW_3D),
     ("fills projected in space", lambda item: item.type == _FILL and item.number("projection") != _UV_PROJECTION),
     ("strokes kept as keys in space", _holds_3d_keys),
+    ("strokes with several symmetry duplicates", lambda item: item.type == "DataStroke" and item.number("duplicateCount") > 1),
 )
 
 #: The UV layout changed and the mesh stayed: paint that follows the layout and is not moved.

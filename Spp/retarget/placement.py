@@ -31,17 +31,21 @@ class Track:
     ``transform`` is what the camera was moved by when the track was followed (``None`` before, and where it did not
     move): the 4x4 rigid motion of the world the camera now sees the way it saw it. ``size_ratio`` is how many times
     longer a step of the UV layout is across the surface under the track now than it was (``None`` where unknown).
+    ``mirror`` is the 4x4 matrix of the symmetry duplicate of the paint -- the same path seen through the camera mirrored
+    by it -- or ``None``; ``mirror_after`` the matrix that keeps the duplicate where it fell, once followed.
     """
 
-    def __init__(self, key, camera, points, through):
+    def __init__(self, key, camera, points, through, mirror=None):
         self.key = key
         self.camera = camera
         self.points = points
         self.through = through
+        self.mirror = mirror
         self.seen = 0
         self.moved = 0
         self.transform = None
         self.size_ratio = None
+        self.mirror_after = None
 
 
 def follow_uv(tracks, context):
@@ -56,37 +60,22 @@ def follow_uv(tracks, context):
             track.seen, track.moved = _move(track, index, context)
 
 
-def _patch(context, uv, place):
-    """Points of the old and of the new surface at the same UV places: the track's own and some around them."""
-    reach = float(np.clip(_REACH_SHARE * float((uv.max(axis=0) - uv.min(axis=0)).max()), _REACH_LEAST, _REACH_MOST))
-    around = (uv[:, None, :] + reach * _AROUND[None, :, :]).reshape(-1, 2)
-    nearby = np.repeat(place, len(_AROUND), axis=0)
-    old_triangle, old_weights, _offset = context.old_layout.query(around, nearby)
-    new_triangle, new_weights, _offset = context.new_layout.query(around, nearby)
-    both = (old_triangle >= 0) & (new_triangle >= 0)
-    return (context.old.point(old_triangle[both], old_weights[both]), context.new.point(new_triangle[both], new_weights[both]))
-
-
-def _move(track, index, context):
-    screen = track.points * 2.0 - 1.0
-    triangle, weights, _depth = index.query(screen, context.old_mask if track.through else None)
-    seen = triangle >= 0
-    if not track.through:
-        seen &= context.old_mask[np.where(seen, triangle, 0)]
-    where = np.nonzero(seen)[0]
-    place = context.old.point(triangle[where], weights[where])
-    uv = context.old.uv(triangle[where], weights[where])
-    new_triangle, new_weights, _offset = context.new_layout.query(uv, place)
-    placed = new_triangle >= 0
-    if not placed.any():
-        return int(seen.sum()), 0
-    new_place = context.new.point(new_triangle[placed], new_weights[placed])
-    patch_old, patch_new = _patch(context, uv[placed], place[placed])
-    transform = geometry.rigid_fit(np.concatenate([place[placed], patch_old]), np.concatenate([new_place, patch_new]))
-    track.transform = transform
-    track.points[where[placed]] = track.camera.following(transform).screen(new_place)
-    track.size_ratio = geometry.length_ratio(context.old, triangle[where][placed], context.new, new_triangle[placed])
-    return int(seen.sum()), int(placed.sum())
+def follow_mirror(tracks, old_points, context):
+    """For the tracks that have a symmetry duplicate and were followed (``old_points`` their points before): set each
+    ``mirror_after`` to the matrix that keeps the duplicate on the UV places it fell on. The duplicate camera follows the
+    rigid motion of the patch it sees, so the matrix is that motion, then the old matrix, then the track's own motion undone."""
+    for track, before in zip(tracks, old_points):
+        if track.mirror is None:
+            continue
+        screen = before * 2.0 - 1.0
+        index = geometry.ScreenIndex(context.old, track.camera.following(track.mirror), screen.min(axis=0) - _MARGIN, screen.max(axis=0) + _MARGIN)
+        _where, triangle, weights = _seen(track, index, context, screen)
+        uv, place, new_triangle, new_weights = _across(context, triangle, weights)
+        placed = new_triangle >= 0
+        if placed.any():
+            patch = _rigid(context, uv[placed], place[placed], context.new.point(new_triangle[placed], new_weights[placed]))
+            own = track.transform if track.transform is not None else np.eye(4)
+            track.mirror_after = patch @ track.mirror @ np.linalg.inv(own)
 
 
 def measure_layout(tracks, context):
@@ -99,12 +88,54 @@ def measure_layout(tracks, context):
         screen = np.concatenate([track.points for track in members]) * 2.0 - 1.0
         index = geometry.ScreenIndex(context.old, members[0].camera, screen.min(axis=0) - _MARGIN, screen.max(axis=0) + _MARGIN)
         for track in members:
-            triangle, weights, _depth = index.query(track.points * 2.0 - 1.0, context.old_mask if track.through else None)
-            seen = triangle >= 0
-            if not track.through:
-                seen &= context.old_mask[np.where(seen, triangle, 0)]
-            where = np.nonzero(seen)[0]
-            new_triangle, _weights = context.counterpart.carry(triangle[where], weights[where])
+            where, triangle, weights = _seen(track, index, context, track.points * 2.0 - 1.0)
+            new_triangle, _weights = context.counterpart.carry(triangle, weights)
             found = new_triangle >= 0
-            track.seen = int(seen.sum())
-            track.size_ratio = geometry.length_ratio(context.old, triangle[where][found], context.new, new_triangle[found])
+            track.seen = len(where)
+            track.size_ratio = geometry.length_ratio(context.old, triangle[found], context.new, new_triangle[found])
+
+
+def _seen(track, index, context, screen):
+    """The points of the track (``screen``, ``-1..1``) that the camera of ``index`` sees on the old surface, and the
+    triangle and weights it sees under each: ``(where, triangle, weights)``."""
+    triangle, weights, _depth = index.query(screen, context.old_mask if track.through else None)
+    seen = triangle >= 0
+    if not track.through:
+        seen &= context.old_mask[np.where(seen, triangle, 0)]
+    where = np.nonzero(seen)[0]
+    return where, triangle[where], weights[where]
+
+
+def _across(context, triangle, weights):
+    """Places of the old surface, and where the same places of the layout are on the new: ``(uv, old point, new triangle,
+    new weights)``, the triangle ``-1`` where the new layout has nothing there."""
+    uv = context.old.uv(triangle, weights)
+    place = context.old.point(triangle, weights)
+    new_triangle, new_weights, _offset = context.new_layout.query(uv, place)
+    return uv, place, new_triangle, new_weights
+
+
+def _rigid(context, uv, place, new_place):
+    """The rigid motion of the patch of surface around the places ``uv`` (old points ``place``, new points ``new_place``):
+    the patch is the places themselves and some around them."""
+    reach = float(np.clip(_REACH_SHARE * float((uv.max(axis=0) - uv.min(axis=0)).max()), _REACH_LEAST, _REACH_MOST))
+    around = (uv[:, None, :] + reach * _AROUND[None, :, :]).reshape(-1, 2)
+    nearby = np.repeat(place, len(_AROUND), axis=0)
+    old_triangle, old_weights, _offset = context.old_layout.query(around, nearby)
+    new_triangle, new_weights, _offset = context.new_layout.query(around, nearby)
+    both = (old_triangle >= 0) & (new_triangle >= 0)
+    return geometry.rigid_fit(np.concatenate([place, context.old.point(old_triangle[both], old_weights[both])]),
+                              np.concatenate([new_place, context.new.point(new_triangle[both], new_weights[both])]))
+
+
+def _move(track, index, context):
+    where, triangle, weights = _seen(track, index, context, track.points * 2.0 - 1.0)
+    uv, place, new_triangle, new_weights = _across(context, triangle, weights)
+    placed = new_triangle >= 0
+    if not placed.any():
+        return len(where), 0
+    new_place = context.new.point(new_triangle[placed], new_weights[placed])
+    track.transform = _rigid(context, uv[placed], place[placed], new_place)
+    track.points[where[placed]] = track.camera.following(track.transform).screen(new_place)
+    track.size_ratio = geometry.length_ratio(context.old, triangle[placed], context.new, new_triangle[placed])
+    return len(where), int(placed.sum())
