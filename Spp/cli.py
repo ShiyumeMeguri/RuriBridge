@@ -3,9 +3,14 @@
 
     python -m RuriBridge.Spp.cli materials PROJECT
     python -m RuriBridge.Spp.cli clone PROJECT SOURCE NAME [--out PATH]
+    python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL... --anchor uv|surface --old SCENE [--out PATH]
 
 ``clone`` adds a material called NAME that is a copy of the material called SOURCE, with its stacks, layers,
 brushes and strokes, to the project at PATH -- or to PROJECT itself when there is no ``--out``.
+
+``retarget`` repairs the paint of the MATERIALs of PROJECT for the surface PROJECT holds, which is not the one
+the paint was made on: SCENE is that surface, a project file or a ``scene.assbin``. ``--anchor uv`` says the UV
+layout stayed and the mesh changed, ``--anchor surface`` that the mesh stayed and the layout changed.
 """
 
 from __future__ import annotations
@@ -30,6 +35,22 @@ def _clone(arguments):
     return {"cloned": arguments.source, "name": arguments.name, "uid": uid, "project": arguments.out or arguments.project}
 
 
+def _old_scene(path):
+    if path.lower().endswith(".spp"):
+        with project.Project(path) as opened:
+            return opened.read(project.SCENE)
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def _retarget(arguments):
+    from .retarget import job
+    old = _old_scene(arguments.old)
+    with project.edited(arguments.project, arguments.out) as changing:
+        report = job.run(changing, old, arguments.materials, arguments.anchor, arguments.uv_set)
+    return {"anchor": arguments.anchor, "project": arguments.out or arguments.project, "report": report}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m RuriBridge.Spp.cli", description=__doc__.split("\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -42,6 +63,14 @@ def main(argv=None):
     cloning.add_argument("name")
     cloning.add_argument("--out")
     cloning.set_defaults(run=_clone)
+    retargeting = commands.add_parser("retarget", help="repair paint for a surface that changed")
+    retargeting.add_argument("project")
+    retargeting.add_argument("materials", nargs="+")
+    retargeting.add_argument("--anchor", choices=("uv", "surface"), required=True)
+    retargeting.add_argument("--old", required=True)
+    retargeting.add_argument("--uv-set", type=int, default=0)
+    retargeting.add_argument("--out")
+    retargeting.set_defaults(run=_retarget)
     arguments = parser.parse_args(argv)
     json.dump(arguments.run(arguments), sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")

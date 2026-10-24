@@ -10,10 +10,11 @@ more than a module's public functions; a module knows one thing and hands data t
 * ``project`` -- a project file as named datasets whose checksums stay true.
 * ``stream`` -- Painter's self-describing data stream (the document, the viewer settings, the baking
   settings) as a tree that writes back byte for byte.
-* ``document`` -- what the document is: materials, stacks, layers, actions, strokes.
+* ``document`` -- what the streams share: objects with uids that others refer to.
 * ``materials`` -- operations on whole materials across the streams that describe them.
+* ``scene`` -- the surface the project paints on, its ``scene.assbin``.
 * ``cli`` -- the command line, for people and for an assistant.
 
-The retarget feature sits beside these (``Spp.retarget``), built from the same pieces and from nothing
-else of the bridge.
+``retarget`` is the one part that uses numpy, which Blender and Painter both carry: it moves paint onto a
+surface that changed, built from ``stream``, ``scene`` and numpy and from nothing else of the bridge.
 """
