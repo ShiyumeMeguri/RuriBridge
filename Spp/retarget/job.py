@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 
 from .. import document as document_module
 from .. import materials, project, scene, stream
-from . import engine, geometry, prune
+from . import engine, faces, geometry, prune
 from .context import Context
 from .selection import CENTRE
 
@@ -54,6 +56,37 @@ def split(target, old_scene, new_scene, source, name, uv_set=0):
     """``split_surfaces`` for the surfaces held in scene files: ``old_scene`` the bytes of the project's own scene, ``new_scene``
     those of the one the split material's polygons are in."""
     return split_surfaces(target, geometry.Surface.of(scene.read(old_scene), uv_set), geometry.Surface.of(scene.read(new_scene), uv_set), source, name)
+
+
+def carry_surfaces(target, old, new, events):
+    """Repair the paint of layers copied into materials of the open, writable project ``target``, for faces carried into those
+    from other materials: ``old`` is the surface the paint was made on and ``new`` the one the project holds, and each of
+    ``events`` -- ``{"source", "target", "roots"}`` -- names the material the faces came from, the one the copies are in and the
+    uids of the copies' root layers. Returns what the passes did, by material the copies are in."""
+    document = stream.read(target.read(project.DOCUMENT))
+    found = {material.text("sceneMaterialName"): material for material in document.root["materials"]}
+    missing = [event["target"] for event in events if event["target"] not in found]
+    if missing:
+        raise ValueError("the project has no material called {0}".format(", ".join(missing)))
+    uids = document_module.Uids(document.root)
+    report = {}
+    for event in events:
+        done = faces.run(found[event["target"]], event["roots"], old, new, event["source"], uids)
+        merged = report.setdefault(event["target"], {})
+        for name, counts in done.items():
+            total = Counter(merged.get(name, {}))
+            total.update(counts)
+            merged[name] = dict(total)
+    target.write(project.DOCUMENT, stream.write(document))
+    return report
+
+
+def carry(target, old_scene, events, uv_set=0):
+    """``carry_surfaces`` for the surfaces held in scene files: ``old_scene`` is the bytes of the ``scene.assbin`` the paint was made on
+    and the project's own scene is the surface it is on now."""
+    old = geometry.Surface.of(scene.read(old_scene), uv_set)
+    new = geometry.Surface.of(scene.read(target.read(project.SCENE)), uv_set)
+    return carry_surfaces(target, old, new, events)
 
 
 def run(target, old_scene, names, anchor, uv_set=0, source_set=None, passes=None):

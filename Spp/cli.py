@@ -5,6 +5,7 @@
     python -m RuriBridge.Spp.cli clone PROJECT SOURCE NAME [--out PATH]
     python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL...|--all --anchor uv|surface --old SCENE [--source-set N] [--passes NAME...] [--out PATH]
     python -m RuriBridge.Spp.cli split PROJECT SOURCE NAME --new SCENE [--out PATH]
+    python -m RuriBridge.Spp.cli carry PROJECT --old SCENE --events FILE [--uv-set N] [--out PATH]
 
 ``clone`` adds a material called NAME that is a copy of the material called SOURCE, with its stacks, layers,
 brushes and strokes, to the project at PATH -- or to PROJECT itself when there is no ``--out``.
@@ -15,6 +16,10 @@ layout stayed and the mesh changed, ``--anchor surface`` that the mesh stayed an
 ``--source-set`` is the UV set of PROJECT's mesh that holds the layout the paint was made in; fills laid through
 the UV layout follow the surface to the new layout by way of it. ``--passes`` names the passes to run (``strokes``,
 ``hits``, ``fills``) when something else takes care of the rest; every pass of the anchor otherwise.
+
+``carry`` repairs the paint of layers copied into a material for the faces carried into it from another one. FILE is JSON,
+``[{"source": material the faces came from, "target": material the copies are in, "roots": [uid of each copied layer]}]``; SCENE
+is the surface the paint was made on, a project file or a ``scene.assbin``, and the surface the faces lie on now is PROJECT's own.
 
 ``split`` adds a material called NAME that is a copy of SOURCE and takes out of it the strokes, polygon fills and layers that
 cannot touch the polygons NAME has in SCENE -- the scene (a project file or a ``scene.assbin``) of the mesh the material was
@@ -70,6 +75,16 @@ def _split(arguments):
     return {"split": arguments.source, "name": arguments.name, "project": arguments.out or arguments.project, "report": report}
 
 
+def _carry(arguments):
+    from .retarget import job
+    with open(arguments.events, encoding="utf-8") as handle:
+        events = json.load(handle)
+    old = _scene_bytes(arguments.old)
+    with project.edited(arguments.project, arguments.out) as changing:
+        report = job.carry(changing, old, events, arguments.uv_set)
+    return {"events": events, "project": arguments.out or arguments.project, "report": report}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m RuriBridge.Spp.cli", description=__doc__.split("\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -101,6 +116,13 @@ def main(argv=None):
     splitting.add_argument("--uv-set", type=int, default=0)
     splitting.add_argument("--out")
     splitting.set_defaults(run=_split)
+    carrying = commands.add_parser("carry", help="repair the paint of layers copied for faces carried into another material")
+    carrying.add_argument("project")
+    carrying.add_argument("--old", required=True)
+    carrying.add_argument("--events", required=True)
+    carrying.add_argument("--uv-set", type=int, default=0)
+    carrying.add_argument("--out")
+    carrying.set_defaults(run=_carry)
     arguments = parser.parse_args(argv)
     json.dump(arguments.run(arguments), sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")

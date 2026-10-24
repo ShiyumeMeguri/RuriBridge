@@ -17,5 +17,5 @@ more than a module's public functions; a module knows one thing and hands data t
 
 ``retarget`` is the one part that uses numpy, which Blender carries and Painter does not: it moves paint onto a
 surface that changed, built from ``stream``, ``scene`` and numpy and from nothing else of the bridge. ``retarget.kinds``
-holds the names the others agree on and needs no numpy.
+holds the names the others agree on and needs no numpy. ``layers`` reads which layers of a document hold paint.
 """

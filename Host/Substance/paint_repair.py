@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Repairing the paint of a project for a surface that is about to go in, before it does.
+"""Repairing the paint of a project for a surface that is about to go in, or went in with copies of layers.
 
 Painter replays every stroke and every polygon fill of the project against the surface it
 holds, so a surface whose mesh changed under layouts that stayed, or whose layouts changed under a
 mesh that stayed, is painted on differently unless the document says where each of them fell on
 the new one. ``Spp.retarget`` says it: it rewrites the document in the project file for the surface
-the project holds, given the one the paint was made on. Painter's interpreter has no numpy, so that runs in a process of its own,
-with the interpreter the modelling application states in its presence, on a project Painter has
-closed.
+the project holds, given the one the paint was made on. Painter's interpreter has no numpy, so that
+runs in a process of its own, with the interpreter the modelling application states in its presence,
+on a project Painter has closed.
 
-A repair is a sequence of stages, one tick at a time, and then the swap goes on as it always
-did:
+A repair of the paint for a surface (``begin``) is a sequence of stages, one tick at a time, and then the
+swap goes on as it always did:
 
 1. the project is saved and copied: that file is the surface the paint was made on;
 2. the new surface is swapped in once, so the project file holds it, and saved;
@@ -19,8 +19,13 @@ did:
 5. the copy takes the project's place, and the project is opened;
 6. the swap of the surface goes on against the repaired project.
 
-Anything that fails after the first swap puts the saved copy back and opens it, so a repair that
-could not be done leaves the project as it was.
+A repair of the copies faces were given (``begin_carry``) comes after the swap, once the layers are copied:
+the project as it stood before the swap is kept (``keep_project``), and the stages are the same but for the
+swap of the surface -- the project is saved, closed, repaired against the kept copy, and opened; the file the
+repaired one replaces is kept until the project is open.
+
+Anything that fails after the project is changed or closed puts the saved copy back, when there is one, and
+opens the project, so a repair that could not be done leaves the project as it was.
 """
 
 from __future__ import annotations
@@ -46,6 +51,9 @@ LOG = logger("painter.repair")
 FOLDER_NAME = "painter_repair"
 REPORT_NAME = "report.json"
 COMPLAINT_NAME = "complaint.log"
+EVENTS_NAME = "events.json"
+#: The name the project as it stood before a swap is kept under.
+KEPT_NAME = "kept.spp"
 #: How long what a Painter left in its folder waits before another sweeps it away.
 STALE_SECONDS = 24 * 3600.0
 #: Ticks a save or a close is given to announce itself before the project is asked whether it is done.
@@ -65,30 +73,30 @@ class RepairError(RuntimeError):
 class _Repair:
     """One repair under way: where its files are, which stage it is at and what that stage has done."""
 
-    __slots__ = ("record", "texture_sets", "anchor", "passes", "interpreter", "project", "directory", "old", "surface",
-                 "edited", "resume", "fail", "stages", "index", "entered", "called", "ticks", "scouted", "swapped",
-                 "opened", "process", "started", "streams", "report", "line", "said", "inside", "reason")
+    __slots__ = ("texture_sets", "interpreter", "project", "directory", "old", "held", "surface", "edited", "arguments",
+                 "resume", "fail", "stages", "index", "entered", "called", "ticks", "scouted", "swapped", "opened",
+                 "process", "started", "streams", "report", "line", "said", "inside", "reason")
 
-    def __init__(self, record, interpreter, project_path, directory, resume, fail):
-        self.record = record
-        self.texture_sets = list(record["texture_sets"])
-        self.anchor = record["anchor"]
-        self.passes = list(record["passes"]) if record.get("passes") else []
+    def __init__(self, texture_sets, interpreter, project_path, directory, old, held, surface, edited, arguments, stages,
+                 swapped, resume, fail):
+        self.texture_sets = list(texture_sets)
         self.interpreter = interpreter
         self.project = project_path
         self.directory = directory
-        self.old = directory / "before.spp"
-        self.surface = directory / "surface.fbx"
-        self.edited = directory / "repaired.spp"
+        self.old = old
+        self.held = held
+        self.surface = surface
+        self.edited = edited
+        self.arguments = arguments
         self.resume = resume
         self.fail = fail
-        self.stages = _FORWARD
+        self.stages = stages
         self.index = 0
         self.entered = time.monotonic()
         self.called = False
         self.ticks = 0
         self.scouted = None
-        self.swapped = False
+        self.swapped = swapped
         self.opened = False
         self.process = None
         self.started = 0.0
@@ -118,20 +126,35 @@ def _folder():
     return base / str(os.getpid())
 
 
+def check(interpreter):
+    """Raise ``RepairError`` unless a repair can run: the project has a file, which it works on, and the modelling application
+    has stated an interpreter that exists."""
+    if not substance_painter.project.file_path():
+        raise RepairError("the project has no file yet, and the repair works on the file: save it once first")
+    if not interpreter or not os.path.isfile(interpreter):
+        raise RepairError("the modelling application has not stated an interpreter the repair can run in")
+
+
+def keep_project(name=KEPT_NAME):
+    """A copy of the open project as it stands, kept in this Painter's folder under ``name``: the surface the paint was made on, for
+    a repair that comes after the surface was swapped in. Returns its path."""
+    directory = _folder()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    substance_painter.project.save_as_copy(str(path))
+    return path
+
+
 def begin(generation, record, interpreter, resume, fail):
     """Take a repair in hand: ``record`` is what the surface asks to have repaired (see ``record.mesh``) and ``generation``
-    the surface. ``resume`` is called when the project is repaired and open, ``fail`` with a line when it could not be
-    and the project is as it was. Returns one line about it. Nothing is touched when it raises."""
+    the surface. ``resume`` is called with the path of the surface when the project is repaired and open, ``fail`` with a line when
+    it could not be and the project is as it was. Returns one line about it. Nothing is touched when it raises."""
     if running():
         raise RepairError("a repair is still running")
     if record.get("anchor") not in kinds.BY_ANCHOR:
         raise RepairError("the paint can be repaired for a surface whose mesh changed under layouts that stayed ({0!r}) or whose layouts "
                           "changed under a mesh that stayed ({1!r}), not for {2!r}".format(kinds.UV, kinds.SURFACE, record.get("anchor")))
-    project_path = substance_painter.project.file_path()
-    if not project_path:
-        raise RepairError("the project has no file yet, and the repair works on the file: save it once first")
-    if not interpreter or not os.path.isfile(interpreter):
-        raise RepairError("the modelling application has not stated an interpreter the repair can run in")
+    check(interpreter)
     held = {texture_set.name for texture_set in substance_painter.textureset.all_texture_sets()}
     absent = [name for name in record["texture_sets"] if name not in held]
     if absent:
@@ -139,7 +162,15 @@ def begin(generation, record, interpreter, resume, fail):
     directory = _folder()
     shutil.rmtree(directory, ignore_errors=True)
     directory.mkdir(parents=True)
-    repair = _Repair(record, interpreter, project_path, directory, resume, fail)
+    project_path = substance_painter.project.file_path()
+    old = directory / "before.spp"
+    edited = directory / "repaired.spp"
+    arguments = ["retarget", project_path, *record["texture_sets"], "--anchor", record["anchor"], "--old", str(old),
+                 "--out", str(edited)]
+    if record.get("passes"):
+        arguments += ["--passes", *record["passes"]]
+    repair = _Repair(record["texture_sets"], interpreter, project_path, directory, old, old, directory / "surface.fbx", edited,
+                     arguments, _FORWARD, False, resume, fail)
     try:
         shutil.copyfile(generation.path(generation.record["scene_file"]), repair.surface)
     except OSError:
@@ -148,6 +179,27 @@ def begin(generation, record, interpreter, resume, fail):
     _current[0] = repair
     LOG.info("repairing the paint of %s for the incoming surface", ", ".join(repair.texture_sets))
     return "repairing the paint of {0} before the surface goes in".format(", ".join(repair.texture_sets))
+
+
+def begin_carry(events, old, interpreter, resume, fail):
+    """Take in hand the repair of the copies of layers that faces carried into other Texture Sets were given: ``events`` are
+    ``{"source", "target", "roots"}`` -- the Texture Set the faces came from, the one the copies are in and the uids of the copies'
+    root layers -- and ``old`` is the project as it stood before the surface was swapped in (``keep_project``). ``resume`` and
+    ``fail`` are as for ``begin``, ``resume`` called with None. Returns one line about it. Nothing is touched when it raises."""
+    if running():
+        raise RepairError("a repair is still running")
+    check(interpreter)
+    old = Path(old)
+    directory = old.parent
+    project_path = substance_painter.project.file_path()
+    edited = directory / "repaired.spp"
+    (directory / EVENTS_NAME).write_text(json.dumps(events), encoding="utf-8")
+    arguments = ["carry", project_path, "--old", str(old), "--events", str(directory / EVENTS_NAME), "--out", str(edited)]
+    repair = _Repair(sorted({event["target"] for event in events}), interpreter, project_path, directory, old,
+                     directory / "held.spp", None, edited, arguments, _CARRYING, False, resume, fail)
+    _current[0] = repair
+    LOG.info("repairing the paint of the copies in %s", ", ".join(repair.texture_sets))
+    return "repairing the paint of the copies in {0}".format(", ".join(repair.texture_sets))
 
 
 def on_project_ready(_event=None):
@@ -207,11 +259,13 @@ def _finish(repair):
         LOG.warning("the paint was not repaired: %s", repair.reason)
         repair.fail("the paint could not be repaired, and the project is as it was: {0}".format(repair.reason))
         return
-    for name in (repair.old.name, repair.edited.name, REPORT_NAME, COMPLAINT_NAME):
+    for path in (repair.old, repair.held, repair.edited):
+        path.unlink(missing_ok=True)
+    for name in (REPORT_NAME, COMPLAINT_NAME, EVENTS_NAME):
         (repair.directory / name).unlink(missing_ok=True)
     LOG.info("the paint is repaired: %s", _summary(repair.report))
     repair.line = "repaired the paint: {0}".format(_summary(repair.report))
-    repair.resume(str(repair.surface))
+    repair.resume(None if repair.surface is None else str(repair.surface))
 
 
 def _fall_back(repair, reason):
@@ -220,13 +274,13 @@ def _fall_back(repair, reason):
     if repair.stages is _BACKWARD:
         _current[0] = None
         repair.fail("the paint could not be repaired, and the project could not be put back as it was ({0}); the saved "
-                    "copy of it is {1}".format(reason, repair.old))
+                    "copy of it is {1}".format(reason, repair.held))
         return
     repair.reason = reason
     if repair.process is not None and repair.process.poll() is None:
         repair.process.kill()
     _close_streams(repair)
-    if not repair.swapped or not repair.old.exists():
+    if not repair.swapped:
         _current[0] = None
         shutil.rmtree(repair.directory, ignore_errors=True)
         repair.fail("the paint could not be repaired, and the project is as it was: {0}".format(reason))
@@ -267,7 +321,8 @@ def _settled():
 
 
 def _saved(repair, copy_to=None):
-    """The project saved as it is, and settled; ``copy_to`` is where a copy of the file is kept once it is."""
+    """The project saved as it is, and settled; ``copy_to`` is where a copy of the file is kept once it is: the file is copied as
+    it lies, which Painter does not lock, rather than written again by Painter, which froze once when asked right after a save."""
     if not repair.called:
         if substance_painter.project.is_busy():
             return False
@@ -279,12 +334,12 @@ def _saved(repair, copy_to=None):
     if repair.ticks < SETTLE_TICKS or not _settled():
         return False
     if copy_to is not None:
-        substance_painter.project.save_as_copy(str(copy_to))
+        shutil.copyfile(repair.project, copy_to)
     return True
 
 
 def _save_held(repair):
-    return _saved(repair, repair.old)
+    return _saved(repair, repair.held)
 
 
 def _scout(repair):
@@ -309,7 +364,7 @@ def _scout(repair):
     return True
 
 
-def _save_scouted(repair):
+def _save_current(repair):
     return _saved(repair)
 
 
@@ -318,6 +373,7 @@ def _closed(repair):
     if not repair.called:
         if substance_painter.project.is_busy():
             return False
+        repair.swapped = True
         substance_painter.project.close()
         repair.called = True
         repair.line = "closing the project"
@@ -328,10 +384,7 @@ def _closed(repair):
 def _edit(repair):
     """The process, run on a copy of the project's file, until it ends."""
     if repair.process is None:
-        arguments = [repair.interpreter, "-m", "RuriBridge.Spp.cli", "retarget", repair.project, *repair.texture_sets,
-                     "--anchor", repair.anchor, "--old", str(repair.old), "--out", str(repair.edited)]
-        if repair.passes:
-            arguments += ["--passes", *repair.passes]
+        arguments = [repair.interpreter, "-m", "RuriBridge.Spp.cli", *repair.arguments]
         environment = dict(os.environ)
         environment["PYTHONPATH"] = os.pathsep.join(
             [os.path.dirname(_package_root())] + ([environment["PYTHONPATH"]] if environment.get("PYTHONPATH") else []))
@@ -378,9 +431,12 @@ def _complaint(repair):
 
 
 def _replaced(repair):
-    """The repaired file in the project's place: written beside it first, so the project is never half a file."""
+    """The repaired file in the project's place: written beside it first, so the project is never half a file; the file it
+    replaces is kept as the held copy unless one was made before."""
     beside = repair.project + ".repairing"
     shutil.copyfile(repair.edited, beside)
+    if not repair.held.exists():
+        shutil.move(repair.project, str(repair.held))
     os.replace(beside, repair.project)
     repair.line = "the repaired file is in the project's place"
     return True
@@ -404,10 +460,11 @@ def _opened(repair):
 
 
 def _put_back(repair):
-    """The saved copy in the project's place: what the project was before the first swap."""
-    beside = repair.project + ".repairing"
-    shutil.copyfile(repair.old, beside)
-    os.replace(beside, repair.project)
+    """The saved copy in the project's place, when there is one: what the project was before it was changed."""
+    if repair.held.exists():
+        beside = repair.project + ".repairing"
+        shutil.copyfile(repair.held, beside)
+        os.replace(beside, repair.project)
     repair.line = "the project is back as it was"
     return True
 
@@ -418,8 +475,9 @@ def _closed_when_open(repair):
     return _closed(repair)
 
 
-_FORWARD = (_save_held, _scout, _save_scouted, _closed, _edit, _replaced, _opened)
+_FORWARD = (_save_held, _scout, _save_current, _closed, _edit, _replaced, _opened)
+_CARRYING = (_save_current, _closed, _edit, _replaced, _opened)
 _BACKWARD = (_closed_when_open, _put_back, _opened)
-_NAMES = {_save_held: "saving the project", _scout: "swapping the new surface in", _save_scouted: "saving the project with it",
+_NAMES = {_save_held: "saving the project", _scout: "swapping the new surface in", _save_current: "saving the project with it",
           _closed: "closing the project", _edit: "repairing the paint", _replaced: "putting the repaired file in place",
           _opened: "opening the project", _closed_when_open: "closing the project", _put_back: "putting the saved project back"}

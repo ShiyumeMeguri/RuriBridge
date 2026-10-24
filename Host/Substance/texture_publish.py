@@ -30,8 +30,7 @@ import substance_painter.textureset
 from ...Kernel import record as record_module
 from ...Kernel.log import logger
 
-from . import (guest_state, layout_state, material_seed, mesh_ingest, paint_pixels, project_facts, shader_state,
-               slot_recipe)
+from . import guest_state, layout_state, material_seed, mesh_ingest, project_facts, shader_state, slot_recipe
 
 LOG = logger("painter.textures")
 

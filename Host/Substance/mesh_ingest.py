@@ -218,10 +218,15 @@ def apply(generation, texture_resolution, on_finished=None, interpreter="", on_s
         guests = guest_state.plan(record, str(generation.directory))
     except (layout_module.LayoutError, guest_state.GuestError) as error:
         raise MeshIngestError("{0}. The mesh was not swapped".format(error)) from error
+    if guests.repairs_wanted:
+        try:
+            paint_repair.check(interpreter)
+        except paint_repair.RepairError as error:
+            raise MeshIngestError("{0}. The mesh was not swapped".format(error)) from error
     before = {texture_set.name for texture_set in substance_painter.textureset.all_texture_sets()}
 
     def swap(scene):
-        _swap(generation, record, chosen, guests, before, scene, on_finished, on_swapping)
+        _swap(generation, record, chosen, guests, before, scene, interpreter, on_finished, on_swapping)
 
     repair = record.get("repair")
     if repair:
@@ -239,9 +244,25 @@ def apply(generation, texture_resolution, on_finished=None, interpreter="", on_s
     return "swap"
 
 
-def _swap(generation, record, chosen, guests, before, scene_path, on_finished, on_swapping):
+def _carry_repairs(generation, guests, interpreter, outcome, applied, created, settle):
+    """Repair the paint of the copies the faces carried were given, then ``settle`` the swap: with its outcome, or with why the
+    paint of the copies could not be carried."""
+    def not_carried(line):
+        settle("mesh generation {0} is in, but the paint of its copies could not be carried: {1}".format(generation.number, line),
+               applied, created)
+
+    try:
+        paint_repair.begin_carry(guests.repairs, guests.before, interpreter, lambda _surface: settle(outcome, applied, created),
+                                 not_carried)
+    except paint_repair.RepairError as error:
+        LOG.error("the paint of the copies of mesh generation %d is not carried: %s", generation.number, error)
+        not_carried(str(error))
+
+
+def _swap(generation, record, chosen, guests, before, scene_path, interpreter, on_finished, on_swapping):
     """Queue the surface in the file ``scene_path`` into the open project: ``chosen`` and ``guests`` are what it changes
-    (``layout_state.plan``, ``guest_state.plan``) and ``before`` the Texture Sets the project had."""
+    (``layout_state.plan``, ``guest_state.plan``), ``before`` the Texture Sets the project had and ``interpreter`` the one the
+    paint of copies is repaired in."""
     if on_swapping is not None:
         on_swapping()
     try:
@@ -252,6 +273,12 @@ def _swap(generation, record, chosen, guests, before, scene_path, on_finished, o
     if emptied:
         LOG.info("%s keep no face and go with this swap, their paint carried where the faces went",
                  ", ".join(emptied))
+
+    def settle(outcome, applied, created):
+        if guests.before is not None:
+            guests.before.unlink(missing_ok=True)
+        if on_finished is not None:
+            on_finished(outcome, applied, created)
 
     def finished(status):
         _allowed_drops.clear()
@@ -275,11 +302,13 @@ def _swap(generation, record, chosen, guests, before, scene_path, on_finished, o
                 LOG.info("layouts: %s", applied.line)
                 if carried:
                     LOG.info("guests: %s", carried)
+                if guests.repairs:
+                    _carry_repairs(generation, guests, interpreter, outcome, applied, created, settle)
+                    return
         else:
             LOG.error("Painter refused mesh generation %d (%s); its log says why",
                       generation.number, status)
-        if on_finished is not None:
-            on_finished(outcome, applied, created)
+        settle(outcome, applied, created)
 
     def reload():
         layout_state.before_surface(chosen)

@@ -5,8 +5,7 @@ Update Mesh reads, in the record ``face_ledger`` keeps, what the surface changes
 that take a new name, faces whose paint lives in another Texture Set's own stack than the one they
 paint into now, and faces an event carried into one Texture Set that now paint into another.
 Painter is asked first (``begin``): it renames, then says how the stacks are made and hands over the
-mesh maps and pictures of the paint a copy cannot cast again. Its answer completes the surface
-(``complete``):
+mesh maps. Its answer completes the surface (``complete``):
 
 * each pair of source and target becomes an event: a folder over there showing the source's stack
   on its faces (``guest_state``); which root layers come live, which are copied and which those
@@ -20,9 +19,8 @@ mesh maps and pictures of the paint a copy cannot cast again. Its answer complet
   carried from the frames the source's layout gave them into the ones the target's gives -- and
   none of the target's own texels changes; a Texture Set the surface makes for faces leaving
   another where they lie takes that one's maps whole, so what reads around them reads the same;
-* the paint the copies stand in for is laid out where it was made, read through the coordinates it
-  was made in; where it lays normals that bend as the islands turn, it is laid out where the faces
-  lie now, the normals carried into the new frames;
+* a copy of a layer that holds paint has its strokes and polygon fills carried to where the faces lie
+  once the surface is in, by Painter, in the project's document: the roots say which hold paint;
 * Painter reads tangent normals in the frames of set 0, so a picture of normals read through the
   coordinates it was made in points elsewhere where the faces' islands turn: a root layer of the
   source's own laying such a picture is copied rather than shown live, and the copy's picture is
@@ -196,7 +194,7 @@ def _decide(roots, generation, painted, source, target, emptied, problems, bendi
         if carry == "copy" and root["kind"] == "other":
             problems.append("{0} of {1} would have to be copied, and only folders and plain fills can be; put it "
                             "in a folder in Painter".format(root["name"], source))
-        decided.append({"uid": root["uid"], "carry": carry, "reads": "painted"})
+        decided.append({"uid": root["uid"], "carry": carry, "reads": "painted", "paint": bool(root["paint"])})
     return decided
 
 
@@ -218,34 +216,11 @@ def _decide_leaving(rehome, generation, laid, target, emptied, problems):
         if carry == "copy" and root["kind"] == "other":
             problems.append("{0} in a folder of {1} would have to be copied, and only folders and plain fills can "
                             "be; put it in a folder in Painter".format(root["name"], holder))
-        decided.append({"uid": root["uid"], "carry": carry, "reads": "painted"})
+        decided.append({"uid": root["uid"], "carry": carry, "reads": "painted", "paint": bool(root["paint"])})
     return decided
 
 
 # -- pictures ---------------------------------------------------------------------------------------------
-
-class _Laid:
-    """Triangles laid out where their paint is (``render``, the old layout) and where they lie now
-    (``target``), the shape the retarget's pictures read."""
-
-    __slots__ = ("render", "target")
-
-    def __init__(self, render, target):
-        self.render = render
-        self.target = target
-
-
-def _frozen(entries, decided, generation, laid, frames, green, beside, name):
-    """Pictures of the paint the copies stand in for, ``{uid: {..., "root"}}``, and its names."""
-    copied = {int(entry["uid"]) for entry in decided if entry["carry"] == "copy"}
-    entries = [entry for entry in entries if int(entry["root"]) in copied]
-    if not entries:
-        return {}, []
-    frozen, named = layout_retarget.frozen_pictures({"frozen": entries}, generation, laid, frames, green, name,
-                                                    beside)
-    roots = {str(entry["uid"]): int(entry["root"]) for entry in entries}
-    return {uid: dict(entry, root=roots[uid]) for uid, entry in frozen.items()}, named
-
 
 def _lanes(values):
     """A mesh map's lanes as few as it needs: one for an opaque grey, three for an opaque colour."""
@@ -485,7 +460,7 @@ def complete(context, session, generation, frame_of_project, painter):
     surface = surface_crossing.gather(objects, frames=True)
     green = _green(record, generation, surface)
     written = _written(record, generation, green)
-    events, targets, notes, named = {}, {}, [], []
+    events, targets, notes = {}, {}, []
     beside = surface_crossing.Beside()
     counts = {"own": 0, "instance": 0, "copy": 0, "skip": 0}
     taken = set(surface_crossing.held_events(view))
@@ -503,13 +478,9 @@ def complete(context, session, generation, frame_of_project, painter):
             bending, frames = _bending(record, generation, surface, movers, source)
             decided = _decide(record["roots"][source], generation, surface.painted[movers], source, target,
                               asked.emptied, problems, bending)
-            frozen, made = _frozen(record["frozen"][source], decided, generation,
-                                   _Laid(surface.painted[movers], surface.render[movers]), frames, green, beside, source)
             normals = _turned(generation, decided, bending, frames, surface.painted[movers], green, written, beside,
                               source, notes)
-            named += made
-            entry["events"][str(event)] = {"source": source, "holder": "", "roots": decided, "frozen": frozen,
-                                           "normals": normals}
+            entry["events"][str(event)] = {"source": source, "holder": "", "roots": decided, "normals": normals}
         for event in leaving:
             rehome = record["rehomes"][event]
             holder = rehome["holder"]
@@ -517,14 +488,8 @@ def complete(context, session, generation, frame_of_project, painter):
             units.append((holder, movers, "render"))
             decided = _decide_leaving(rehome, generation, surface.render[movers], target, asked.emptied, problems)
             _read_charts(tables, holder, decided, problems)
-            frames = surface.frames(movers, "render", "render")
-            frozen, made = _frozen(rehome["frozen"], decided, generation,
-                                   _Laid(surface.render[movers], surface.render[movers]), frames, green, beside, holder)
-            named += made
             entry["events"][event] = {"source": surface_crossing.held_events(view)[event][1], "holder": holder,
-                                      "roots": decided, "frozen": {uid: dict(one, moved=True)
-                                                                   for uid, one in frozen.items()},
-                                      "normals": {}}
+                                      "roots": decided, "normals": {}}
         for one in entry["events"].values():
             for decision in one["roots"]:
                 counts[decision["carry"]] += 1
@@ -563,9 +528,8 @@ def complete(context, session, generation, frame_of_project, painter):
     parts = ["{0} renamed {1}".format(old, new) for old, new in sorted(renamed.items())]
     if targets:
         parts.append("carried paint into {0}: {1} layer(s) live, {2} of the target's own laid over them, {3} copied, "
-                     "{4} left out, {5} piece(s) of paint as pixels".format(
-                         ", ".join(sorted(targets)), counts["instance"], counts["own"], counts["copy"], counts["skip"],
-                         len(named)))
+                     "{4} left out".format(", ".join(sorted(targets)), counts["instance"], counts["own"], counts["copy"],
+                                           counts["skip"]))
     parts.append("surface generation {0} sent".format(sent.number))
     if asked.emptied:
         parts.append("{0} keep no face and go".format(", ".join(asked.emptied)))

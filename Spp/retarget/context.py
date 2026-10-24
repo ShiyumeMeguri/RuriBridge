@@ -31,16 +31,18 @@ class Context:
 
     ``source`` is the new mesh read with the UV set ``source_set``: the set that holds the layout the paint was
     made in, which a fill laid through the layout needs to follow the surface to a new one. ``uids`` hands out the
-    uids of what a pass adds to the document.
+    uids of what a pass adds to the document. ``moved`` is ``(old, new)``, a boolean per triangle of each surface, for
+    paint carried with faces into another material: the passes then see those polygons only, and a polygon is found
+    again whatever material it has been given.
     """
 
-    def __init__(self, old, new, material, uv_reach=0.05, source=None, source_set=None, uids=None):
+    def __init__(self, old, new, material, uv_reach=0.05, source=None, source_set=None, uids=None, moved=None):
         self.old = old
         self.new = new
         self.material = material
         self.uv_reach = uv_reach
-        self.old_mask = old.mask(material)
-        self.new_mask = new.mask(material)
+        self.carrying = moved is not None
+        self.old_mask, self.new_mask = moved if self.carrying else (old.mask(material), new.mask(material))
         self.uids = uids
         self._source = source
         self._source_set = source_set
@@ -143,7 +145,7 @@ class Context:
 
     @cached_property
     def counterpart(self):
-        return geometry.Correspondence(self.old, self.new, 1e-5 * self.diagonal)
+        return geometry.Correspondence(self.old, self.new, 1e-5 * self.diagonal, same_material=not self.carrying)
 
     def uv_counterpart(self, triangles):
         """For each of ``triangles`` of the old surface the triangle of the new one at the same place of the UV layout, ``-1`` where

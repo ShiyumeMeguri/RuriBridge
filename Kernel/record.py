@@ -195,17 +195,15 @@ def mesh(source, scene_file, scene, materials, frame_of_project, layouts, uv_set
     moves faces into another Texture Set (see ``carry_answer``): ``{"request": generation,
     "emptied": [source], "targets": {Texture Set: {"mesh_maps": {usage: file}, "channels":
     [{"channel", "format", "label"}], "resolution": [width, height] or None, "events": {event:
-    {"source", "holder", "roots": [{"uid", "carry", "reads"}], "frozen": {uid: {"layer", "mask",
-    "own", "name", "root", "moved", "pictures": {channel: file and "space"}}}, "normals": {uid:
+    {"source", "holder", "roots": [{"uid", "carry", "reads", "paint"}], "normals": {uid:
     file}}}}}}`` -- the Texture Set's mesh maps with the faces moving in laid into them, beside
     the record, the channels it takes from them, and the resolution of one this surface makes;
-    per event how each layer it lays comes along (``own``, ``instance``, ``copy`` or ``skip``) and
+    per event how each layer it lays comes along (``own``, ``instance``, ``copy`` or ``skip``),
     whether it goes on reading the layout (``reads`` ``layout``) or reads where the faces' paint
-    is laid out (``painted``), and the pictures standing in for the paint of the
-    copies that a copy cannot cast again, laid out where the paint was made, or where the faces
-    lie now (``moved``), and the pictures of normals of the
-    copies' fills turned where each texel lies into the frames the faces have now, in the chart
-    the fill reads (``normals``). An event of faces that leave a source's own stack lays the
+    is laid out (``painted``), whether it holds paint (``paint``: the strokes and polygon fills of
+    a copy that does are carried to where the faces lie once it is in), and the pictures of
+    normals of the copies' fills turned where each texel lies into the frames the faces have now,
+    in the chart the fill reads (``normals``). An event of faces that leave a source's own stack lays the
     source's root layers; one whose faces leave the Texture Set holding their folder (``holder``,
     empty otherwise) keeps its number and lays what lies over that folder and what it holds, and
     the folder goes. The ``emptied`` sources keep no face and go with this surface.
@@ -339,20 +337,19 @@ def layout_answer(source, texture_set, request, fingerprint, readers, tables, ke
     return record
 
 
-def carry_answer(source, request, renamed, moves, rehomes, tables, texture_sets, readers, roots, frozen, normals,
-                 convention, refused):
+def carry_answer(source, request, renamed, moves, rehomes, tables, texture_sets, readers, roots, normals, convention,
+                 refused):
     """Texture Sets some faces of which are about to paint into others, as the texturing side
     holds them, for the side that moved the faces to carry their paint over.
 
     ``request`` is the generation of the ask it answers, ``renamed`` the Texture Sets it renamed
     first, old name to new -- every other name in the answer is the new one -- ``moves`` the ask
     itself, ``{target: [source]}``, and ``rehomes`` the events whose faces leave the Texture Set
-    holding their folder, ``{event: {"holder", "target", "roots", "frozen", "lying", "inside"}}``:
+    holding their folder, ``{event: {"holder", "target", "roots", "lying", "inside"}}``:
     the holder's root layers over the folder (``inside`` false) and the layers the folder holds
-    (``inside`` true), top first, in the shape of ``roots``; the paint under them a copy cannot
-    cast again, in the shape of ``frozen``; every layer lying in the folder, which goes with it
-    (``lying``); and every layer and effect the folder shows, through instances too (``inside``),
-    the fills among them reading where the faces' paint is laid out.
+    (``inside`` true), top first, in the shape of ``roots``; every layer lying in the folder, which
+    goes with it (``lying``); and every layer and effect the folder shows, through instances too
+    (``inside``), the fills among them reading where the faces' paint is laid out.
     ``tables`` are the tables the project applies (charts only), by Texture Set.
     ``texture_sets`` describes every source and target, ``{"resolution": [width, height],
     "channels": [{"channel", "format", "label"}], "mesh_maps": {usage: {"file", "kind"}}}``,
@@ -364,10 +361,8 @@ def carry_answer(source, request, renamed, moves, rehomes, tables, texture_sets,
     anything under it holds paint, whether it is the bridge's own layer of the source's
     Blender material, whether it is a folder, and -- for one that would have to be copied --
     pictures of where it covers the source, ``{"mask": file or "", "channels": {channel:
-    file}}``, each holding the coverage as alpha (a mask as its value). ``frozen`` is, per
-    source, its own paint that a copy cannot cast again where it lay -- laid out in UV space
-    or picked by polygon -- in the shape of a layout answer's, each with the root layer
-    holding it (``root``). ``normals`` is, per source, every fill it shows laying tangent
+    file}}``, each holding the coverage as alpha (a mask as its value). ``normals`` is, per
+    source, every fill it shows laying tangent
     normals through a chart, in the shape of a layout answer's ``fills``, each with the root
     layer it lies under (``root``): Painter reads such normals in the frames of set 0, so on
     islands that turn they point elsewhere unless their picture is turned. ``convention`` is,
@@ -386,7 +381,6 @@ def carry_answer(source, request, renamed, moves, rehomes, tables, texture_sets,
         "texture_sets": dict(texture_sets),
         "readers": list(readers),
         "roots": dict(roots),
-        "frozen": dict(frozen),
         "normals": dict(normals),
         "convention": dict(convention),
         "refused": refused,
