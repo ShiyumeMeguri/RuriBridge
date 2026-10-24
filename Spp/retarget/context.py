@@ -58,6 +58,10 @@ class Context:
         return selection.elements(self.old)
 
     @cached_property
+    def new_elements(self):
+        return selection.elements(self.new)
+
+    @cached_property
     def old_chunks(self):
         return selection.chunks(self.old)
 
@@ -81,6 +85,11 @@ class Context:
     @cached_property
     def new_layout(self):
         return geometry.UvIndex(self.new, self.new_mask)
+
+    @cached_property
+    def old_layout_exact(self):
+        """The old layout without a reach: a place outside every island is nowhere."""
+        return geometry.UvIndex(self.old, self.old_mask)
 
     @cached_property
     def new_space(self):

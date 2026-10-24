@@ -366,9 +366,8 @@ class UvIndex:
         return found, weights, offset
 
     def holding(self, points):
-        """How many triangles of the index hold each of ``points`` (n, 2) in the UV layout: more than one where islands
-        lie over one another."""
-        counts = np.zeros(len(points), dtype=np.int64)
+        """Every triangle of the index that holds one of ``points`` (n, 2) in the UV layout: ``(point, triangle)`` pairs,
+        several for a point where islands lie over one another."""
         cells = np.floor((points - self.origin) / self.size).astype(np.int64)
         inside = ((cells >= 0) & (cells < self.resolution)).all(axis=1)
         cells = np.clip(cells, 0, self.resolution - 1)
@@ -377,8 +376,7 @@ class UvIndex:
         keep = inside[query]
         query, triangle = query[keep], triangle[keep]
         _weights, held = _barycentric(self.surface.uvs[self.surface.triangles[triangle]], points[query])
-        np.add.at(counts, query[held], 1)
-        return counts
+        return query[held], triangle[held]
 
     def _query(self, points, near, found, weights, offset):
         cells = np.floor((points - self.origin) / self.size).astype(np.int64)

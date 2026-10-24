@@ -23,6 +23,8 @@ _REACH_SHARE = 0.1
 _REACH_LEAST = 2e-3
 _REACH_MOST = 0.05
 _AROUND = np.array([(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)])
+#: At most this many places of a track are used to find the motion of its patch.
+_PATCH_PLACES = 48
 
 
 class Track:
@@ -69,10 +71,10 @@ def follow_mirror(tracks, old_points, context):
         screen = before * 2.0 - 1.0
         index = geometry.ScreenIndex(context.old, track.camera.following(track.mirror), screen.min(axis=0) - _MARGIN, screen.max(axis=0) + _MARGIN)
         _where, triangle, weights = _seen(index, context, screen)
-        uv, place, new_triangle, new_weights = _across(context, triangle, weights)
+        uv, place, new_triangle, new_weights = across(context, triangle, weights)
         placed = new_triangle >= 0
         if placed.any():
-            patch = _rigid(context, uv[placed], place[placed], context.new.point(new_triangle[placed], new_weights[placed]))
+            patch = rigid(context, uv[placed], place[placed], context.new.point(new_triangle[placed], new_weights[placed]))
             own = track.transform if track.transform is not None else np.eye(4)
             track.mirror_after = patch @ track.mirror @ np.linalg.inv(own)
 
@@ -103,7 +105,7 @@ def _seen(index, context, screen):
     return where, triangle[where], weights[where]
 
 
-def _across(context, triangle, weights):
+def across(context, triangle, weights):
     """Places of the old surface, and where the same places of the layout are on the new: ``(uv, old point, new triangle,
     new weights)``, the triangle ``-1`` where the new layout has nothing there."""
     uv = context.old.uv(triangle, weights)
@@ -112,13 +114,15 @@ def _across(context, triangle, weights):
     return uv, place, new_triangle, new_weights
 
 
-def _rigid(context, uv, place, new_place):
+def rigid(context, uv, place, new_place):
     """The rigid motion of the patch of surface around the places ``uv`` (old points ``place``, new points ``new_place``):
-    the patch is the places themselves and some around them."""
+    the patch is some of the places themselves and some around them."""
     reach = float(np.clip(_REACH_SHARE * float((uv.max(axis=0) - uv.min(axis=0)).max()), _REACH_LEAST, _REACH_MOST))
+    chosen = np.linspace(0, len(uv) - 1, min(len(uv), _PATCH_PLACES)).astype(np.int64)
+    uv, place, new_place = uv[chosen], place[chosen], new_place[chosen]
     around = (uv[:, None, :] + reach * _AROUND[None, :, :]).reshape(-1, 2)
     nearby = np.repeat(place, len(_AROUND), axis=0)
-    old_triangle, old_weights, _offset = context.old_layout.query(around, nearby)
+    old_triangle, old_weights, _offset = context.old_layout_exact.query(around, nearby)
     new_triangle, new_weights, _offset = context.new_layout.query(around, nearby)
     both = (old_triangle >= 0) & (new_triangle >= 0)
     return geometry.rigid_fit(np.concatenate([place, context.old.point(old_triangle[both], old_weights[both])]),
@@ -127,12 +131,12 @@ def _rigid(context, uv, place, new_place):
 
 def _move(track, index, context):
     where, triangle, weights = _seen(index, context, track.points * 2.0 - 1.0)
-    uv, place, new_triangle, new_weights = _across(context, triangle, weights)
+    uv, place, new_triangle, new_weights = across(context, triangle, weights)
     placed = new_triangle >= 0
     if not placed.any():
         return len(where), 0
     new_place = context.new.point(new_triangle[placed], new_weights[placed])
-    track.transform = _rigid(context, uv[placed], place[placed], new_place)
+    track.transform = rigid(context, uv[placed], place[placed], new_place)
     track.points[where[placed]] = track.camera.following(track.transform).screen(new_place)
     track.size_ratio = geometry.length_ratio(context.old, triangle[placed], context.new, new_triangle[placed])
     return len(where), int(placed.sum())

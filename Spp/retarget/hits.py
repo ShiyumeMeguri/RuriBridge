@@ -8,10 +8,11 @@ layout the project has now. They choose the same polygons whatever the mesh look
 
 * ``follow_uv`` -- the mesh moved, the UV layout stayed: the hits made through a camera are replaced by clicks in the layout.
 * ``follow_surface`` -- the UV layout moved, the mesh stayed: the hits made in the UV view are replaced by clicks at where
-  the layout now puts the polygons they chose (a hit through a camera is right as it is). A UV chunk is chosen by one click
-  only where the new layout still holds it as one chunk; otherwise its polygons are clicked one by one.
+  the layout now puts the polygons they chose (a hit through a camera is right as it is).
 
-A hit whose polygons lie over others in the layout cannot be told apart by a click in the layout; it is left as it is.
+A replacement is only made when the rules, run on the clicks, choose exactly the polygons the hit chose: a UV chunk is
+clicked as one only where the layout still holds it as one chunk, and a polygon that lies over another in the layout (a
+mirrored island) is only clicked where the one under it is chosen too. Otherwise the hit is left as it is and counted.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from collections import Counter
 import numpy as np
 
 from .. import stream
-from . import geometry, selection
+from . import geometry, placement, selection
 
 HOLDER = "DataActionDecal"
 PUNCTUAL = "DataDecalHitPunctual"
@@ -32,6 +33,29 @@ FIELDS = (("color", 0x03), ("duplicateCount", 0x0B), ("duplicateMatrix", 0x0E), 
           ("position", 0x02), ("projViewInvMatrix", 0x0E), ("uid", 0x0C), ("viewType", 0x09))
 DEFINITION = stream.Definition(PUNCTUAL, FIELDS)
 _WINDOW = 0.02
+#: What ``convert`` gives for a hit the pass is not about: it stays and is not counted.
+UNTOUCHED = object()
+
+
+class _Layout:
+    """A surface with its UV layout as hits are clicked in it: what a set of clicks chooses, by the rules of ``selection``."""
+
+    def __init__(self, surface, mask, elements, chunks):
+        self.surface = surface
+        self.mask = mask
+        self.elements = elements
+        self.chunks = chunks
+        self.index = geometry.UvIndex(surface, mask)
+
+    def chosen(self, positions, granularities):
+        """The triangles clicks at ``positions`` (n, 2) of the given ``granularities`` choose: a boolean per triangle."""
+        point, triangle = self.index.holding(positions)
+        out = np.zeros(len(self.surface.triangles), dtype=bool)
+        for granularity in np.unique(granularities):
+            seeds = np.zeros(len(self.surface.triangles), dtype=bool)
+            seeds[triangle[granularities[point] == granularity]] = True
+            out |= selection.widened(seeds, granularity, lambda kind: self.elements if kind == selection.ELEMENT else self.chunks)
+        return out & self.mask
 
 
 def _click(context, template, position, granularity):
@@ -40,10 +64,6 @@ def _click(context, template, position, granularity):
               "paintThrough": 0, "position": tuple(float(value) for value in position), "projViewInvMatrix": (0.0,) * 16,
               "uid": context.uids.take(), "viewType": VIEW_2D}
     return stream.Object(DEFINITION, [stream.encode(code, values[name]) for name, code in FIELDS])
-
-
-def _actions(material):
-    return [action for action in stream.walk(material) if action.type == HOLDER]
 
 
 def _mirror(hit):
@@ -82,61 +102,39 @@ def _seeds_in_layout(hit, context):
     return seeds
 
 
-def _choice(seeds, granularity, context):
-    """What the hit chooses, as what has to be clicked: ``(0, triangles)``, each polygon of the material chosen, or
-    ``(granularity, triangles)`` for an element or UV chunk, one polygon of the material in each chosen."""
+def _compact(granularity, labels, mask, wanted):
+    """``(granularity, triangles)``: one polygon of the material in each element or chunk ``wanted`` is made of, where the
+    granularity is one of those; ``None`` for the other granularities."""
     if granularity not in (selection.ELEMENT, selection.CHUNK):
-        return 0, np.nonzero(seeds & context.old_mask)[0]
-    labels = context.old_elements if granularity == selection.ELEMENT else context.old_chunks
-    own = np.nonzero(context.old_mask & np.isin(labels, np.unique(labels[seeds])))[0]
+        return None
+    own = np.nonzero(mask & wanted)[0]
     _labels, first = np.unique(labels[own], return_index=True)
     return granularity, own[first]
 
 
-def _clicks_in_old_layout(context, template, choice):
-    granularity, triangles = choice
-    if len(triangles) and (context.old_layout.holding(selection.centroid_uv(context.old, triangles)) > 1).any():
-        return None
-    return [_click(context, template, position, granularity) for position in selection.centroid_uv(context.old, triangles)]
-
-
-def _carried(context, triangles):
-    """The triangles of the new surface that are the old ``triangles``; ``-1`` where there is none."""
-    return context.counterpart.carry(triangles, np.repeat(selection.CENTRE, len(triangles), axis=0))[0]
-
-
-def _chunks_stay(context, triangles):
-    """Whether the UV chunk of each of the old ``triangles`` is, polygon for polygon, one UV chunk of the new layout."""
-    for triangle in triangles:
-        carried = _carried(context, np.nonzero(context.old_mask & (context.old_chunks == context.old_chunks[triangle]))[0])
-        if (carried < 0).any():
-            return False
-        labels = np.unique(context.new_chunks[carried])
-        if len(labels) != 1 or int((context.new_mask & (context.new_chunks == labels[0])).sum()) != len(carried):
-            return False
-    return True
-
-
-def _clicks_in_new_layout(context, template, seeds, granularity):
-    """Clicks that choose in the new layout what ``seeds`` chose in the old; ``None`` where they cannot."""
-    kind, triangles = _choice(seeds, granularity, context)
-    if kind == selection.CHUNK and not _chunks_stay(context, triangles):
-        kind, triangles = 0, np.nonzero(context.old_mask & np.isin(context.old_chunks, context.old_chunks[triangles]))[0]
-    new_triangles = _carried(context, triangles)
-    if (new_triangles < 0).any() or (context.new_layout.holding(selection.centroid_uv(context.new, new_triangles)) > 1).any():
-        return None
-    return [_click(context, template, position, kind) for position in selection.centroid_uv(context.new, new_triangles)]
+def _replacement(context, template, layout, chosen, compact):
+    """Clicks in ``layout`` that choose exactly the triangles ``chosen`` (a boolean per triangle of its surface): the compact
+    ones first -- ``compact`` is ``(granularity, triangles)`` or ``None`` -- then one on every polygon; ``None`` where neither does."""
+    for granularity, triangles in ([compact] if compact is not None else []) + [(0, np.nonzero(chosen)[0])]:
+        positions = selection.centroid_uv(layout.surface, triangles)
+        if (layout.chosen(positions, np.full(len(triangles), granularity)) == chosen).all():
+            return [_click(context, template, position, granularity) for position in positions]
+    return None
 
 
 def _replace(material, convert):
     """Rebuild the hits of every polygon fill of the material: ``convert(hit)`` gives the hits that take a hit's place,
-    or ``None`` to leave it. Counts what was done; a fill left with no hit is taken out of the stack that holds it."""
+    ``None`` for a hit that has to stay one (counted as ``left``) or ``UNTOUCHED`` for one the pass is not about. A fill left
+    with no hit is taken out of the stack that holds it."""
     counts = Counter()
     emptied = []
-    for action in _actions(material):
+    for action in [found for found in stream.walk(material) if found.type == HOLDER]:
         rebuilt = []
         for hit in action["hits"]:
             made = convert(hit)
+            if made is UNTOUCHED:
+                rebuilt.append(hit)
+                continue
             counts["hits"] += 1
             if made is None:
                 counts["left"] += 1
@@ -153,22 +151,59 @@ def _replace(material, convert):
     return counts
 
 
+def _follow_camera(hit, context, wanted):
+    """Move the camera of a hit the way the patch of the polygons it chose moved, so it still sees them: all that can be done
+    for a hit that cannot be said by clicks in the layout. Counts nothing as ``None`` -- the hit stays a hit of its own."""
+    triangles = np.nonzero(wanted)[0]
+    if not len(triangles):
+        return None
+    weights = np.repeat(selection.CENTRE, len(triangles), axis=0)
+    uv, place, new_triangle, new_weights = placement.across(context, triangles, weights)
+    placed = new_triangle >= 0
+    if not placed.any():
+        return None
+    motion = placement.rigid(context, uv[placed], place[placed], context.new.point(new_triangle[placed], new_weights[placed]))
+    hit.set_number("projViewInvMatrix", geometry.moved_inverse(hit.number("projViewInvMatrix"), motion))
+    return None
+
+
 def follow_uv(material, context):
-    """Replace the hits made through a camera by clicks in the UV layout on the polygons they chose."""
+    """Replace the hits made through a camera by clicks in the UV layout on the polygons they chose; those that clicks cannot say
+    (polygons that lie over others in the layout) keep their camera, moved with the patch of polygons they chose."""
+    layout = _Layout(context.old, context.old_mask, context.old_elements, context.old_chunks)
+
     def convert(hit):
         if hit.number("viewType") != VIEW_3D:
-            return None
+            return UNTOUCHED
+        granularity = hit.number("granularity")
         seeds = _seeds_through_camera(hit, context)
-        return _clicks_in_old_layout(context, hit, _choice(seeds, hit.number("granularity"), context))
+        wanted = selection.widened(seeds, granularity, lambda kind: context.old_elements if kind == selection.ELEMENT else context.old_chunks)
+        labels = context.old_elements if granularity == selection.ELEMENT else context.old_chunks
+        made = _replacement(context, hit, layout, wanted & context.old_mask, _compact(granularity, labels, context.old_mask, wanted))
+        return made if made is not None else _follow_camera(hit, context, wanted & context.old_mask)
 
     return dict(_replace(material, convert))
 
 
 def follow_surface(material, context):
     """Replace the hits made in the UV view by clicks in the new layout on the polygons they chose."""
+    layout = _Layout(context.new, context.new_mask, context.new_elements, context.new_chunks)
+
     def convert(hit):
-        if hit.number("viewType") != VIEW_2D or hit.number("duplicateCount") != 0:
+        if hit.number("viewType") != VIEW_2D:
+            return UNTOUCHED
+        if hit.number("duplicateCount") != 0:
             return None
-        return _clicks_in_new_layout(context, hit, _seeds_in_layout(hit, context), hit.number("granularity"))
+        granularity = hit.number("granularity")
+        seeds = _seeds_in_layout(hit, context)
+        wanted_old = selection.widened(seeds, granularity, lambda kind: context.old_elements if kind == selection.ELEMENT else context.old_chunks) & context.old_mask
+        old_triangles = np.nonzero(wanted_old)[0]
+        carried = context.counterpart.carry(old_triangles, np.repeat(selection.CENTRE, len(old_triangles), axis=0))[0]
+        if (carried < 0).any():
+            return None
+        wanted = np.zeros(len(context.new.triangles), dtype=bool)
+        wanted[carried] = True
+        labels = context.new_elements if granularity == selection.ELEMENT else context.new_chunks
+        return _replacement(context, hit, layout, wanted, _compact(granularity, labels, context.new_mask, wanted))
 
     return dict(_replace(material, convert))
