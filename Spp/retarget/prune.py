@@ -95,6 +95,8 @@ def _stroke_touches(stroke, brush, context, moved_index, moved_space):
     if stroke.number("viewType") != VIEW_3D:
         triangle, weights, _offset = context.old_layout.query(points)
         found = triangle >= 0
+        if not found.any():
+            return False
         scale = _scale(context.old, triangle[found])
         radius = max(RADIUS.values()) * size
         return _may_touch(context, moved_index, moved_space, context.old.uv(triangle[found], weights[found]), context.old.point(triangle[found], weights[found]),
