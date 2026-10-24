@@ -16,6 +16,11 @@ SOURCE_TOLERANCE = 1e-5
 SOURCE_SAMPLES = 4000
 #: How many triangles of the material are looked at to find the rigid motion between the surfaces.
 MOTION_SAMPLES = 4000
+#: How far, as a share of the model's diagonal, a polygon may lie from where a rigid motion takes it and still be on it.
+MOTION_TOLERANCE = 1e-3
+#: Candidate motions are fitted to the polygons around this many seed polygons, this many each.
+MOTION_SEEDS = 48
+MOTION_NEIGHBOURS = 12
 
 
 class Context:
@@ -57,18 +62,39 @@ class Context:
 
     @cached_property
     def motion(self):
-        """The rigid motion (4x4) that best takes the material's polygons from the old surface to the new, and the largest
-        distance any of them is left from where it is in the new: the places of the old layout found again in the new."""
+        """The rigid motion (4x4) most of the material's polygons made from the old surface to the new, and the share of them
+        that are where it takes them (to within ``MOTION_TOLERANCE`` of the diagonal): the places of the old layout found
+        again in the new. Where half the surface was changed and half left, the left half's motion -- none -- is it."""
         triangles = np.nonzero(self.old_mask)[0]
         triangles = triangles[::max(1, len(triangles) // MOTION_SAMPLES)]
         weights = np.repeat(selection.CENTRE, len(triangles), axis=0)
         place = self.old.point(triangles, weights)
         new_triangle, new_weights, _offset = self.new_layout.query(self.old.uv(triangles, weights), place)
         found = new_triangle >= 0
-        new_place = self.new.point(new_triangle[found], new_weights[found])
-        motion = geometry.rigid_fit(place[found], new_place)
-        gap = float(np.linalg.norm(place[found] @ motion[:3, :3].T + motion[:3, 3] - new_place, axis=1).max()) if found.any() else float("inf")
-        return motion, gap
+        if not found.any():
+            return np.eye(4), 0.0
+        place, new_place = place[found], self.new.point(new_triangle[found], new_weights[found])
+        tolerance = MOTION_TOLERANCE * self.diagonal
+
+        def inliers(motion):
+            return np.linalg.norm(place @ motion[:3, :3].T + motion[:3, 3] - new_place, axis=1) <= tolerance
+
+        best = (float(inliers(np.eye(4)).mean()), np.eye(4))
+        seeds = np.linspace(0, len(place) - 1, min(len(place), MOTION_SEEDS)).astype(np.int64)
+        starts = [geometry.rigid_fit(place, new_place)]
+        for seed in seeds:
+            near = np.argsort(np.linalg.norm(place - place[seed], axis=1))[:MOTION_NEIGHBOURS]
+            starts.append(geometry.rigid_fit(place[near], new_place[near]))
+        for motion in starts:
+            for _round in range(4):
+                held = inliers(motion)
+                if held.sum() < 3:
+                    break
+                motion = geometry.rigid_fit(place[held], new_place[held])
+            share = float(inliers(motion).mean())
+            if share > best[0] + 1e-9:
+                best = (share, motion)
+        return best[1], best[0]
 
     @cached_property
     def old_elements(self):

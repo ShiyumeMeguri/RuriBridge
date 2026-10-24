@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from . import geometry
-
 ELEMENT = 2
 CHUNK = 3
 CENTRE = np.full((1, 3), 1.0 / 3.0)

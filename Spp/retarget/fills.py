@@ -10,7 +10,8 @@ was made in follows the surface through any layout the mesh has now, live, with 
   the UV set to UV set projection from the set of the new mesh that holds the old layout.
 * ``follow_space`` -- the mesh moved, the layout stayed: a fill laid on the surface through a frame in space (planar,
   triplanar, spherical, cylindrical, warp) keeps the same places of the surface where the frame moves with the surface; that
-  is exact where the surface moved as one rigid body, and where it did not nothing is moved and the fills are counted.
+  is exact where the surface moved as one rigid body; where most of it did (half of it changed, half left) the frames follow
+  that motion and the share of the surface off it is reported, and where none did nothing is moved and the fills are counted.
   The frame is a position ``t`` (scene units), Euler angles giving the rotation ``R = Rx Ry Rz`` and a size ``S``; it takes
   a point ``p`` to ``S^-1 R^T (p - t)`` (measured on a planar fill, where half of that plus a half is the place in the
   picture), and a motion ``(Q, q)`` of the surface makes ``t' = Q t + q`` and ``R' = Q R``.
@@ -28,8 +29,8 @@ FILL = "DataActionFill"
 UV_PROJECTION = 0
 UV_SET_TO_UV_SET = 9
 SPACE_PROJECTIONS = (1, 2, 3, 4, 7)
-#: How far, as a share of the model's diagonal, the surfaces may lie from one rigid motion for it to count as one.
-RIGID_TOLERANCE = 1e-3
+#: The share of the surface that has to have moved as one rigid body for the frames to follow it.
+MAJORITY = 0.6
 
 
 def follow_layout(material, context):
@@ -69,11 +70,12 @@ def follow_space(material, context):
     fills = [item for item in stream.walk(material) if item.type == FILL and item.number("projection") in SPACE_PROJECTIONS]
     if not fills:
         return {}
-    motion, gap = context.motion
-    if gap > RIGID_TOLERANCE * context.diagonal:
+    motion, share = context.motion
+    if share < MAJORITY:
         return {"not moved as one rigid body": len(fills)}
+    off = {"share of the surface off that motion": round(1.0 - share, 4)} if share < 1.0 else {}
     if np.allclose(motion, np.eye(4), atol=1e-9):
-        return {"fills": len(fills), "moved": 0}
+        return {"fills": len(fills), "moved": 0, **off}
     counts = Counter()
     for fill in fills:
         fill.set_number("dddPosition", tuple(float(value) for value in motion[:3, :3] @ np.array(fill.number("dddPosition")) + motion[:3, 3]))
@@ -84,4 +86,4 @@ def follow_space(material, context):
             symmetry.set_number("matrix", tuple(float(value) for value in (motion @ mirror @ np.linalg.inv(motion)).T.reshape(-1)))
         counts["fills"] += 1
         counts["moved"] += 1
-    return dict(counts)
+    return {**counts, **off}
