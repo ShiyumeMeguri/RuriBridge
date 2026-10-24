@@ -9,8 +9,6 @@ SURFACE = "surface"
 
 _FILL = "DataActionFill"
 _UV_PROJECTION = 0
-#: Planar, triplanar, spherical, cylindrical and warp: laid on the surface through a frame in space.
-_SPACE_PROJECTIONS = (1, 2, 3, 4, 7)
 _VIEW_2D = 0
 
 
@@ -20,7 +18,6 @@ def _holds_3d_keys(item):
 
 #: The mesh changed and the UV layout stayed: paint that follows the mesh and is not moved.
 MESH_BOUND = (
-    ("fills projected in space", lambda item: item.type == _FILL and item.number("projection") in _SPACE_PROJECTIONS),
     ("strokes kept as keys in space", _holds_3d_keys),
     ("strokes with several symmetry duplicates", lambda item: item.type == "DataStroke" and item.number("duplicateCount") > 1),
 )

@@ -15,7 +15,7 @@ SURFACE = kinds.SURFACE
 #: What each anchor repairs: the passes that move the data bound to what changed. A kind of paint is carried by
 #: adding its pass here and taking its row out of ``kinds``.
 PASSES = {
-    UV: (strokes.follow_uv, hits.follow_uv),
+    UV: (strokes.follow_uv, hits.follow_uv, fills.follow_space),
     SURFACE: (strokes.follow_surface, hits.follow_surface, fills.follow_layout),
 }
 

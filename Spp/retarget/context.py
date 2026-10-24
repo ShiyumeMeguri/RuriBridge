@@ -14,6 +14,8 @@ from . import geometry, selection
 SOURCE_TOLERANCE = 1e-5
 #: How many triangles of the material are looked at to check that copy.
 SOURCE_SAMPLES = 4000
+#: How many triangles of the material are looked at to find the rigid motion between the surfaces.
+MOTION_SAMPLES = 4000
 
 
 class Context:
@@ -52,6 +54,21 @@ class Context:
             raise ValueError("UV set {0} of the new mesh is not the layout {1} was painted in: it differs by up to {2:.6f} over {3:.1f}% of the triangles".format(
                 self._source_set, self.material, float(difference.max()), 100.0 * float((difference > SOURCE_TOLERANCE).mean())))
         return self._source_set
+
+    @cached_property
+    def motion(self):
+        """The rigid motion (4x4) that best takes the material's polygons from the old surface to the new, and the largest
+        distance any of them is left from where it is in the new: the places of the old layout found again in the new."""
+        triangles = np.nonzero(self.old_mask)[0]
+        triangles = triangles[::max(1, len(triangles) // MOTION_SAMPLES)]
+        weights = np.repeat(selection.CENTRE, len(triangles), axis=0)
+        place = self.old.point(triangles, weights)
+        new_triangle, new_weights, _offset = self.new_layout.query(self.old.uv(triangles, weights), place)
+        found = new_triangle >= 0
+        new_place = self.new.point(new_triangle[found], new_weights[found])
+        motion = geometry.rigid_fit(place[found], new_place)
+        gap = float(np.linalg.norm(place[found] @ motion[:3, :3].T + motion[:3, 3] - new_place, axis=1).max()) if found.any() else float("inf")
+        return motion, gap
 
     @cached_property
     def old_elements(self):
