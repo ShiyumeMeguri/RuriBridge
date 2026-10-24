@@ -20,11 +20,11 @@ from collections import Counter
 import numpy as np
 
 from .. import stream
-from . import geometry, placement
+from . import brushes, geometry, placement
 
 VIEW_2D = 0
 VIEW_3D = 1
-HOLDERS = ("DataActionPaint", "DataActionEraser", "DataActionSmudge")
+HOLDERS = brushes.HOLDERS
 
 
 def _strokes(material, view):
@@ -69,12 +69,16 @@ def follow_uv(material, context):
         counts["points"] += len(stroke_rows)
         counts["seen"] += track.seen
         counts["moved"] += track.moved
+    factors = {id(stroke): track.size_ratio for stroke, _rows_, track in tracks if track.size_ratio is not None}
+    brushes.resize(material, factors, (brushes.VIEW, brushes.OBJECT), context.uids)
     return dict(counts)
 
 
 def follow_surface(material, context):
-    """Carry the points of the strokes drawn in the UV view to where the layout now puts the surface they were on."""
+    """Carry the points of the strokes drawn in the UV view to where the layout now puts the surface they were on,
+    and give the strokes whose brush is measured in the layout the size that keeps their footprint on the surface."""
     counts = Counter()
+    factors_2d = {}
     for stroke, _through in _strokes(material, VIEW_2D):
         rows = _rows(stroke)
         triangle, weights, offset = context.old_layout.query(rows[:, :2])
@@ -97,6 +101,17 @@ def follow_surface(material, context):
         counts["seen"] += int(found.sum())
         counts["moved"] += int(placed.sum())
         _store(stroke, rows)
+        ratio = geometry.length_ratio(context.old, triangle[where], context.new, new_triangle[placed])
+        if ratio is not None:
+            factors_2d[id(stroke)] = 1.0 / ratio
+    brushes.resize(material, factors_2d, (brushes.VIEW, brushes.TEXTURE), context.uids)
+    tracks = []
+    for stroke, through in _strokes(material, VIEW_3D):
+        key = (stroke.number("viewMatrix"), stroke.number("projectionMatrix"))
+        tracks.append((stroke, placement.Track(key, geometry.Camera(*key), _rows(stroke)[:, :2].copy(), through)))
+    placement.measure_layout([track for _stroke, track in tracks], context)
+    factors_3d = {id(stroke): 1.0 / track.size_ratio for stroke, track in tracks if track.size_ratio is not None}
+    brushes.resize(material, factors_3d, (brushes.TEXTURE,), context.uids)
     return dict(counts)
 
 

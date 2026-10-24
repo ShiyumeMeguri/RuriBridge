@@ -8,7 +8,6 @@ UV = "uv"
 SURFACE = "surface"
 
 _FILL = "DataActionFill"
-_HITS = ("DataDecalHitPunctual", "DataDecalHitRect")
 _UV_PROJECTION = 0
 _VIEW_2D = 0
 _VIEW_3D = 1
@@ -29,7 +28,7 @@ MESH_BOUND = (
 #: The UV layout changed and the mesh stayed: paint that follows the layout and is not moved.
 LAYOUT_BOUND = (
     ("fills laid through the UV layout", lambda item: item.type == _FILL and item.number("projection") == _UV_PROJECTION),
-    ("polygon fills chosen in the UV view", lambda item: item.type in _HITS and item.number("viewType") == _VIEW_2D),
+    ("polygon fills chosen by a rectangle in the UV view", lambda item: item.type == "DataDecalHitRect" and item.number("viewType") == _VIEW_2D),
 )
 
 BY_ANCHOR = {UV: MESH_BOUND, SURFACE: LAYOUT_BOUND}

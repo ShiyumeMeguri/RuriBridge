@@ -20,16 +20,18 @@ class Context:
     """The surface a material was painted on, the one it is painted on now, and the lookups between them.
 
     ``source`` is the new mesh read with the UV set ``source_set``: the set that holds the layout the paint was
-    made in, which a fill laid through the layout needs to follow the surface to a new one.
+    made in, which a fill laid through the layout needs to follow the surface to a new one. ``uids`` hands out the
+    uids of what a pass adds to the document.
     """
 
-    def __init__(self, old, new, material, uv_reach=0.05, source=None, source_set=None):
+    def __init__(self, old, new, material, uv_reach=0.05, source=None, source_set=None, uids=None):
         self.old = old
         self.new = new
         self.material = material
         self.uv_reach = uv_reach
         self.old_mask = old.mask(material)
         self.new_mask = new.mask(material)
+        self.uids = uids
         self._source = source
         self._source_set = source_set
 

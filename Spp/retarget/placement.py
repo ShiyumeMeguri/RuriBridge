@@ -29,7 +29,8 @@ class Track:
     """Points (n, 2) on the screen of ``camera`` (``0..1`` across and up), and whether paint goes through the model.
 
     ``transform`` is what the camera was moved by when the track was followed (``None`` before, and where it did not
-    move): the 4x4 rigid motion of the world the camera now sees the way it saw it.
+    move): the 4x4 rigid motion of the world the camera now sees the way it saw it. ``size_ratio`` is how many times
+    longer a step of the UV layout is across the surface under the track now than it was (``None`` where unknown).
     """
 
     def __init__(self, key, camera, points, through):
@@ -40,6 +41,7 @@ class Track:
         self.seen = 0
         self.moved = 0
         self.transform = None
+        self.size_ratio = None
 
 
 def follow_uv(tracks, context):
@@ -83,4 +85,26 @@ def _move(track, index, context):
     transform = geometry.rigid_fit(np.concatenate([place[placed], patch_old]), np.concatenate([new_place, patch_new]))
     track.transform = transform
     track.points[where[placed]] = track.camera.following(transform).screen(new_place)
+    track.size_ratio = geometry.length_ratio(context.old, triangle[where][placed], context.new, new_triangle[placed])
     return int(seen.sum()), int(placed.sum())
+
+
+def measure_layout(tracks, context):
+    """For tracks through a camera on a mesh that did not change: set each ``size_ratio`` from the surface its points
+    fall on, across the old layout and the new."""
+    groups = defaultdict(list)
+    for track in tracks:
+        groups[track.key].append(track)
+    for members in groups.values():
+        screen = np.concatenate([track.points for track in members]) * 2.0 - 1.0
+        index = geometry.ScreenIndex(context.old, members[0].camera, screen.min(axis=0) - _MARGIN, screen.max(axis=0) + _MARGIN)
+        for track in members:
+            triangle, weights, _depth = index.query(track.points * 2.0 - 1.0, context.old_mask if track.through else None)
+            seen = triangle >= 0
+            if not track.through:
+                seen &= context.old_mask[np.where(seen, triangle, 0)]
+            where = np.nonzero(seen)[0]
+            new_triangle, _weights = context.counterpart.carry(triangle[where], weights[where])
+            found = new_triangle >= 0
+            track.seen = int(seen.sum())
+            track.size_ratio = geometry.length_ratio(context.old, triangle[where][found], context.new, new_triangle[found])

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from .. import document as document_module
 from .. import project, scene, stream
 from . import engine, geometry
 
@@ -20,7 +21,8 @@ def run_surfaces(target, old, new, names, anchor, source=None, source_set=None):
     missing = [name for name in names if name not in found]
     if missing:
         raise ValueError("the project has no material called {0}".format(", ".join(missing)))
-    report = {name: engine.run(found[name], old, new, anchor, source=source, source_set=source_set) for name in names}
+    uids = document_module.Uids(document.root)
+    report = {name: engine.run(found[name], old, new, anchor, source=source, source_set=source_set, uids=uids) for name in names}
     target.write(project.DOCUMENT, stream.write(document))
     return report
 

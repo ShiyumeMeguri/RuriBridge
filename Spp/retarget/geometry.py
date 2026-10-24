@@ -100,6 +100,21 @@ class Camera:
         return (clip[:, :2] / clip[:, 3:4]) * 0.5 + 0.5
 
 
+def length_ratio(old, old_triangles, new, new_triangles):
+    """How many times longer, on average, a step in the UV layout is across ``new`` than across ``old``, at the
+    places the two lists of triangles are (geometric mean over the triangles that have a layout); ``None`` where none has."""
+    old_frames, old_usable = old.frames(old_triangles)
+    new_frames, new_usable = new.frames(new_triangles)
+    usable = old_usable & new_usable
+    if not usable.any():
+        return None
+
+    def log_area(frames):
+        return np.log(np.abs(np.linalg.det(np.einsum("nji,njk->nik", frames, frames))) + 1e-300)
+
+    return float(np.exp(0.25 * np.mean(log_area(new_frames[usable]) - log_area(old_frames[usable]))))
+
+
 def rigid_fit(old, new):
     """The 4x4 rigid motion taking the points ``old`` (n, 3) as near as it can to ``new``, least squares (Kabsch);
     the identity where the points do not pin one down (fewer than three, or all on a line)."""
