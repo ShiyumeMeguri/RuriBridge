@@ -213,12 +213,21 @@ def apply(generation, texture_resolution, on_finished=None, interpreter="", on_s
     if dropping:
         LOG.warning("dropping %s on this swap, as asked", ", ".join(dropping))
 
+    try:
+        chosen = layout_state.plan(record, str(generation.directory))
+        guests = guest_state.plan(record, str(generation.directory))
+    except (layout_module.LayoutError, guest_state.GuestError) as error:
+        raise MeshIngestError("{0}. The mesh was not swapped".format(error)) from error
     before = {texture_set.name for texture_set in substance_painter.textureset.all_texture_sets()}
+
+    def swap(scene):
+        _swap(generation, record, chosen, guests, before, scene, on_finished, on_swapping)
+
     repair = record.get("repair")
     if repair:
         def resume(surface):
             try:
-                _swap(generation, record, Path(surface), before, on_finished, on_swapping)
+                swap(Path(surface))
             except Exception as error:
                 LOG.exception("the paint is repaired, but mesh generation %d could not go in: %s", generation.number, error)
                 if on_finished is not None:
@@ -226,19 +235,18 @@ def apply(generation, texture_resolution, on_finished=None, interpreter="", on_s
 
         paint_repair.begin(generation, repair, interpreter, resume, on_finished)
         return "repair"
-    _swap(generation, record, scene_path, before, on_finished, on_swapping)
+    swap(scene_path)
     return "swap"
 
 
-def _swap(generation, record, scene_path, before, on_finished, on_swapping):
-    """Queue the surface in the file ``scene_path`` into the open project; ``before`` are the Texture Sets it had."""
+def _swap(generation, record, chosen, guests, before, scene_path, on_finished, on_swapping):
+    """Queue the surface in the file ``scene_path`` into the open project: ``chosen`` and ``guests`` are what it changes
+    (``layout_state.plan``, ``guest_state.plan``) and ``before`` the Texture Sets the project had."""
     if on_swapping is not None:
         on_swapping()
     try:
-        chosen = layout_state.plan(record, str(generation.directory))
-        guests = guest_state.plan(record, str(generation.directory))
         guest_state.before_surface(guests)
-    except (layout_module.LayoutError, guest_state.GuestError) as error:
+    except guest_state.GuestError as error:
         raise MeshIngestError("{0}. The mesh was not swapped".format(error)) from error
     emptied = sorted(emptied_texture_sets(record))
     if emptied:
