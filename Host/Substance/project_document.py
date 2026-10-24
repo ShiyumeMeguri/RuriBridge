@@ -48,6 +48,11 @@ _RECORDS = 0x11
 _OBJECT = 0x12
 _OBJECTS = 0x13
 _EMBEDDED = 0x14
+#: A block of bytes of a fixed size, kept as it is: ``channelTypes`` -- on every action, source and
+#: blending of a project saved by a Painter whose stream schema is 91 -- is sixteen bytes, all
+#: ``0x00`` or all ``0xFF`` in the projects seen. A wrong width cannot pass unseen: an object's own
+#: end offset is checked against where its fields end.
+_BLOCKS = {0x16: 16}
 
 #: Painter's enumerations as its stream stores them: ``DataViewType_2D``,
 #: ``DataBrushAlignment_UV``, ``DataBrushSizeSpace_Texture``, ``DataDecalGranularity_UVChunk``.
@@ -241,6 +246,13 @@ class _Stream:
             values = struct.unpack_from(layout, self.data, self.position)
             self.position += struct.calcsize(layout)
             return values[0] if len(values) == 1 else list(values)
+        if code in _BLOCKS:
+            width = _BLOCKS[code]
+            value = bytes(self.data[self.position:self.position + width])
+            if len(value) != width:
+                raise struct.error("a {0}-byte block of {1}.{2} runs past the end".format(width, owner, field))
+            self.position += width
+            return value
         if code == _TEXT:
             return self._text()
         if code in (_OBJECT, _EMBEDDED):
