@@ -406,10 +406,10 @@ python -m RuriBridge.Spp.cli clone <工程> <源材质> <新名字> [--out <路�
 都在。工程得是关着的:Painter 开着时改文件,存盘会被它盖掉。
 
 ```bash
-python -m RuriBridge.Spp.cli retarget <工程> <材质>... --anchor uv|surface --old <旧场景> [--uv-set 0] [--source-set N] [--out <路径>]
+python -m RuriBridge.Spp.cli retarget <工程> <材质>...|--all --anchor uv|surface --old <旧场景> [--uv-set 0] [--source-set N] [--out <路径>]
 ```
 
-`retarget` 在不烘焙成像素的前提下,把材质里的笔触和多边形填充的点选修到换过的表面上。笔触存的是"某个相机
+`retarget`(`--all` = 新旧表面都有多边形的每个材质)在不烘焙成像素的前提下,把材质里的笔触、填充和多边形填充的点选修到换过的表面上。笔触存的是"某个相机
 屏幕上的点"(在 UV 视图里画的存 UV 坐标),多边形填充的点选存的是相机和屏幕点,Painter 只在换网格(`reload_mesh`)
 时按它们在新表面上重放;开工程时不重放,把工程里的笔触全删了、全挪走,导出的贴图也一样。`--old` 是画这些东西时的表面:
 换网格前的工程,或从工程里取出的 `paint/scene.assbin`;新表面是 `<工程>` 自己的 `scene.assbin`。所以步骤是(Painter 关着

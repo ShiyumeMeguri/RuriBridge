@@ -3,13 +3,13 @@
 
     python -m RuriBridge.Spp.cli materials PROJECT
     python -m RuriBridge.Spp.cli clone PROJECT SOURCE NAME [--out PATH]
-    python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL... --anchor uv|surface --old SCENE [--source-set N] [--out PATH]
+    python -m RuriBridge.Spp.cli retarget PROJECT MATERIAL...|--all --anchor uv|surface --old SCENE [--source-set N] [--out PATH]
     python -m RuriBridge.Spp.cli split PROJECT SOURCE NAME --new SCENE [--out PATH]
 
 ``clone`` adds a material called NAME that is a copy of the material called SOURCE, with its stacks, layers,
 brushes and strokes, to the project at PATH -- or to PROJECT itself when there is no ``--out``.
 
-``retarget`` repairs the paint of the MATERIALs of PROJECT for the surface PROJECT holds, which is not the one
+``retarget`` repairs the paint of the MATERIALs of PROJECT (``--all``: every one both surfaces have polygons of) for the surface PROJECT holds, which is not the one
 the paint was made on: SCENE is that surface, a project file or a ``scene.assbin``. ``--anchor uv`` says the UV
 layout stayed and the mesh changed, ``--anchor surface`` that the mesh stayed and the layout changed.
 ``--source-set`` is the UV set of PROJECT's mesh that holds the layout the paint was made in; fills laid through
@@ -52,9 +52,11 @@ def _scene_bytes(path):
 
 def _retarget(arguments):
     from .retarget import job
+    if bool(arguments.materials) == arguments.all:
+        raise SystemExit("name the materials to retarget, or give --all")
     old = _scene_bytes(arguments.old)
     with project.edited(arguments.project, arguments.out) as changing:
-        report = job.run(changing, old, arguments.materials, arguments.anchor, arguments.uv_set, arguments.source_set)
+        report = job.run(changing, old, None if arguments.all else arguments.materials, arguments.anchor, arguments.uv_set, arguments.source_set)
     return {"anchor": arguments.anchor, "project": arguments.out or arguments.project, "report": report}
 
 
@@ -80,7 +82,8 @@ def main(argv=None):
     cloning.set_defaults(run=_clone)
     retargeting = commands.add_parser("retarget", help="repair paint for a surface that changed")
     retargeting.add_argument("project")
-    retargeting.add_argument("materials", nargs="+")
+    retargeting.add_argument("materials", nargs="*")
+    retargeting.add_argument("--all", action="store_true")
     retargeting.add_argument("--anchor", choices=("uv", "surface"), required=True)
     retargeting.add_argument("--old", required=True)
     retargeting.add_argument("--uv-set", type=int, default=0)
