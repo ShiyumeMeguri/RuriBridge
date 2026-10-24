@@ -96,7 +96,7 @@ def _seeds_in_layout(hit, context):
         own = np.nonzero(context.old_mask)[0]
         seeds[own[selection.overlapping(context.old.uvs[context.old.triangles[own]], low, high)]] = True
     else:
-        triangle, _weights, _offset = context.old_layout.query(np.array([hit.number("position")], dtype=np.float64))
+        triangle, _weights, _offset = context.old_layout_exact.query(np.array([hit.number("position")], dtype=np.float64))
         if triangle[0] >= 0:
             seeds[triangle[0]] = True
     return seeds

@@ -151,7 +151,7 @@ def _hit_touches(hit, context, moved):
         low, high = np.minimum(hit.number("position0"), hit.number("position1")), np.maximum(hit.number("position0"), hit.number("position1"))
         seeds[own[selection.overlapping(context.old.uvs[context.old.triangles[own]], low, high)]] = True
     else:
-        triangle, _weights, _offset = context.old_layout.query(np.array([hit.number("position")], dtype=np.float64))
+        triangle, _weights, _offset = context.old_layout_exact.query(np.array([hit.number("position")], dtype=np.float64))
         if triangle[0] >= 0:
             seeds[triangle[0]] = True
     chosen = selection.widened(seeds, hit.number("granularity"), lambda kind: context.old_elements if kind == selection.ELEMENT else context.old_chunks)
