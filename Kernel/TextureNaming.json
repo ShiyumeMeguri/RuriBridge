@@ -1,0 +1,24 @@
+{
+  "Version": 1,
+  "Default": {
+    "MaterialPrefix": "",
+    "TexturePrefix": "",
+    "Suffixes": {}
+  },
+  "Shaders": {
+    "Ruri_Endfield_Uber": {
+      "MaterialPrefix": "M_",
+      "TexturePrefix": "T_",
+      "Suffixes": {
+        "_BaseMap": "D",
+        "_BumpMap": "N",
+        "_MetallicGlossMap": "P",
+        "_EmissionMap": "E",
+        "_SplitNormalMap": "HN",
+        "_ClearCoatMask": "M",
+        "_ParallaxTex": "ht_M",
+        "_RMOSMap": "RMOS"
+      }
+    }
+  }
+}

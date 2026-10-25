@@ -45,6 +45,7 @@ import os
 import bpy
 import numpy
 
+from ...Kernel import texture_naming
 from ...Kernel.log import logger
 from . import pixels
 
@@ -226,6 +227,7 @@ def compose(entry, directory, materials, declaration_key):
     jobs = []
     plans = []
     for material in materials:
+        shader = str(material[declaration_key].get("name") or "")
         images = dict(material[declaration_key]["images"])
         group = str(images["group"])
         held = dict(material.get(group) or {})
@@ -242,9 +244,9 @@ def compose(entry, directory, materials, declaration_key):
                 original = pixels.read(path, size)
             key = (slot, original_image.name_full if original_image is not None else "")
             if key not in written:
-                stem = "{0}_{1}".format(name, slot.lstrip("_"))
+                stem = texture_naming.stem(shader, name, slot)
                 if any(path == stem for path in written.values()):
-                    stem = "{0}_{1}_{2}".format(name, material.name, slot.lstrip("_"))
+                    stem = texture_naming.stem(shader, name, slot, material.name)
                 try:
                     lanes, wide = _stand_up(recipe, painter, original, size, unpainted[slot])
                 except RuntimeError as error:
