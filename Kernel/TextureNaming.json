@@ -16,6 +16,10 @@
         "_EmissionMap": "E",
         "_SplitNormalMap": "HN",
         "_SDFLightmap": "SDF",
+        "_SDFMask": "cm_M",
+        "_HighlightMap": "hl_M",
+        "_OutlineMask": "ST",
+        "_HairBrowMask": "sw_M",
         "_ClearCoatMask": "M",
         "_ParallaxTex": "ht_M",
         "_RMOSMap": "RMOS"
