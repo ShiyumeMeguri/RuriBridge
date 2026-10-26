@@ -15,6 +15,7 @@
         "_MetallicGlossMap": "P",
         "_EmissionMap": "E",
         "_SplitNormalMap": "HN",
+        "_SDFLightmap": "SDF",
         "_ClearCoatMask": "M",
         "_ParallaxTex": "ht_M",
         "_RMOSMap": "RMOS"
