@@ -1749,6 +1749,9 @@ def register():
     bpy.types.Scene.ruri_bridge_retarget = bpy.props.PointerProperty(type=RuriBridgeRetargetSettings)
     if _ruri_bridge_after_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_ruri_bridge_after_load)
+    # A headless Blender that names no session stays out of the one the user's own Blender and Painter talk on.
+    if bpy.app.background and "RURI_BRIDGE_SESSION" not in os.environ:
+        return
     try:
         CONNECTION.open(os.environ.get("RURI_BRIDGE_SESSION", arena_module.DEFAULT_SESSION),
                         os.environ.get("RURI_BRIDGE_ROOT") or None)
